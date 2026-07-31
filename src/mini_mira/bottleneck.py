@@ -11,7 +11,6 @@ class BottleneckConfig :
     temporal_stride : int = 2
 
 
-
 class MyBottleneck(nn.Module):
     def __init__(self,config:BottleneckConfig):
         super().__init__()

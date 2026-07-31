@@ -124,13 +124,13 @@ class MyDecoder(nn.Module):
         self.config = config
 
         self.from_latent = nn.ConvTranspose2d(
-            
             config.latent_dim,
             config.width,
             kernel_size=config.stride,
             stride=config.stride,
             bias=True,
         )
+        
         self.blocks = nn.ModuleList([SpaceTimeBlock(config) for _ in range(config.depth)])
         self.norm_out = nn.LayerNorm(config.width, eps=config.eps)
         self.patch_unembed = PatchUnembed(config)

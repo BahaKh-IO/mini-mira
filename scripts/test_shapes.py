@@ -20,6 +20,7 @@ print("Day 1:", z.shape)
 
 assert z.shape == (2, 20, 32, 9, 16)
 
+
 decoder_config = DecoderConfig()
 decoder = MyDecoder(decoder_config)
 z2 = torch.randn(2, 20, 32, 9, 16)
