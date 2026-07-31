@@ -14,6 +14,7 @@ module = MyBottleneck(config)
 x=torch.randn(2,40,1024,18,32)
 z=module(x)
 
+
 print("Day 1:", z.shape)
 
 assert z.shape == (2, 20, 32, 9, 16)
