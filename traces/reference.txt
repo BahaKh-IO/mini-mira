@@ -1,0 +1,74 @@
+Day 1 — bottleneck reference trace, captured from the real mira repo.
+
+Source: mira/src/mira/codec/rae_encoder.py (RAEEncoder.__init__ lines 35-58, forward lines 89-97).
+DinoModel/DINOv3 backbone itself was NOT constructed (it pulls in torchvision + unrelated
+detection/eval modules just to load a plain feature extractor). Not needed here anyway:
+the bottleneck only needs a tensor shaped like DINO's output, not DINO itself.
+
+Config used (mira.codec.config.StridedConvBottleneckConfig + mira.codec.dino.DINO_DIM):
+  dino_dim        = 1024   (DINO_DIM["dinov3_vitl16"])
+  latent_dim      = 32
+  stride          = 2
+  temporal_stride = 2
+
+input_shape  = (2, 40, 1024, 18, 32)   # (B, T, dino_dim, H, W)
+output_shape = (2, 20, 32, 9, 16)      # (B, T', latent_dim, H', W')
+
+mini_mira/src/mini_mira/bottleneck.py's MyBottleneck, given the same config and input shape,
+must produce output_shape == (2, 20, 32, 9, 16). Confirmed matching via
+mini_mira/scripts/test_shapes.py.
+
+
+Day 2 — decoder reference trace, captured from the REAL mira repo (unlike Day 1, no
+DINO/torchvision wall here: ViTVideoDecoder has no frozen-backbone dependency, so it was
+constructed directly, for real, rather than reimplemented standalone).
+
+Source: mira/src/mira/codec/vit_decoder.py, ViTVideoDecoder, constructed via
+mira.codec.config.ViTDecoderConfig.
+
+Config used (small width/depth to keep this fast -- shape contract doesn't depend on
+vit_width/vit_depth at all, only on latent_dim/stride/patch_size/patch_size_t/out_channels):
+  latent_dim   = 32
+  stride       = 2   (bottleneck.stride, default)
+  patch_size   = 16
+  patch_size_t = 2
+  vit_width    = 256   (real default is 1152; shrunk for speed, doesn't affect shapes)
+  vit_depth    = 4     (real default is 24; shrunk for speed, doesn't affect shapes)
+  vit_num_heads = 8
+  out_channels = 3     (default)
+
+input_shape  = (2, 20, 32, 9, 16)      # (B, T, latent_dim, H, W) -- Day 1's bottleneck output
+output_shape = (2, 40, 3, 288, 512)    # (B, T*patch_size_t, out_channels, H*patch_size, W*patch_size)
+
+Note: mini_mira/src/mini_mira/decoder.py's MyDecoder deliberately skips RoPE (a scope
+decision -- RoPE only changes attention's VALUES, not any tensor's SHAPE, so it's invisible
+to this shape check) and uses plain torch.nn.functional.scaled_dot_product_attention with
+is_causal instead of mira.ml.SelfAttention's RoPE/GQA/QK-norm machinery. The spatial
+(bidirectional) / temporal (causal) split -- the one architectural choice flagged as most
+important -- is preserved exactly.
+
+MyDecoder, given the same config and input shape, must produce
+output_shape == (2, 40, 3, 288, 512). Confirmed matching via mini_mira/scripts/test_shapes.py.
+
+
+Day 3 -- world model. No real-repo construction this time: unlike Day 1/2, the pass
+condition here is stated directly, not derived -- "same shape in, same shape out" (the
+predicted flow-matching velocity is always the same shape as the noisy latent it corrects).
+That's directly testable without building the real (much heavier, config-hungry)
+DiffusionTransformer.
+
+Scope decisions (deliberate simplifications, not silent omissions):
+  - Reuses decoder.py's SpaceTimeBlock directly for the factorised space-time attention
+    (spatial bidirectional, temporal causal) -- already built and tested on Day 2, so a
+    separate "plain transformer" throwaway stage was skipped: we aren't training anything,
+    only checking shapes, so there was nothing for an incremental de-risking stage to buy us.
+  - actions and tau are accepted in MyWorldModel.forward() with the real
+    DiffusionTransformer's signature, but intentionally UNUSED -- action/diffusion-time
+    conditioning (AdaLN) changes attention's VALUES, never any tensor's SHAPE, so it has
+    zero effect on this shape check.
+  - Positional encoding: plain learned embeddings (pos_t + pos_h + pos_w), not RoPE.
+
+input_shape  = (2, 20, 32, 9, 16)   # (B, T, latent_dim, H, W) -- same as Day 1's output
+output_shape = (2, 20, 32, 9, 16)   # identical shape -- the pass condition itself
+
+Confirmed matching via mini_mira/scripts/test_shapes.py.
