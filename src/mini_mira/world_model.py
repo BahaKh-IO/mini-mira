@@ -30,6 +30,7 @@ class MyWorldModel(nn.Module):
         self.pos_h = nn.Parameter(0.02 * torch.randn(1, 1, config.max_h, 1, config.hidden_dim))
         self.pos_w = nn.Parameter(0.02 * torch.randn(1, 1, 1, config.max_w, config.hidden_dim))
 
+      
         block_config = DecoderConfig(
             width=config.hidden_dim,
             depth=config.depth,

@@ -124,6 +124,7 @@ class MyDecoder(nn.Module):
         self.config = config
 
         self.from_latent = nn.ConvTranspose2d(
+            
             config.latent_dim,
             config.width,
             kernel_size=config.stride,

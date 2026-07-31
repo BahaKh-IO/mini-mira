@@ -19,6 +19,7 @@ must produce output_shape == (2, 20, 32, 9, 16). Confirmed matching via
 mini_mira/scripts/test_shapes.py.
 
 
+
 Day 2 — decoder reference trace, captured from the REAL mira repo (unlike Day 1, no
 DINO/torchvision wall here: ViTVideoDecoder has no frozen-backbone dependency, so it was
 constructed directly, for real, rather than reimplemented standalone).

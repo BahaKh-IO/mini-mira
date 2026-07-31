@@ -9,6 +9,7 @@ from mini_mira.bottleneck import BottleneckConfig , MyBottleneck
 from mini_mira.decoder import DecoderConfig, MyDecoder
 from mini_mira.world_model import WorldModelConfig, MyWorldModel
 
+
 config = BottleneckConfig()
 module = MyBottleneck(config)
 x=torch.randn(2,40,1024,18,32)
