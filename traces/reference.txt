@@ -74,3 +74,33 @@ input_shape  = (2, 20, 32, 9, 16)   # (B, T, latent_dim, H, W) -- same as Day 1'
 output_shape = (2, 20, 32, 9, 16)   # identical shape -- the pass condition itself
 
 Confirmed matching via mini_mira/scripts/test_shapes.py.
+
+
+Day 4 -- the pipeline. The actual required deliverable: codec encode => latent diffusion
+(real multi-step loop) => codec decode, one forward() call, correct output shapes.
+
+Design decisions, asked and confirmed rather than assumed (see conversation):
+  - Plain multi-step loop, no streaming KV-cache. The real denoise_streaming re-denoises
+    only the last frame per call, caching earlier frames for efficiency during long
+    autoregressive rollouts -- that needs kv_cache/return_kv support in SimpleSelfAttention
+    and SpaceTimeBlock, which don't have it. Here every step re-runs the WHOLE z_t through
+    the whole stack -- slower, but shape-equivalent and far simpler.
+  - n_diffusion_steps = 4, evenly spaced tau in [0,1], constant delta_t. The real
+    "linear_quadratic" schedule affects sample QUALITY, not shape -- same reasoning as
+    Pass C and RoPE.
+  - z_t starts from torch.randn_like(z) -- pure noise, matching how
+    LatentWorldModel.inference actually starts a real generation (you never have the true
+    clean latent at generation time). The bottleneck-encoded z is used only for shape/dtype.
+
+Known, stated limitation: MyWorldModel still ignores actions/tau (Pass C not implemented),
+so the loop is mechanically real -- it genuinely calls the network multiple times and
+integrates the predicted velocity -- but the network's predictions don't actually improve
+as tau advances, since it can't see tau. Correct machinery around a network blind to the
+signal it's given.
+
+input_shape  = (2, 40, 1024, 18, 32)   # (B, T, dino_dim, H, W) -- DINO-shaped, matching Day 1
+output_shape = (2, 40, 3, 288, 512)    # real video -- matches the supervisor's exact ask:
+                                         # "codec => latent diffusion => decode, whole forward
+                                         # pass, correct output shapes"
+
+Confirmed matching via mini_mira/scripts/test_shapes.py.

@@ -8,6 +8,7 @@ import torch
 from mini_mira.bottleneck import BottleneckConfig , MyBottleneck
 from mini_mira.decoder import DecoderConfig, MyDecoder
 from mini_mira.world_model import WorldModelConfig, MyWorldModel
+from mini_mira.pipeline import PipelineConfig, MyPipeline
 
 
 config = BottleneckConfig()
@@ -38,3 +39,12 @@ pred_v = world_model(z_t, actions=None, tau=None)
 print("Day 3:", pred_v.shape)
 
 assert pred_v.shape == z_t.shape, f"got {pred_v.shape}"
+
+pipeline_config = PipelineConfig()
+pipeline = MyPipeline(pipeline_config)
+dino_features = torch.randn(2, 40, 1024, 18, 32)
+video = pipeline(dino_features, actions=None)
+
+print("Day 4:", video.shape)
+
+assert video.shape == (2, 40, 3, 288, 512), f"got {video.shape}"
