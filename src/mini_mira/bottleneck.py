@@ -4,7 +4,7 @@ import torch.nn as nn
 from einops import rearrange
 
 @dataclass
-class BottleneckConfig :
+class StridedConvBottleneckConfig :
     dino_dim : int = 1024
     latent_dim : int = 32
     stride : int = 2
@@ -12,7 +12,7 @@ class BottleneckConfig :
 
 
 class MyBottleneck(nn.Module):
-    def __init__(self,config:BottleneckConfig):
+    def __init__(self,config:StridedConvBottleneckConfig):
         super().__init__()
         self.config=config
 

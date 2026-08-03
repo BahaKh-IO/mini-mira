@@ -5,46 +5,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 import torch
-from mini_mira.bottleneck import BottleneckConfig , MyBottleneck
-from mini_mira.decoder import DecoderConfig, MyDecoder
-from mini_mira.world_model import WorldModelConfig, MyWorldModel
+from mini_mira.bottleneck import StridedConvBottleneckConfig, MyBottleneck
+from mini_mira.decoder import ViTDecoderConfig, ViTVideoDecoder
+from mini_mira.world_model import LatentWorldModelConfig, DiffusionTransformer
 from mini_mira.pipeline import PipelineConfig, MyPipeline
 
-
-config = BottleneckConfig()
-module = MyBottleneck(config)
-x=torch.randn(2,40,1024,18,32)
-z=module(x)
-
-
-print("Day 1:", z.shape)
-
-assert z.shape == (2, 20, 32, 9, 16)
+with torch.inference_mode():
+    config = StridedConvBottleneckConfig()
+    module = MyBottleneck(config)
+    x=torch.randn(2,40,1024,18,32)
+    z=module(x)
 
 
-decoder_config = DecoderConfig()
-decoder = MyDecoder(decoder_config)
-z2 = torch.randn(2, 20, 32, 9, 16)
-out = decoder(z2)
+    print("Day 1:", z.shape)
 
-print("Day 2:", out.shape)
+    assert z.shape == (2, 20, 32, 9, 16)
 
-assert out.shape == (2, 40, 3, 288, 512), f"got {out.shape}"
 
-wm_config = WorldModelConfig()
-world_model = MyWorldModel(wm_config)
-z_t = torch.randn(2, 20, 32, 9, 16)
-pred_v = world_model(z_t, actions=None, tau=None)
+    decoder_config = ViTDecoderConfig()
+    decoder = ViTVideoDecoder(decoder_config)
+    z2 = torch.randn(2, 20, 32, 9, 16)
+    out = decoder(z2)
 
-print("Day 3:", pred_v.shape)
+    print("Day 2:", out.shape)
 
-assert pred_v.shape == z_t.shape, f"got {pred_v.shape}"
+    assert out.shape == (2, 40, 3, 288, 512), f"got {out.shape}"
 
-pipeline_config = PipelineConfig()
-pipeline = MyPipeline(pipeline_config)
-dino_features = torch.randn(2, 40, 1024, 18, 32)
-video = pipeline(dino_features, actions=None)
+    wm_config = LatentWorldModelConfig()
+    world_model = DiffusionTransformer(wm_config)
+    z_t = torch.randn(2, 20, 32, 9, 16)
+    pred_v = world_model(z_t, actions=None, tau=None)
 
-print("Day 4:", video.shape)
+    print("Day 3:", pred_v.shape)
 
-assert video.shape == (2, 40, 3, 288, 512), f"got {video.shape}"
+    assert pred_v.shape == z_t.shape, f"got {pred_v.shape}"
+
+    pipeline_config = PipelineConfig()
+    pipeline = MyPipeline(pipeline_config)
+    dino_features = torch.randn(2, 40, 1024, 18, 32)
+    video = pipeline(dino_features, actions=None)
+
+    print("Day 4:", video.shape)
+
+    assert video.shape == (2, 40, 3, 288, 512), f"got {video.shape}"

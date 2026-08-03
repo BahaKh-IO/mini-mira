@@ -3,7 +3,7 @@
 Design decisions (asked and confirmed rather than assumed):
   - Plain multi-step loop, no streaming KV-cache. The real denoise_streaming only
     re-denoises the last frame per call, caching earlier frames for efficiency during long
-    autoregressive rollouts. That requires kv_cache/return_kv support in SimpleSelfAttention
+    autoregressive rollouts. That requires kv_cache/return_kv support in SelfAttention
     and SpaceTimeBlock, which don't have it. Here, every step just calls world_model on the
     WHOLE z_t and re-runs the whole stack -- slower, but shape-equivalent and much simpler.
   - A few steps (n_diffusion_steps), evenly spaced tau in [0, 1], constant delta_t. The real
@@ -14,7 +14,7 @@ Design decisions (asked and confirmed rather than assumed):
     clean latent at generation time. The bottleneck-encoded z is used only to get the right
     shape/dtype for that noise, then otherwise unused.
 
-Known limitation, stated rather than hidden: MyWorldModel still ignores actions/tau. So this loop is mechanically real (it really
+Known limitation, stated rather than hidden: DiffusionTransformer still ignores actions/tau. So this loop is mechanically real (it really
 does call the network multiple times and integrate the predicted velocity), but the
 network's predictions don't actually improve as tau advances, since it can't see tau. The
 loop is correct machinery around a network that doesn't yet use the signal it's given.
@@ -25,16 +25,16 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
-from mini_mira.bottleneck import BottleneckConfig, MyBottleneck
-from mini_mira.decoder import DecoderConfig, MyDecoder
-from mini_mira.world_model import MyWorldModel, WorldModelConfig
+from mini_mira.bottleneck import StridedConvBottleneckConfig, MyBottleneck
+from mini_mira.decoder import ViTDecoderConfig, ViTVideoDecoder
+from mini_mira.world_model import DiffusionTransformer, LatentWorldModelConfig
 
 
 @dataclass
 class PipelineConfig:
-    bottleneck: BottleneckConfig = field(default_factory=BottleneckConfig)
-    world_model: WorldModelConfig = field(default_factory=WorldModelConfig)
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    bottleneck: StridedConvBottleneckConfig = field(default_factory=StridedConvBottleneckConfig)
+    world_model: LatentWorldModelConfig = field(default_factory=LatentWorldModelConfig)
+    decoder: ViTDecoderConfig = field(default_factory=ViTDecoderConfig)
     n_diffusion_steps: int = 4
 
 
@@ -43,8 +43,8 @@ class MyPipeline(nn.Module):
         super().__init__()
         self.config = config
         self.bottleneck = MyBottleneck(config.bottleneck)
-        self.world_model = MyWorldModel(config.world_model)
-        self.decoder = MyDecoder(config.decoder)
+        self.world_model = DiffusionTransformer(config.world_model)
+        self.decoder = ViTVideoDecoder(config.decoder)
 
     def forward(self, dino_features, actions=None):
         z = self.bottleneck(dino_features)  # codec encode -- used here only for shape/dtype

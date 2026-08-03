@@ -1,42 +1,39 @@
 from dataclasses import dataclass
 
-import torch
 import torch.nn as nn
 from einops import rearrange
 
-from mini_mira.decoder import DecoderConfig, SpaceTimeBlock
+from mini_mira.blocks import BlockConfig, SpaceTimeBlock
+from mini_mira.rope import spatial_rope, temporal_rope
 
 
 @dataclass
-class WorldModelConfig:
+class LatentWorldModelConfig:
     latent_dim: int = 32
     hidden_dim: int = 256
     depth: int = 4
     num_heads: int = 8
     mlp_dim_multiplier: int = 4
     eps: float = 1e-6
-    max_t: int = 32
-    max_h: int = 16
-    max_w: int = 32
+    layerscale_init: float = 1e-4
+    rope_theta_spatial: float = 100.0
+    rope_theta_temporal: float = 64.0
 
 
-class MyWorldModel(nn.Module):
-    def __init__(self, config: WorldModelConfig):
+class DiffusionTransformer(nn.Module):
+    def __init__(self, config: LatentWorldModelConfig):
         super().__init__()
         self.config = config
+        self.head_dim = config.hidden_dim // config.num_heads
         self.in_proj = nn.Linear(config.latent_dim, config.hidden_dim)
 
-        self.pos_t = nn.Parameter(0.02 * torch.randn(1, config.max_t, 1, 1, config.hidden_dim))
-        self.pos_h = nn.Parameter(0.02 * torch.randn(1, 1, config.max_h, 1, config.hidden_dim))
-        self.pos_w = nn.Parameter(0.02 * torch.randn(1, 1, 1, config.max_w, config.hidden_dim))
-
-        block_config = DecoderConfig(
+        block_config = BlockConfig(
             width=config.hidden_dim,
-            depth=config.depth,
             num_heads=config.num_heads,
             mlp_dim_multiplier=config.mlp_dim_multiplier,
             causal=True,  # temporal attention causal, matching the real repo
             eps=config.eps,
+            layerscale_init=config.layerscale_init,
         )
         self.blocks = nn.ModuleList([SpaceTimeBlock(block_config) for _ in range(config.depth)])
         self.norm_out = nn.LayerNorm(config.hidden_dim, eps=config.eps)
@@ -46,10 +43,12 @@ class MyWorldModel(nn.Module):
         b, t, c, h, w = z_t.shape
         x = rearrange(z_t, "b t c h w -> b t h w c")
         x = self.in_proj(x)
-        x = x + self.pos_t[:, :t] + self.pos_h[:, :, :h] + self.pos_w[:, :, :, :w]
+
+        rope_spatial = spatial_rope(h, w, self.head_dim, self.config.rope_theta_spatial, x.device)
+        rope_temporal = temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x, rope_spatial, rope_temporal)
 
         x = self.norm_out(x)
         x = self.out_proj(x)
