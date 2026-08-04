@@ -27,6 +27,7 @@ class DiffusionTransformer(nn.Module):
         self.config = config
         self.head_dim = config.hidden_dim // config.num_heads
         self.in_proj = nn.Linear(config.latent_dim, config.hidden_dim)
+        self.past_proj = nn.Linear(config.latent_dim, config.hidden_dim)
 
         self.blocks = nn.ModuleList(
             [
@@ -44,10 +45,15 @@ class DiffusionTransformer(nn.Module):
         self.norm_out = nn.LayerNorm(config.hidden_dim, eps=config.eps)
         self.out_proj = nn.Linear(config.hidden_dim, config.latent_dim)
 
-    def forward(self, z_t, actions=None, tau=None):
+    def forward(self, z_t, actions=None, tau=None, clean_past=None):
         b, t, c, h, w = z_t.shape
         x = rearrange(z_t, "b t c h w -> b t h w c")
         x = self.in_proj(x)
+
+        # The past frames are always clean (un-noised) latents -- added to the noisy
+        # projection, not concatenated, so the sequence length never changes.
+        clean_past = rearrange(clean_past, "b t c h w -> b t h w c")
+        x = x + self.past_proj(clean_past)
 
         rope_spatial = spatial_rope(h, w, self.head_dim, self.config.rope_theta_spatial, x.device)
         rope_temporal = temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)

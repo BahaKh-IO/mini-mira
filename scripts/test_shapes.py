@@ -35,7 +35,8 @@ with torch.inference_mode():
     world_model = DiffusionTransformer(wm_config)
     z_t = torch.randn(2, 20, 32, 9, 16)
     tau = torch.rand(2, 20, 1, 1, 1)  # one noise level per latent frame, shape (b, t, 1, 1, 1)
-    pred_v = world_model(z_t, actions=None, tau=tau)
+    clean_past = torch.randn(2, 20, 32, 9, 16)  # same shape as z_t -- the frame-before content
+    pred_v = world_model(z_t, actions=None, tau=tau, clean_past=clean_past)
 
     print("Day 3:", pred_v.shape)
 
