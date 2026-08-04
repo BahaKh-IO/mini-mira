@@ -3,8 +3,9 @@ from dataclasses import dataclass
 import torch.nn as nn
 from einops import rearrange
 
-from mini_mira.blocks import BlockConfig, SpaceTimeBlock
+from mini_mira.blocks import AdaSTBlock
 from mini_mira.rope import spatial_rope, temporal_rope
+from mini_mira.timestep_encoder import DiffusionTimeEmbedding
 
 
 @dataclass
@@ -27,15 +28,19 @@ class DiffusionTransformer(nn.Module):
         self.head_dim = config.hidden_dim // config.num_heads
         self.in_proj = nn.Linear(config.latent_dim, config.hidden_dim)
 
-        block_config = BlockConfig(
-            width=config.hidden_dim,
-            num_heads=config.num_heads,
-            mlp_dim_multiplier=config.mlp_dim_multiplier,
-            causal=True,  # temporal attention causal, matching the real repo
-            eps=config.eps,
-            layerscale_init=config.layerscale_init,
+        self.blocks = nn.ModuleList(
+            [
+                AdaSTBlock(
+                    dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    mlp_dim_multiplier=config.mlp_dim_multiplier,
+                    causal=True,  # temporal attention causal, matching the real repo
+                    cond_dim=config.hidden_dim,
+                )
+                for _ in range(config.depth)
+            ]
         )
-        self.blocks = nn.ModuleList([SpaceTimeBlock(block_config) for _ in range(config.depth)])
+        self.diffusion_time_embedding = DiffusionTimeEmbedding(dim=config.hidden_dim)
         self.norm_out = nn.LayerNorm(config.hidden_dim, eps=config.eps)
         self.out_proj = nn.Linear(config.hidden_dim, config.latent_dim)
 
@@ -47,8 +52,11 @@ class DiffusionTransformer(nn.Module):
         rope_spatial = spatial_rope(h, w, self.head_dim, self.config.rope_theta_spatial, x.device)
         rope_temporal = temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)
 
+        tau_emb = self.diffusion_time_embedding(tau)  # (b, t, 1, 1, hidden_dim)
+        cond = tau_emb.repeat(1, 1, h, w, 1)  # (b, t, h, w, hidden_dim)
+
         for block in self.blocks:
-            x = block(x, rope_spatial, rope_temporal)
+            x = block(x, cond, rope_spatial, rope_temporal)
 
         x = self.norm_out(x)
         x = self.out_proj(x)

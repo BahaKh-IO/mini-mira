@@ -14,10 +14,9 @@ Design decisions (asked and confirmed rather than assumed):
     clean latent at generation time. The bottleneck-encoded z is used only to get the right
     shape/dtype for that noise, then otherwise unused.
 
-Known limitation, stated rather than hidden: DiffusionTransformer still ignores actions/tau. So this loop is mechanically real (it really
-does call the network multiple times and integrate the predicted velocity), but the
-network's predictions don't actually improve as tau advances, since it can't see tau. The
-loop is correct machinery around a network that doesn't yet use the signal it's given.
+Known limitation, stated rather than hidden: DiffusionTransformer now conditions on tau (via
+AdaLN) but still ignores actions -- actions is threaded through the signature and passed
+down, but nothing inside DiffusionTransformer reads it yet.
 """
 
 from dataclasses import dataclass, field
@@ -49,13 +48,17 @@ class MyPipeline(nn.Module):
     def forward(self, dino_features, actions=None):
         z = self.bottleneck(dino_features)  # codec encode -- used here only for shape/dtype
         z_t = torch.randn_like(z)  # real generation starts from pure noise, not the true latent
+        b, t = z_t.shape[:2]
 
         n_steps = self.config.n_diffusion_steps
         timesteps = torch.linspace(0, 1, n_steps + 1, device=z_t.device)
         delta_t = 1.0 / n_steps
 
         for i in range(n_steps):
-            tau = timesteps[i]
+            # Same tau for every frame at this step (this loop denoises the whole clip
+            # together, not per-frame) -- but DiffusionTimeEmbedding needs a real
+            # (b, t, 1, 1, 1) tensor, not the bare scalar timesteps[i] used to be.
+            tau = timesteps[i] * torch.ones(b, t, 1, 1, 1, device=z_t.device)
             pred_v = self.world_model(z_t, actions, tau)
             z_t = z_t + delta_t * pred_v
 

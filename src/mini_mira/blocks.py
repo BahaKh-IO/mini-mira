@@ -107,3 +107,64 @@ class SpaceTimeBlock(nn.Module):
         x = rearrange(xt, "(b h w) t c -> b t h w c", b=b, h=h, w=w)
         x = x + self.mlp_ls(self.mlp(self.mlp_norm(x)))
         return x
+
+
+class AdaptiveLayerNorm(nn.Module):
+    def __init__(self, embed_dim: int, cond_dim: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.layer_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.gamma_beta = nn.Linear(cond_dim, 2 * embed_dim)
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        normalized_x = self.layer_norm(x)
+        gamma_beta = self.gamma_beta(cond)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        return (1 + gamma) * normalized_x + beta
+
+
+class AdaSTBlock(nn.Module):
+    """Conditioned sibling of SpaceTimeBlock, for the world model only.
+
+    Matches mira's AdaSTBlock in three ways: forward takes (x, cond); all three norms
+    (space, time, mlp) are AdaptiveLayerNorm; there is no LayerScale anywhere.
+
+    Deliberately NOT implemented, unlike mira's version: the time_attention flag (temporal
+    attention is always on here), kv_cache, and return_kv (forward returns just x, not a
+    (x, to_cache) tuple). rope_spatial/rope_temporal are kept (mira's AdaSTBlock has these
+    too, as temporal_rotary_emb/spatial_rotary_emb) so the RoPE wiring already in the world
+    model keeps working.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_dim_multiplier: int, causal: bool, cond_dim: int):
+        super().__init__()
+        self.space_attn_ln = AdaptiveLayerNorm(dim, cond_dim)
+        self.space_attn = SelfAttention(dim, num_heads)
+
+        self.time_attn_ln = AdaptiveLayerNorm(dim, cond_dim)
+        self.time_attn = SelfAttention(dim, num_heads)
+        self.causal = causal
+
+        self.mlp_ln = AdaptiveLayerNorm(dim, cond_dim)
+        self.mlp = SwiGLU(dim, dim_multiplier=mlp_dim_multiplier)
+
+    def forward(
+        self,
+        x,
+        cond: Tensor,
+        rope_spatial: tuple[Tensor, Tensor] | None = None,
+        rope_temporal: tuple[Tensor, Tensor] | None = None,
+    ):
+        b, t, h, w, _ = x.shape
+
+        xs = rearrange(x, "b t h w c -> (b t) (h w) c")
+        cond_s = rearrange(cond, "b t h w c -> (b t) (h w) c")
+        xs = xs + self.space_attn(self.space_attn_ln(xs, cond_s), causal=False, freqs=rope_spatial)
+
+        xt = rearrange(xs, "(b t) (h w) c -> (b h w) t c", b=b, t=t, h=h, w=w)
+        cond_t = rearrange(cond, "b t h w c -> (b h w) t c")
+        xt = xt + self.time_attn(self.time_attn_ln(xt, cond_t), causal=self.causal, freqs=rope_temporal)
+
+        x = rearrange(xt, "(b h w) t c -> b t h w c", b=b, h=h, w=w)
+        x = x + self.mlp(self.mlp_ln(x, cond))
+        return x
