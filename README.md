@@ -46,7 +46,8 @@ Both the decoder and the world model factorize attention into **spatial** (bidir
 within a frame) and **temporal** (causal, across frames) sublayers, followed by a SwiGLU MLP —
 each a pre-norm residual block. Position is encoded with rotary embeddings (RoPE) rather than
 learned positional embeddings; the world model additionally conditions every block on the
-diffusion timestep `tau` via adaptive LayerNorm (AdaLN).
+diffusion timestep `tau` via adaptive LayerNorm (AdaLN), and on the clean latent content of the
+previous frame (`clean_past`) via an additive projection.
 
 ## Project layout
 
@@ -58,9 +59,10 @@ diffusion timestep `tau` via adaptive LayerNorm (AdaLN).
 | `src/mini_mira/blocks.py` | Shared building blocks: `LayerScale`, `SwiGLU`, `SelfAttention`, `SpaceTimeBlock` (decoder), `AdaptiveLayerNorm`, `AdaSTBlock` (world model) |
 | `src/mini_mira/rope.py` | Rotary position embeddings — one shared implementation (temporal + axial spatial), used by both the decoder and the world model |
 | `src/mini_mira/timestep_encoder.py` | `DiffusionTimeEmbedding` — sinusoidal embedding of the diffusion timestep `tau` |
-| `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass |
+| `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos` and builds `clean_past` from the real encoded input |
 | `scripts/test_shapes.py` | Shape-correctness checks for every stage of the pipeline |
-| `scripts/verify_rope.py` | Behavioral checks: causal masking, position sensitivity, and `tau` sensitivity |
+| `scripts/verify_rope.py` | Behavioral checks for RoPE: causal masking and position sensitivity |
+| `scripts/verify_conditioning.py` | Behavioral checks for AdaLN and clean-past: `tau` sensitivity, `clean_past` sensitivity, determinism, and an end-to-end pipeline check |
 
 At the default configuration, the components have the following parameter counts:
 
@@ -68,8 +70,9 @@ At the default configuration, the components have the following parameter counts
 |---|---|
 | Bottleneck | 262,176 |
 | Decoder | 4,893,952 |
-| World model | 6,184,224 |
-| **Total** | **11,340,352** |
+| World model | 6,192,672 |
+| `bos` (owned by `MyPipeline` itself, not any submodule) | 32 |
+| **Total** | **11,348,832** |
 
 ## Scope
 
@@ -79,14 +82,20 @@ At the default configuration, the components have the following parameter counts
 - Rotary position embeddings (temporal + axial 2D spatial).
 - AdaLN conditioning of the world model on the diffusion timestep `tau`, via a sinusoidal
   timestep embedding matched to the real implementation.
+- Clean-past conditioning: each denoising step additively conditions on the real, clean latent
+  content of the previous frame (`clean_past`), with a learned `bos` parameter standing in for
+  the frame before the first one in a clip. This is what makes the pipeline's output actually
+  depend on its input, rather than only on noise and `tau`. Note this is teacher forcing, not
+  generation: `clean_past` here comes from the real, encoded input (ground truth), not from
+  previously-generated frames — true autoregressive rollout is not implemented.
 - Flow-matching sampling: a multi-step Euler integration loop from pure noise to a decoded video.
 
 **Deliberately simplified or not yet implemented**, each a disclosed decision rather than a gap
 found later:
 - **Action conditioning.** `actions` is threaded through every relevant signature but not yet
   encoded or used — the model cannot currently distinguish different action sequences.
-- **Clean-past / diffusion-forcing conditioning.** No mechanism yet lets a denoising step
-  condition on the clean latents of previous frames.
+- **Autoregressive rollout.** `clean_past` is always built from the real encoded input, never
+  from the model's own previous output — see the note above.
 - **Streaming inference.** No KV-cache; every diffusion step recomputes the whole sequence.
 - **The frozen visual encoder.** The pipeline accepts DINOv3-shaped feature tensors as input; it
   does not load or run a real DINOv3 backbone.
@@ -107,15 +116,21 @@ both:
 - **`scripts/test_shapes.py`** — asserts every stage's output shape against the real codec's
   actual configuration (`(2, 40, 1024, 18, 32)` DINO-shaped input through to `(2, 40, 3, 288,
   512)` decoded video).
-- **`scripts/verify_rope.py`** — targeted behavioral checks, each aimed at a specific silent
-  failure mode:
+- **`scripts/verify_rope.py`** — targeted behavioral checks for RoPE, each aimed at a specific
+  silent failure mode:
   - *Causality*: perturbing only the last frame of a clip must not change any earlier frame's
     output.
   - *Position sensitivity*: swapping two input frames must not simply swap the output back — a
     degenerate (all-zero or all-identical) set of rotary frequencies would do exactly that.
+- **`scripts/verify_conditioning.py`** — targeted behavioral checks for AdaLN and clean-past:
   - *`tau` sensitivity*: the same latent with two different `tau` values must produce different
-    predicted velocities; the same latent with identical `tau` values must produce identical
-    output.
+    predicted velocities.
+  - *`clean_past` sensitivity*: the same latent and `tau` with two different `clean_past` values
+    must produce different predicted velocities — and the reverse, identical `clean_past` must
+    produce identical output, confirming the model is deterministic.
+  - *End-to-end*: the same noise seed with two completely different input videos must now
+    produce different decoded output — this is the direct regression test for the bug where the
+    pipeline's output used to be independent of its input entirely.
 
 ## Getting started
 
@@ -125,6 +140,7 @@ scripts add `src/` to `sys.path` directly.
 ```
 python scripts/test_shapes.py
 python scripts/verify_rope.py
+python scripts/verify_conditioning.py
 ```
 
 ## Relationship to mira and attribution
@@ -145,6 +161,6 @@ the original source under its Apache License 2.0 terms.
 ## Status
 
 Architecture-correctness work in progress. Completed so far: shared block/RoPE infrastructure
-decoupled from the decoder and world model, RoPE wired into both, and AdaLN conditioning on
-`tau` wired into the world model. Action conditioning and clean-past conditioning are the next
-pieces of the forward pass to implement.
+decoupled from the decoder and world model, RoPE wired into both, AdaLN conditioning on `tau`,
+and clean-past conditioning (with a learned `bos` for the first frame of a clip). Action
+conditioning is the next piece of the forward pass to implement.
