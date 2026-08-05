@@ -45,7 +45,7 @@ class DiffusionTransformer(nn.Module):
         self.norm_out = nn.LayerNorm(config.hidden_dim, eps=config.eps)
         self.out_proj = nn.Linear(config.hidden_dim, config.latent_dim)
 
-    def forward(self, z_t, actions=None, tau=None, clean_past=None):
+    def forward(self, z_t, a=None, tau=None, clean_past=None):
         b, t, c, h, w = z_t.shape
         x = rearrange(z_t, "b t c h w -> b t h w c")
         x = self.in_proj(x)
@@ -59,7 +59,8 @@ class DiffusionTransformer(nn.Module):
         rope_temporal = temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)
 
         tau_emb = self.diffusion_time_embedding(tau)  # (b, t, 1, 1, hidden_dim)
-        cond = tau_emb.repeat(1, 1, h, w, 1)  # (b, t, h, w, hidden_dim)
+        a_broadcast = rearrange(a, "b t c -> b t 1 1 c").repeat(1, 1, h, w, 1)  # (b, t, h, w, hidden_dim)
+        cond = a_broadcast + tau_emb.repeat(1, 1, h, w, 1)  # (b, t, h, w, hidden_dim)
 
         for block in self.blocks:
             x = block(x, cond, rope_spatial, rope_temporal)
