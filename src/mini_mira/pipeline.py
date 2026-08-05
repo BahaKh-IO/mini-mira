@@ -22,10 +22,16 @@ Design decisions (asked and confirmed rather than assumed):
     repo's. mini_mira's bottleneck/world model never fix a spatial resolution in their configs
     (h, w are only known from the actual input tensor at forward time), so a fixed-grid bos
     would need a new resolution config field that doesn't otherwise exist here.
+  - ActionEncoder lives here too, for the same reason as bos: mira's ActionEncoder belongs to
+    LatentWorldModel, the wrapper that owns the codec's encoder output, not to
+    DiffusionTransformer. Raw actions are encoded into a conditioning tensor here, once, then
+    passed into the world model already-encoded -- DiffusionTransformer never sees raw
+    key-press data, only the embedding.
 
-Known limitation, stated rather than hidden: DiffusionTransformer conditions on tau (AdaLN)
-and clean_past now, but still ignores actions -- actions is threaded through every signature
-and passed down, but nothing inside DiffusionTransformer reads it yet.
+Known limitation, stated rather than hidden: actions are keys-only (no mouse -- see
+action_encoder.py's docstring), and simplified relative to mira's ActionEncoder (no dropout,
+mean-pooling instead of a learned temporal pool, a plain Linear instead of mira's power-of-2
+per-key split -- see notes/deviations.md 1.10).
 """
 
 from dataclasses import dataclass, field
@@ -33,6 +39,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
+from mini_mira.action_encoder import ActionEncoder
 from mini_mira.bottleneck import StridedConvBottleneckConfig, MyBottleneck
 from mini_mira.decoder import ViTDecoderConfig, ViTVideoDecoder
 from mini_mira.world_model import DiffusionTransformer, LatentWorldModelConfig
@@ -44,6 +51,7 @@ class PipelineConfig:
     world_model: LatentWorldModelConfig = field(default_factory=LatentWorldModelConfig)
     decoder: ViTDecoderConfig = field(default_factory=ViTDecoderConfig)
     n_diffusion_steps: int = 4
+    num_keys: int = 9  # the real Rocket League release vocabulary size (W,A,S,D,Q,E,Space,LShift,LCtrl)
 
 
 class MyPipeline(nn.Module):
@@ -54,8 +62,13 @@ class MyPipeline(nn.Module):
         self.world_model = DiffusionTransformer(config.world_model)
         self.decoder = ViTVideoDecoder(config.decoder)
         self.bos = nn.Parameter(0.02 * torch.randn(config.bottleneck.latent_dim))
+        self.action_encoder = ActionEncoder(
+            num_keys=config.num_keys,
+            hidden_dim=config.world_model.hidden_dim,
+            temporal_downsampling=config.bottleneck.temporal_stride,
+        )
 
-    def forward(self, dino_features, actions=None):
+    def forward(self, dino_features, actions):
         z = self.bottleneck(dino_features)  # codec encode -- now actually used, not discarded
         b, t, c, h, w = z.shape
 
@@ -65,6 +78,10 @@ class MyPipeline(nn.Module):
         # never the evolving noisy z_t.
         bos = self.bos.view(1, 1, c, 1, 1).expand(b, 1, c, h, w)
         clean_past = torch.cat([bos, z[:, :-1]], dim=1)
+
+        # Encoded once, like clean_past -- the actions that produced this clip don't change
+        # across diffusion steps, only the noise level (tau) does.
+        a = self.action_encoder(actions)
 
         z_t = torch.randn_like(z)  # real generation starts from pure noise, not the true latent
 
@@ -77,7 +94,7 @@ class MyPipeline(nn.Module):
             # together, not per-frame) -- but DiffusionTimeEmbedding needs a real
             # (b, t, 1, 1, 1) tensor, not the bare scalar timesteps[i] used to be.
             tau = timesteps[i] * torch.ones(b, t, 1, 1, 1, device=z_t.device)
-            pred_v = self.world_model(z_t, actions, tau, clean_past=clean_past)
+            pred_v = self.world_model(z_t, a, tau, clean_past=clean_past)
             z_t = z_t + delta_t * pred_v
 
         return self.decoder(z_t)
