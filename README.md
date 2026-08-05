@@ -45,8 +45,9 @@ DINO-shaped features  (B, T, dino_dim, H, W)
 Both the decoder and the world model factorize attention into **spatial** (bidirectional,
 within a frame) and **temporal** (causal, across frames) sublayers, followed by a SwiGLU MLP —
 each a pre-norm residual block. Position is encoded with rotary embeddings (RoPE) rather than
-learned positional embeddings; the world model additionally conditions every block on the
-diffusion timestep `tau` via adaptive LayerNorm (AdaLN), and on the clean latent content of the
+learned positional embeddings; the world model additionally conditions every block, via adaptive
+LayerNorm (AdaLN), on the diffusion timestep `tau` and on the player's key-press actions
+(encoded by `ActionEncoder`) — and separately conditions on the clean latent content of the
 previous frame (`clean_past`) via an additive projection.
 
 ## Project layout
@@ -59,10 +60,11 @@ previous frame (`clean_past`) via an additive projection.
 | `src/mini_mira/blocks.py` | Shared building blocks: `LayerScale`, `SwiGLU`, `SelfAttention`, `SpaceTimeBlock` (decoder), `AdaptiveLayerNorm`, `AdaSTBlock` (world model) |
 | `src/mini_mira/rope.py` | Rotary position embeddings — one shared implementation (temporal + axial spatial), used by both the decoder and the world model |
 | `src/mini_mira/timestep_encoder.py` | `DiffusionTimeEmbedding` — sinusoidal embedding of the diffusion timestep `tau` |
-| `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos` and builds `clean_past` from the real encoded input |
+| `src/mini_mira/action_encoder.py` | `ActionEncoder` — encodes raw multi-hot key-press actions into per-latent-frame conditioning vectors |
+| `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos`/`clean_past` and `ActionEncoder` |
 | `scripts/test_shapes.py` | Shape-correctness checks for every stage of the pipeline |
 | `scripts/verify_rope.py` | Behavioral checks for RoPE: causal masking and position sensitivity |
-| `scripts/verify_conditioning.py` | Behavioral checks for AdaLN and clean-past: `tau` sensitivity, `clean_past` sensitivity, determinism, and an end-to-end pipeline check |
+| `scripts/verify_conditioning.py` | Behavioral checks for AdaLN, clean-past, and actions: `tau`/`clean_past`/action sensitivity, determinism, and end-to-end pipeline checks |
 
 At the default configuration, the components have the following parameter counts:
 
@@ -71,8 +73,9 @@ At the default configuration, the components have the following parameter counts
 | Bottleneck | 262,176 |
 | Decoder | 4,893,952 |
 | World model | 6,192,672 |
+| Action encoder (9 keys) | 37,664 |
 | `bos` (owned by `MyPipeline` itself, not any submodule) | 32 |
-| **Total** | **11,348,832** |
+| **Total** | **11,386,496** |
 
 ## Scope
 
@@ -88,12 +91,21 @@ At the default configuration, the components have the following parameter counts
   depend on its input, rather than only on noise and `tau`. Note this is teacher forcing, not
   generation: `clean_past` here comes from the real, encoded input (ground truth), not from
   previously-generated frames — true autoregressive rollout is not implemented.
+- Action conditioning: raw multi-hot key-press actions are encoded by `ActionEncoder` (per-key
+  learned embeddings, pooled from video frame rate to latent frame rate, with a learned
+  `initial_action_token` standing in for the action before the first frame — the same role
+  `bos` plays for `clean_past`) and added into the same AdaLN `cond` signal as `tau`.
 - Flow-matching sampling: a multi-step Euler integration loop from pure noise to a decoded video.
 
 **Deliberately simplified or not yet implemented**, each a disclosed decision rather than a gap
 found later:
-- **Action conditioning.** `actions` is threaded through every relevant signature but not yet
-  encoded or used — the model cannot currently distinguish different action sequences.
+- **Actions are keys only, no mouse.** The released Rocket League data never carries real mouse
+  signal either (mouse movement is always zero, sensitivity always unknown), so this matches
+  mira's actual data more than it simplifies away from it. Also simplified relative to mira's
+  `ActionEncoder`: no dropout (training-only), mean-pooling instead of a learned temporal pool,
+  and a plain `Linear` projection instead of mira's power-of-2 per-key dimension split (which,
+  at mira's real numbers, wastes 44% of its keyboard channels as zero-padding — see
+  `notes/deviations.md`).
 - **Autoregressive rollout.** `clean_past` is always built from the real encoded input, never
   from the model's own previous output — see the note above.
 - **Streaming inference.** No KV-cache; every diffusion step recomputes the whole sequence.
@@ -122,15 +134,21 @@ both:
     output.
   - *Position sensitivity*: swapping two input frames must not simply swap the output back — a
     degenerate (all-zero or all-identical) set of rotary frequencies would do exactly that.
-- **`scripts/verify_conditioning.py`** — targeted behavioral checks for AdaLN and clean-past:
+- **`scripts/verify_conditioning.py`** — targeted behavioral checks for AdaLN, clean-past, and
+  actions:
   - *`tau` sensitivity*: the same latent with two different `tau` values must produce different
     predicted velocities.
   - *`clean_past` sensitivity*: the same latent and `tau` with two different `clean_past` values
     must produce different predicted velocities — and the reverse, identical `clean_past` must
     produce identical output, confirming the model is deterministic.
-  - *End-to-end*: the same noise seed with two completely different input videos must now
-    produce different decoded output — this is the direct regression test for the bug where the
-    pipeline's output used to be independent of its input entirely.
+  - *Actions sensitivity*: the same latent, `tau`, and `clean_past` with two different encoded
+    action tensors must produce different predicted velocities.
+  - *End-to-end (clean_past)*: the same noise seed with two completely different input videos
+    must now produce different decoded output — the direct regression test for the bug where
+    the pipeline's output used to be independent of its input entirely.
+  - *End-to-end (actions)*: the same input video and noise seed with two different raw key-press
+    sequences must produce different decoded output — this exercises `ActionEncoder` itself
+    (per-key embeddings, temporal pooling, `initial_action_token`), not just the AdaLN pathway.
 
 ## Getting started
 
@@ -162,5 +180,8 @@ the original source under its Apache License 2.0 terms.
 
 Architecture-correctness work in progress. Completed so far: shared block/RoPE infrastructure
 decoupled from the decoder and world model, RoPE wired into both, AdaLN conditioning on `tau`,
-and clean-past conditioning (with a learned `bos` for the first frame of a clip). Action
-conditioning is the next piece of the forward pass to implement.
+clean-past conditioning (with a learned `bos` for the first frame of a clip), and action
+conditioning (with a learned `initial_action_token` playing the same role for the first frame's
+missing action). The forward pass now conditions on every signal mira's real architecture
+conditions on. Remaining gaps are the ones listed in Scope above: no autoregressive rollout, no
+streaming inference, no real DINOv3 backbone, and no training.
