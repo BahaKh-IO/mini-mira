@@ -18,13 +18,14 @@ with torch.no_grad():
     z = torch.randn(1, 6, 32, 4, 4)
     tau = torch.rand(1, 6, 1, 1, 1)  # fixed, shared tau -- these checks aren't testing tau
     clean_past = torch.randn(1, 6, 32, 4, 4)  # fixed, shared clean_past -- ditto
-    out1 = world_model(z, tau=tau, clean_past=clean_past)
+    a = torch.randn(1, 6, 256)  # fixed, shared already-encoded actions -- ditto
+    out1 = world_model(z, a=a, tau=tau, clean_past=clean_past)
 
     # Perturb only the LAST frame. Earlier outputs must be byte-identical --
     # a causal model cannot let a future frame change the past.
     z_perturbed = z.clone()
     z_perturbed[:, -1] += 100.0
-    out2 = world_model(z_perturbed, tau=tau, clean_past=clean_past)
+    out2 = world_model(z_perturbed, a=a, tau=tau, clean_past=clean_past)
 
     earlier_diff = (out1[:, :-1] - out2[:, :-1]).abs().max().item()
     last_diff = (out1[:, -1] - out2[:, -1]).abs().max().item()
@@ -38,7 +39,7 @@ with torch.no_grad():
     # would be treating position as irrelevant (the classic "all-zero freqs" bug).
     z_swapped = z.clone()
     z_swapped[:, [0, 1]] = z_swapped[:, [1, 0]]
-    out3 = world_model(z_swapped, tau=tau, clean_past=clean_past)
+    out3 = world_model(z_swapped, a=a, tau=tau, clean_past=clean_past)
 
     naive_swap = out1.clone()
     naive_swap[:, [0, 1]] = naive_swap[:, [1, 0]]

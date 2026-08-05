@@ -36,7 +36,8 @@ with torch.inference_mode():
     z_t = torch.randn(2, 20, 32, 9, 16)
     tau = torch.rand(2, 20, 1, 1, 1)  # one noise level per latent frame, shape (b, t, 1, 1, 1)
     clean_past = torch.randn(2, 20, 32, 9, 16)  # same shape as z_t -- the frame-before content
-    pred_v = world_model(z_t, actions=None, tau=tau, clean_past=clean_past)
+    a = torch.randn(2, 20, 256)  # already-encoded actions -- ActionEncoder lives on MyPipeline, not here
+    pred_v = world_model(z_t, a=a, tau=tau, clean_past=clean_past)
 
     print("Day 3:", pred_v.shape)
 
@@ -45,7 +46,11 @@ with torch.inference_mode():
     pipeline_config = PipelineConfig()
     pipeline = MyPipeline(pipeline_config)
     dino_features = torch.randn(2, 40, 1024, 18, 32)
-    video = pipeline(dino_features, actions=None)
+    # raw key-presses at video frame rate: (T_latent - 1) * temporal_downsampling = (20-1)*2 = 38,
+    # not 40 -- there's no real action for the frame before frame 0 (see ActionEncoder's
+    # initial_action_token).
+    actions = torch.randint(0, 2, (2, 38, 9))
+    video = pipeline(dino_features, actions)
 
     print("Day 4:", video.shape)
 
