@@ -5,6 +5,17 @@ DinoModel/DINOv3 backbone itself was NOT constructed (it pulls in torchvision + 
 detection/eval modules just to load a plain feature extractor). Not needed here anyway:
 the bottleneck only needs a tensor shaped like DINO's output, not DINO itself.
 
+NOTE (added once the real DINOv3 backbone was actually integrated, src/mini_mira/dino.py):
+this trace's dino_dim=1024 reflects dinov3_vitl16, which was just the DINO_DIM entry
+arbitrarily referenced for a Day 1 shape check -- not a project-wide decision. mini_mira's
+actual default config now loads dinov3_vitb16 (dino_dim=768; the real, gated weights this
+project obtained), and torchvision turned out to be needed after all -- it was the missing
+dependency for torch.hub.load's hubconf.py, not for the plain backbone. Neither change
+invalidates this trace: dino_dim is only the bottleneck conv's input channel count and is
+fully decoupled from latent_dim/stride/temporal_stride below, so the shape relationship this
+trace documents holds for either variant. Left as originally captured rather than edited to
+match current defaults, since it's a record of what was true then, not living documentation.
+
 Config used (mira.codec.config.StridedConvBottleneckConfig + mira.codec.dino.DINO_DIM):
   dino_dim        = 1024   (DINO_DIM["dinov3_vitl16"])
   latent_dim      = 32
