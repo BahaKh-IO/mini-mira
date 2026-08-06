@@ -5,7 +5,7 @@ from einops import rearrange
 
 @dataclass
 class StridedConvBottleneckConfig :
-    dino_dim : int = 1024
+    dino_dim : int = 768  # dinov3_vitb16's feature width -- the real variant this project loads
     latent_dim : int = 32
     stride : int = 2
     temporal_stride : int = 2
