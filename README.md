@@ -54,19 +54,22 @@ previous frame (`clean_past`) via an additive projection.
 
 | File | Contents |
 |---|---|
-| `src/mini_mira/bottleneck.py` | `StridedConvBottleneckConfig`, `MyBottleneck` — the encoder-side strided-conv projection into the latent |
-| `src/mini_mira/decoder.py` | `ViTDecoderConfig`, `ViTVideoDecoder`, `PatchUnembed` — the space-time ViT decoder |
-| `src/mini_mira/world_model.py` | `LatentWorldModelConfig`, `DiffusionTransformer` — the AdaLN-conditioned diffusion transformer |
-| `src/mini_mira/blocks.py` | Shared building blocks: `LayerScale`, `SwiGLU`, `SelfAttention`, `SpaceTimeBlock` (decoder), `AdaptiveLayerNorm`, `AdaSTBlock` (world model) |
-| `src/mini_mira/rope.py` | Rotary position embeddings — one shared implementation (temporal + axial spatial), used by both the decoder and the world model |
-| `src/mini_mira/timestep_encoder.py` | `DiffusionTimeEmbedding` — sinusoidal embedding of the diffusion timestep `tau` |
-| `src/mini_mira/action_encoder.py` | `ActionEncoder` — encodes raw multi-hot key-press actions into per-latent-frame conditioning vectors |
+| `src/mini_mira/codec/bottleneck.py` | `StridedConvBottleneckConfig`, `MyBottleneck` — the encoder-side strided-conv projection into the latent |
+| `src/mini_mira/codec/decoder.py` | `ViTDecoderConfig`, `ViTVideoDecoder`, `PatchUnembed` — the space-time ViT decoder |
+| `src/mini_mira/world_model/diffusion_transformer.py` | `LatentWorldModelConfig`, `DiffusionTransformer` — the AdaLN-conditioned diffusion transformer |
+| `src/mini_mira/ml/blocks.py` | Shared building blocks: `LayerScale`, `SwiGLU`, `SelfAttention`, `SpaceTimeBlock` (decoder), `AdaptiveLayerNorm`, `AdaSTBlock` (world model) |
+| `src/mini_mira/ml/rope.py` | Rotary position embeddings — one shared implementation (temporal + axial spatial), used by both the decoder and the world model |
+| `src/mini_mira/world_model/timestep_encoder.py` | `DiffusionTimeEmbedding` — sinusoidal embedding of the diffusion timestep `tau` |
+| `src/mini_mira/world_model/action_encoder.py` | `ActionEncoder` — encodes raw multi-hot key-press actions into per-latent-frame conditioning vectors |
 | `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos`/`clean_past` and `ActionEncoder` |
-| `src/mini_mira/dino.py` | `DinoModel` — the real, frozen DINOv3 (ViT-B/16) backbone; loads real pretrained weights, not yet wired into `MyPipeline` (see Scope) |
+| `src/mini_mira/codec/dino.py` | `DinoModel` — the real, frozen DINOv3 (ViT-B/16) backbone; loads real pretrained weights, wired into `MyPipeline` behind `PipelineConfig.use_real_dino` (see Scope) |
 | `scripts/test_shapes.py` | Shape-correctness checks for every stage of the pipeline |
 | `scripts/verify_rope.py` | Behavioral checks for RoPE: causal masking and position sensitivity |
 | `scripts/verify_conditioning.py` | Behavioral checks for AdaLN, clean-past, and actions: `tau`/`clean_past`/action sensitivity, determinism, and end-to-end pipeline checks |
 | `scripts/verify_dino.py` | Behavioral checks for the real DINOv3 backbone: frozen parameters, correct output shape, patch-alignment resizing, non-degenerate features. Requires real gated weights on disk (see Getting started) |
+| `src/mini_mira/ml/config_loading.py` | `load_pipeline_config` — builds a `PipelineConfig` from a YAML preset under `configs/` |
+| `configs/small.yaml` | Named preset mirroring today's dataclass defaults exactly (regression-safe baseline) |
+| `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target |
 
 At the default configuration, the components have the following parameter counts:
 
@@ -104,15 +107,17 @@ backbone isn't part of that budget any more than it is in real mira.
   `initial_action_token` standing in for the action before the first frame — the same role
   `bos` plays for `clean_past`) and added into the same AdaLN `cond` signal as `tau`.
 - Flow-matching sampling: a multi-step Euler integration loop from pure noise to a decoded video.
-- The frozen visual encoder (`DinoModel`, `src/mini_mira/dino.py`): the real DINOv3 ViT-B/16
+- The frozen visual encoder (`DinoModel`, `src/mini_mira/codec/dino.py`): the real DINOv3 ViT-B/16
   backbone, loaded with real pretrained weights (gated by Meta — must be downloaded manually
   and pointed to via `RS_DINO_WEIGHTS_DIR`, matching mira's own environment variable
   convention). Loaded by importing the backbone constructor directly rather than through
   `torch.hub.load`'s `hubconf.py`, which otherwise pulls in unrelated segmentation/detection/
   depth/text-alignment dependencies this project never uses — see `notes/deviations.md`.
-  **Not yet wired into `MyPipeline`**: it's a separate, independently verified component
-  (`scripts/verify_dino.py`); `MyPipeline.forward` still takes pre-encoded `dino_features`
-  directly, the same as before.
+  Wired into `MyPipeline` behind an opt-in flag: `PipelineConfig.use_real_dino` (default
+  `False`) keeps every existing fast test unchanged, taking pre-encoded `dino_features`
+  directly; setting it `True` builds the real frozen backbone in `__init__` and switches
+  `forward`'s first argument to raw video instead, verified end to end in
+  `scripts/verify_dino.py`.
 
 **Deliberately simplified or not yet implemented**, each a disclosed decision rather than a gap
 found later:
@@ -126,10 +131,6 @@ found later:
 - **Autoregressive rollout.** `clean_past` is always built from the real encoded input, never
   from the model's own previous output — see the note above.
 - **Streaming inference.** No KV-cache; every diffusion step recomputes the whole sequence.
-- **`DinoModel` isn't wired into `MyPipeline` yet.** The real backbone exists and is verified in
-  isolation (see above), but `MyPipeline.forward` still takes pre-encoded `dino_features`
-  tensors directly rather than raw video — connecting the two is a separate, deliberately
-  deferred step.
 - **Grouped-query attention.** Attention here always uses as many KV heads as query heads.
 - **Training.** No loss functions, optimizer, or data loading exist. Every weight is randomly
   initialized; this project verifies architecture and shapes, not learned behavior.
@@ -179,10 +180,10 @@ both:
 
 ## Getting started
 
-Requirements: Python ≥ 3.10, plus `requirements.txt` (`torch`, `einops` — verified against the
-actual code paths used, not against everything installed while debugging DINOv3 loading; see
-`notes/deviations.md` 1.14). There is no packaging configuration — the scripts add `src/` to
-`sys.path` directly.
+Requirements: Python ≥ 3.10, plus `requirements.txt` (`torch`, `einops`, `pyyaml` — verified
+against the actual code paths used, not against everything installed while debugging DINOv3
+loading; see `notes/deviations.md` 1.14). There is no packaging configuration — the scripts add
+`src/` to `sys.path` directly.
 
 ```
 pip install -r requirements.txt
@@ -199,6 +200,39 @@ pointed to via an environment variable — matching mira's own convention exactl
 ```
 RS_DINO_WEIGHTS_DIR=/path/to/dir/containing/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth python scripts/verify_dino.py
 ```
+
+## Configs
+
+Named, comparable presets for `PipelineConfig` live in `configs/` at the repo root — data, not
+installable package code, so it sits alongside `src/`, `scripts/`, `notes/`, and `traces/` rather
+than under `src/mini_mira/` — matching the real mira release's own top-level `mira/configs/`
+convention. This is a deliberately lightweight system: one YAML file is one full preset mirroring
+`PipelineConfig`'s whole nested shape (`bottleneck` / `world_model` / `decoder` sections, plus the
+top-level `n_diffusion_steps` / `num_keys` fields) — not mira's own per-component-file composition
+system (no Hydra, no config groups, no CLI overrides).
+
+| File | Purpose |
+|---|---|
+| `configs/small.yaml` | Mirrors today's dataclass defaults exactly — a regression-safe baseline preset (11,320,960 parameters) |
+| `configs/scaled_300m.yaml` | Scales `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target, tuned to also roughly match real mira's own world_model/decoder size ratio (1.82) rather than pinning the decoder to the frozen-encoder size exactly (measured: 292,457,344 parameters, ratio 1.81) |
+
+Load a preset with `load_pipeline_config` (`src/mini_mira/ml/config_loading.py`):
+
+```python
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+from mini_mira.ml.config_loading import load_pipeline_config
+from mini_mira.pipeline import MyPipeline
+
+config = load_pipeline_config("configs/scaled_300m.yaml")
+pipeline = MyPipeline(config)
+```
+
+Each section is keyword-unpacked straight into its dataclass's constructor, so an unrecognized
+key raises `TypeError` immediately — the same typo safety as constructing the dataclass directly
+in Python.
 
 ## Relationship to mira and attribution
 
@@ -222,7 +256,7 @@ decoupled from the decoder and world model, RoPE wired into both, AdaLN conditio
 clean-past conditioning (with a learned `bos` for the first frame of a clip), action
 conditioning (with a learned `initial_action_token` playing the same role for the first frame's
 missing action), and the real, frozen DINOv3 backbone (loaded with real pretrained weights,
-verified in isolation, not yet wired into `MyPipeline`). The forward pass now conditions on
-every signal mira's real architecture conditions on. Remaining gaps are the ones listed in
-Scope above: no autoregressive rollout, no streaming inference, `DinoModel` not yet connected
-to `MyPipeline`, and no training.
+wired into `MyPipeline` behind the opt-in `use_real_dino` flag so existing fast tests stay
+unaffected). The forward pass now conditions on every signal mira's real architecture conditions
+on. Remaining gaps are the ones listed in Scope above: no autoregressive rollout, no streaming
+inference, and no training.
