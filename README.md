@@ -50,6 +50,36 @@ LayerNorm (AdaLN), on the diffusion timestep `tau` and on the player's key-press
 (encoded by `ActionEncoder`) — and separately conditions on the clean latent content of the
 previous frame (`clean_past`) via an additive projection.
 
+### Scale
+
+The supervisor's target is ~300M parameters. `configs/scaled_300m.yaml` is the real attempt at
+that target — this is the architecture's intended scale, measured from a real instantiated
+`MyPipeline`, not estimated:
+
+| Component | Parameters |
+|---|---|
+| Bottleneck | 196,640 |
+| Decoder (width=1024, depth=6, 16 heads) | 104,000,000 |
+| World model (hidden_dim=1024, depth=8, 16 heads) | 188,110,880 |
+| Action encoder (9 keys) | 149,792 |
+| `bos` | 32 |
+| **Total** | **292,457,344** (−2.51% vs. the 300M target) |
+| `DinoModel` (dinov3_vitb16, frozen, real pretrained weights, not part of the total above) | 85,669,632 |
+
+The decoder/world-model split isn't arbitrary: it's tuned so the **world_model/decoder parameter
+ratio (1.81) roughly matches real mira's own shipped-config ratio (1.82)** — measured the same
+way from real mira's actual `ViTVideoDecoder`/`DiffusionTransformer` classes at their shipped
+hyperparameters — rather than picking a split by feel. An earlier draft instead pinned the
+decoder to match the frozen-DINOv3-plus-bottleneck "encoder" size exactly, but that made the
+ratio 2.43 — notably *more* lopsided than real mira's own architecture. See `configs/scaled_300m.yaml`'s comments for the full numbers, and [Configs](#configs) below for how to load it.
+
+**Every fast verification script in this project (see [Verification](#verification)) instead
+uses a much smaller configuration** — `PipelineConfig()`'s own Python defaults, matching
+`configs/small.yaml`, ~11.3M parameters — purely so shape and behavior checks run in
+milliseconds without needing gated weights loaded. This mirrors real mira's own relationship
+between its class-level config defaults and its actual shipped configs: the small numbers are a
+convenience for fast iteration, not the intended final scale.
+
 ## Project layout
 
 | File | Contents |
@@ -67,26 +97,13 @@ previous frame (`clean_past`) via an additive projection.
 | `scripts/verify_rope.py` | Behavioral checks for RoPE: causal masking and position sensitivity |
 | `scripts/verify_conditioning.py` | Behavioral checks for AdaLN, clean-past, and actions: `tau`/`clean_past`/action sensitivity, determinism, and end-to-end pipeline checks |
 | `scripts/verify_dino.py` | Behavioral checks for the real DINOv3 backbone: frozen parameters, correct output shape, patch-alignment resizing, non-degenerate features. Requires real gated weights on disk (see Getting started) |
+| `scripts/test_dino.py` | Raw sanity check for the dinov3_vitb16 backbone bypassing `DinoModel` entirely — a diagnostic to tell apart "mini_mira's wrapper is broken" from "the underlying library/weights are broken" if `verify_dino.py` ever fails |
 | `src/mini_mira/ml/config_loading.py` | `load_pipeline_config` — builds a `PipelineConfig` from a YAML preset under `configs/` |
 | `configs/small.yaml` | Named preset mirroring today's dataclass defaults exactly (regression-safe baseline) |
 | `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target |
 
-At the default configuration, the components have the following parameter counts:
-
-| Component | Parameters |
-|---|---|
-| Bottleneck | 262,176 |
-| Decoder | 4,893,952 |
-| World model | 6,192,672 |
-| Action encoder (9 keys) | 37,664 |
-| `bos` (owned by `MyPipeline` itself, not any submodule) | 32 |
-| **Total (mini_mira's own architecture)** | **11,386,496** |
-| `DinoModel` (dinov3_vitb16, frozen, real pretrained weights) | 85,669,632 |
-
-`DinoModel`'s 85.7M parameters are frozen (real pretrained DINOv3, not trained by this
-project) and kept out of the total above deliberately — that total tracks mini_mira's own
-architecture size against the supervisor's ~300M scaling target, and a frozen pretrained
-backbone isn't part of that budget any more than it is in real mira.
+See [Scale](#scale) above for parameter counts at both the intended ~300M scale
+(`configs/scaled_300m.yaml`) and the small default used for fast testing (`configs/small.yaml`).
 
 ## Scope
 
@@ -213,8 +230,8 @@ system (no Hydra, no config groups, no CLI overrides).
 
 | File | Purpose |
 |---|---|
-| `configs/small.yaml` | Mirrors today's dataclass defaults exactly — a regression-safe baseline preset (11,320,960 parameters) |
-| `configs/scaled_300m.yaml` | Scales `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target, tuned to also roughly match real mira's own world_model/decoder size ratio (1.82) rather than pinning the decoder to the frozen-encoder size exactly (measured: 292,457,344 parameters, ratio 1.81) |
+| `configs/scaled_300m.yaml` | **The intended architecture scale** — scales `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target, tuned to also roughly match real mira's own world_model/decoder size ratio (1.82) rather than pinning the decoder to the frozen-encoder size exactly (measured: 292,457,344 parameters, ratio 1.81). See [Scale](#scale) above. |
+| `configs/small.yaml` | Mirrors `PipelineConfig()`'s own Python defaults exactly — the size every fast verification script uses (11,320,960 parameters), not the intended final scale |
 
 Load a preset with `load_pipeline_config` (`src/mini_mira/ml/config_loading.py`):
 
