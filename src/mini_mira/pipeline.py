@@ -32,6 +32,15 @@ Known limitation, stated rather than hidden: actions are keys-only (no mouse -- 
 action_encoder.py's docstring), and simplified relative to mira's ActionEncoder (no dropout,
 mean-pooling instead of a learned temporal pool, a plain Linear instead of mira's power-of-2
 per-key split -- see notes/deviations.md 1.10).
+
+use_real_dino (config flag, default False): when off, forward's first argument is pre-encoded
+DINO-shaped features, exactly as before -- every existing fast test script keeps working
+unchanged, with no gated weights or real backbone needed. When on, MyPipeline builds a real,
+frozen DinoModel in __init__ (following the same "don't create the parameter if the feature is
+off" pattern already used for past_proj/bos elsewhere in this codebase, so a pipeline built
+without it stays a strict subset), and forward's first argument becomes raw video instead --
+the real backbone runs internally before the bottleneck. This is what a real training loop
+would use; the flag exists so fast architecture verification doesn't have to pay for it.
 """
 
 from dataclasses import dataclass, field
@@ -39,10 +48,11 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
-from mini_mira.action_encoder import ActionEncoder
-from mini_mira.bottleneck import StridedConvBottleneckConfig, MyBottleneck
-from mini_mira.decoder import ViTDecoderConfig, ViTVideoDecoder
-from mini_mira.world_model import DiffusionTransformer, LatentWorldModelConfig
+from mini_mira.world_model.action_encoder import ActionEncoder
+from mini_mira.codec.bottleneck import StridedConvBottleneckConfig, MyBottleneck
+from mini_mira.codec.decoder import ViTDecoderConfig, ViTVideoDecoder
+from mini_mira.codec.dino import DinoModel
+from mini_mira.world_model.diffusion_transformer import DiffusionTransformer, LatentWorldModelConfig
 
 
 @dataclass
@@ -52,6 +62,7 @@ class PipelineConfig:
     decoder: ViTDecoderConfig = field(default_factory=ViTDecoderConfig)
     n_diffusion_steps: int = 4
     num_keys: int = 9  # the real Rocket League release vocabulary size (W,A,S,D,Q,E,Space,LShift,LCtrl)
+    use_real_dino: bool = False  # see module docstring
 
 
 class MyPipeline(nn.Module):
@@ -67,8 +78,15 @@ class MyPipeline(nn.Module):
             hidden_dim=config.world_model.hidden_dim,
             temporal_downsampling=config.bottleneck.temporal_stride,
         )
+        # Only built when use_real_dino is on -- mirrors past_proj/bos's own pattern (config.py:50-53
+        # in mira, see notes/deviations.md) so a pipeline built with the flag off stays a strict
+        # subset, not a superset with an unused frozen backbone sitting in it.
+        self.dino = DinoModel() if config.use_real_dino else None
 
-    def forward(self, dino_features, actions):
+    def forward(self, x, actions):
+        # x is (B, T, dino_dim, H, W) pre-encoded DINO features if use_real_dino is False (the
+        # default); (B, T, 3, H, W) raw video in [0, 1] if use_real_dino is True.
+        dino_features = self.dino.dino_forward(x) if self.config.use_real_dino else x
         z = self.bottleneck(dino_features)  # codec encode -- now actually used, not discarded
         b, t, c, h, w = z.shape
 
