@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 from mini_mira.pipeline import PipelineConfig, MyPipeline
-from mini_mira.world_model import LatentWorldModelConfig, DiffusionTransformer
+from mini_mira.world_model.diffusion_transformer import LatentWorldModelConfig, DiffusionTransformer
 
 torch.manual_seed(0)
 

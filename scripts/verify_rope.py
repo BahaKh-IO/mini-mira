@@ -4,8 +4,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
-from mini_mira.decoder import ViTDecoderConfig, ViTVideoDecoder
-from mini_mira.world_model import LatentWorldModelConfig, DiffusionTransformer
+from mini_mira.codec.decoder import ViTDecoderConfig, ViTVideoDecoder
+from mini_mira.world_model.diffusion_transformer import LatentWorldModelConfig, DiffusionTransformer
 
 torch.manual_seed(0)
 

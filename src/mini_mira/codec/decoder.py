@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from mini_mira.blocks import BlockConfig, SpaceTimeBlock
-from mini_mira.rope import spatial_rope, temporal_rope
+from mini_mira.ml.blocks import BlockConfig, SpaceTimeBlock
+from mini_mira.ml.rope import spatial_rope, temporal_rope
 
 
 @dataclass

@@ -5,9 +5,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 import torch
-from mini_mira.bottleneck import StridedConvBottleneckConfig, MyBottleneck
-from mini_mira.decoder import ViTDecoderConfig, ViTVideoDecoder
-from mini_mira.world_model import LatentWorldModelConfig, DiffusionTransformer
+from mini_mira.codec.bottleneck import StridedConvBottleneckConfig, MyBottleneck
+from mini_mira.codec.decoder import ViTDecoderConfig, ViTVideoDecoder
+from mini_mira.world_model.diffusion_transformer import LatentWorldModelConfig, DiffusionTransformer
 from mini_mira.pipeline import PipelineConfig, MyPipeline
 
 with torch.inference_mode():

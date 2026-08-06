@@ -3,9 +3,9 @@ from dataclasses import dataclass
 import torch.nn as nn
 from einops import rearrange
 
-from mini_mira.blocks import AdaSTBlock
-from mini_mira.rope import spatial_rope, temporal_rope
-from mini_mira.timestep_encoder import DiffusionTimeEmbedding
+from mini_mira.ml.blocks import AdaSTBlock
+from mini_mira.ml.rope import spatial_rope, temporal_rope
+from mini_mira.world_model.timestep_encoder import DiffusionTimeEmbedding
 
 
 @dataclass
