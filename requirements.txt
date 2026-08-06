@@ -1,0 +1,6 @@
+# Verified against the actual code paths this project uses (not against what happened to be
+# installed during development -- see notes/deviations.md 1.14 for why torchvision, torchmetrics,
+# and termcolor are all NOT listed here despite coming up while wiring up DINOv3: they're only
+# needed by torch.hub.load's hubconf.py route, which mini_mira deliberately bypasses).
+torch>=2.0
+einops>=0.8
