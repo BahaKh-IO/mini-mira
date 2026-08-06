@@ -67,10 +67,11 @@ with torch.no_grad():
     # Same input video, same noise seed, two different RAW key-press sequences -> the decoded
     # output must differ. This exercises ActionEncoder itself (per-key embeddings, temporal
     # pooling, initial_action_token), not just the AdaLN pathway above.
-    pipeline_actions = MyPipeline(PipelineConfig())
+    actions_config = PipelineConfig()
+    pipeline_actions = MyPipeline(actions_config)
     pipeline_actions.eval()
 
-    same_video = torch.randn(1, 4, 1024, 4, 4)
+    same_video = torch.randn(1, 4, actions_config.bottleneck.dino_dim, 4, 4)
     keys_all_zero = torch.zeros(1, 2, 9, dtype=torch.long)  # no keys pressed, ever
     keys_all_w = torch.zeros(1, 2, 9, dtype=torch.long)
     keys_all_w[:, :, 0] = 1  # key index 0 held down the whole clip (no name<->index mapping exists in mini_mira)
@@ -89,11 +90,12 @@ with torch.no_grad():
     # Same noise seed, two completely different input videos -> the DECODED OUTPUT must now
     # differ. Before clean_past existed, this printed exactly 0.0 (the encoded input was
     # computed and then discarded -- see pipeline.py's docstring for the full story).
-    pipeline = MyPipeline(PipelineConfig())
+    pipeline_config = PipelineConfig()
+    pipeline = MyPipeline(pipeline_config)
     pipeline.eval()
 
-    video_a = torch.randn(1, 4, 1024, 4, 4)
-    video_b = torch.zeros(1, 4, 1024, 4, 4)
+    video_a = torch.randn(1, 4, pipeline_config.bottleneck.dino_dim, 4, 4)
+    video_b = torch.zeros(1, 4, pipeline_config.bottleneck.dino_dim, 4, 4)
     # raw_t = (T_latent - 1) * temporal_downsampling = (2 - 1) * 2 = 2, for a 4-frame clip.
     shared_actions = torch.randint(0, 2, (1, 2, 9))
 
