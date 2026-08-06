@@ -4,3 +4,7 @@
 # needed by torch.hub.load's hubconf.py route, which mini_mira deliberately bypasses).
 torch>=2.0
 einops>=0.8
+# Used directly by mini_mira.ml.config_loading to parse configs/*.yaml presets (previously only
+# a transitive dependency pulled in by other installed packages; 6.0.2 is the version actually
+# installed and verified against here).
+pyyaml>=6.0
