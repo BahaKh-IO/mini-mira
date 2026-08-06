@@ -13,8 +13,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
-from mini_mira.bottleneck import StridedConvBottleneckConfig
-from mini_mira.dino import DinoModel
+from mini_mira.codec.bottleneck import StridedConvBottleneckConfig
+from mini_mira.codec.dino import DinoModel
+from mini_mira.pipeline import PipelineConfig, MyPipeline
 
 if not os.environ.get("RS_DINO_WEIGHTS_DIR"):
     raise SystemExit(
@@ -57,5 +58,19 @@ with torch.no_grad():
     assert torch.isfinite(out).all(), "DINO features contain NaN/Inf"
     assert out.std().item() > 0.01, f"DINO features look degenerate (std={out.std().item():.6f})"
     print(f"[PASS] output is finite and non-degenerate: mean={out.mean().item():.4f}, std={out.std().item():.4f}")
+
+    # --- end-to-end: MyPipeline with use_real_dino=True, raw video in, decoded video out ---
+    # This exercises the actual wiring (pipeline.py's forward branches on the flag and calls
+    # self.dino.dino_forward internally), not just DinoModel alone -- the exact thing a real
+    # training loop would call. Small resolution/depths (PipelineConfig()'s own small defaults)
+    # to keep this fast despite the real backbone.
+    real_dino_config = PipelineConfig(use_real_dino=True)
+    real_dino_pipeline = MyPipeline(real_dino_config)
+    real_dino_pipeline.eval()
+
+    raw_video = torch.rand(1, 4, 3, 32, 32)  # (b, t, c, h, w) in [0, 1] -- 32x32 is patch-aligned
+    raw_actions = torch.randint(0, 2, (1, 2, real_dino_config.num_keys))
+    decoded = real_dino_pipeline(raw_video, raw_actions)
+    print(f"[PASS] end-to-end use_real_dino=True: raw video {tuple(raw_video.shape)} -> decoded {tuple(decoded.shape)}")
 
 print("\nAll DINOv3 checks passed.")
