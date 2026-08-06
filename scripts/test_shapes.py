@@ -13,7 +13,7 @@ from mini_mira.pipeline import PipelineConfig, MyPipeline
 with torch.inference_mode():
     config = StridedConvBottleneckConfig()
     module = MyBottleneck(config)
-    x=torch.randn(2,40,1024,18,32)
+    x=torch.randn(2,40,config.dino_dim,18,32)
     z=module(x)
 
 
@@ -45,7 +45,7 @@ with torch.inference_mode():
 
     pipeline_config = PipelineConfig()
     pipeline = MyPipeline(pipeline_config)
-    dino_features = torch.randn(2, 40, 1024, 18, 32)
+    dino_features = torch.randn(2, 40, pipeline_config.bottleneck.dino_dim, 18, 32)
     # raw key-presses at video frame rate: (T_latent - 1) * temporal_downsampling = (20-1)*2 = 38,
     # not 40 -- there's no real action for the frame before frame 0 (see ActionEncoder's
     # initial_action_token).
