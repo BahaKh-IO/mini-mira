@@ -101,6 +101,9 @@ convenience for fast iteration, not the intended final scale.
 | `src/mini_mira/ml/config_loading.py` | `load_pipeline_config` — builds a `PipelineConfig` from a YAML preset under `configs/` |
 | `configs/small.yaml` | Named preset mirroring today's dataclass defaults exactly (regression-safe baseline) |
 | `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target |
+| `scripts/verify_codec_training.py` | Mechanical proof the codec's training mechanism is wired correctly: overfits one fixed synthetic video and asserts the reconstruction loss drops substantially. Small config, random-init DINOv3 — no gated weights, runs in seconds |
+| `scripts/train_codec.py` | Config-driven codec training (real mira's `loss_mae`; LPIPS/DINO-consistency not implemented — see `notes/deviations.md`). Defaults to a fast toy size; `--config`/`--height`/`--width`/`--frames` point it at the real target scale once there's a GPU. No real dataset exists yet — trains on one fixed synthetic video |
+| `scripts/reconstruct.py` | Runs a real image or a real video clip (`.mp4`/`.mov`/`.avi`/`.mkv`/`.webm`, decoded frame-by-frame via `imageio`) through the codec once (untrained weights) and saves a side-by-side comparison grid — top row original frames, bottom row reconstructed, aligned by timestep. Proves the real-data path works mechanically — not that the reconstruction looks like anything yet |
 
 See [Scale](#scale) above for parameter counts at both the intended ~300M scale
 (`configs/scaled_300m.yaml`) and the small default used for fast testing (`configs/small.yaml`).
@@ -149,8 +152,14 @@ found later:
   from the model's own previous output — see the note above.
 - **Streaming inference.** No KV-cache; every diffusion step recomputes the whole sequence.
 - **Grouped-query attention.** Attention here always uses as many KV heads as query heads.
-- **Training.** No loss functions, optimizer, or data loading exist. Every weight is randomly
-  initialized; this project verifies architecture and shapes, not learned behavior.
+- **Training.** The codec (`DinoModel` → `MyBottleneck` → `ViTVideoDecoder`) has a real
+  reconstruction-loss training mechanism (`scripts/train_codec.py`, real mira's `loss_mae`),
+  verified to actually reduce loss (`scripts/verify_codec_training.py`) — but only on one fixed
+  synthetic video; no real dataset, no LPIPS/DINO-consistency loss terms, no LR schedule. The
+  world model has no training mechanism at all yet (only the inference-time sampling loop in
+  `MyPipeline.forward` exists) — deliberately deferred to a later task. Every weight starts
+  randomly initialized either way; this project mostly verifies architecture and shapes, not
+  learned behavior.
 - **One shared implementation where the real repo has two.** The real codec and world model
   never share code with each other, even for identical logic (e.g. two separately-named but
   functionally identical MLP classes, two separate RoPE implementations). mini_mira
@@ -194,6 +203,10 @@ both:
     still resize and produce a correctly-rounded shape, not crash or silently misalign.
   - *Non-degenerate output*: real features must be finite and have real variance — a silent
     weight-loading failure would tend to produce all-zero or NaN output instead of a clean crash.
+- **`scripts/verify_codec_training.py`** — checks the codec's training mechanism itself, not
+  just its architecture: overfitting one fixed synthetic video with real optimizer steps must
+  substantially reduce the reconstruction loss. A wrong loss, a detached graph, or params that
+  silently aren't receiving gradients would all show up here as a loss that never moves.
 
 ## Getting started
 

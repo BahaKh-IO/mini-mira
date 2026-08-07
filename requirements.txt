@@ -8,3 +8,12 @@ einops>=0.8
 # a transitive dependency pulled in by other installed packages; 6.0.2 is the version actually
 # installed and verified against here).
 pyyaml>=6.0
+# Used directly by scripts/reconstruct.py to load a real image file (jpg/png/etc.) from disk.
+# Lightweight, no heavy dependency chain -- 11.3.0 is the version verified against here.
+pillow>=10.0
+# Used directly by scripts/reconstruct.py to decode real video files (.mp4/.mov/etc.) frame by
+# frame. Checked torchvision.io first -- it dropped read_video/write_video entirely in this
+# version (0.28.0), image formats only -- so this is the real, working choice, not a default
+# guess. imageio-ffmpeg is imageio's actual video-decoding backend, not optional.
+imageio>=2.30
+imageio-ffmpeg>=0.6
