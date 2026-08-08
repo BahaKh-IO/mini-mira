@@ -85,8 +85,18 @@ class MyPipeline(nn.Module):
 
     def forward(self, x, actions):
         # x is (B, T, dino_dim, H, W) pre-encoded DINO features if use_real_dino is False (the
-        # default); (B, T, 3, H, W) raw video in [0, 1] if use_real_dino is True.
-        dino_features = self.dino.dino_forward(x) if self.config.use_real_dino else x
+        # default); (B, T, 3, H, W) raw video in [0, 1] if use_real_dino is True. no_grad here:
+        # this is the encoder side (matches mira's RAEEncoder.forward, which wraps its own
+        # DINO call the same way) -- nothing upstream of the raw video pixels has a gradient to
+        # receive, so building an autograd graph through frozen DINO here would only waste
+        # memory/compute. dino_forward itself no longer wraps this automatically (see
+        # mini_mira.codec.dino.DinoModel.dino_forward) because the loss module's DINO-consistency
+        # term needs the *reconstruction*-side call to keep its graph.
+        if self.config.use_real_dino:
+            with torch.no_grad():
+                dino_features = self.dino.dino_forward(x)
+        else:
+            dino_features = x
         z = self.bottleneck(dino_features)  # codec encode -- now actually used, not discarded
         b, t, c, h, w = z.shape
 

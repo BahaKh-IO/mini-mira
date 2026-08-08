@@ -98,18 +98,19 @@ class DinoModel(nn.Module):
         mini_mira never sets). Multi-layer features exist in mira only to feed
         DinoPerceptualLoss's latent-consistency term, which needs several layers to average
         over -- see the next point.
-      - No DinoPerceptualLoss. That class is a training-loss module (the perceptual/
-        latent-consistency loss terms in codec training); mini_mira has no training loop, so
-        there is nothing that would ever call it.
+      - No DinoPerceptualLoss class (mira's own perceptual/latent-consistency loss module) --
+        mini_mira's equivalent lives directly in mini_mira.codec.loss.CodecLoss instead, calling
+        dino_forward the same way mira's RAEEncoder.forward does.
       - No torch.compile. A speed optimization for repeated real training-scale calls, not a
         correctness requirement -- and not obviously worth it for a CPU-only educational
         project making a handful of forward passes.
-      - dino_forward wraps itself in torch.no_grad() directly, rather than leaving that to
-        the caller as mira's RAEEncoder.forward does. Since this module's parameters already
-        have requires_grad=False, this is a belt-and-suspenders difference, not a behavior
-        difference: it additionally guarantees no autograd graph gets built through this
-        computation even if the input itself requires grad, without relying on every caller
-        remembering to wrap the call.
+      - dino_forward does NOT wrap itself in torch.no_grad() (an earlier version of this class
+        did -- see notes/deviations.md). That blocked gradients from flowing back through it,
+        which breaks CodecLoss's DINO-latent-consistency term: it needs to backprop from DINO's
+        features on the *reconstruction* through the decoder and bottleneck. This module's own
+        weights still never get gradients (requires_grad_(False) in __init__, set once and never
+        undone) -- only the *input's* gradient path is left open, matching mira's own convention
+        of leaving no_grad to the caller (RAEEncoder.forward doesn't wrap its DINO call either).
     """
 
     def __init__(self, dino_model: str = "dinov3_vitb16", require_pretrained: bool = True):
@@ -147,13 +148,18 @@ class DinoModel(nn.Module):
         return (x - self.mean) / self.std
 
     def dino_forward(self, x: Tensor) -> Tensor:
-        """x: (b, t, 3, h, w) video, values in [0, 1]. Returns (b, t, dino_dim, h', w')."""
-        with torch.no_grad():
-            b, t, _, h, w = x.shape
-            x = rearrange(x, "b t c h w -> (b t) c h w")
-            x = self.image_normalization(x)
-            new_h = self.patch_size * (h // self.patch_size)
-            new_w = self.patch_size * (w // self.patch_size)
-            x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
-            features = self.dino_model.get_intermediate_layers(x, n=1, norm=True, reshape=True)[0]
-            return rearrange(features, "(b t) c h w -> b t c h w", b=b, t=t)
+        """x: (b, t, 3, h, w) video, values in [0, 1]. Returns (b, t, dino_dim, h', w').
+
+        No internal no_grad(): the caller decides. Call it under torch.no_grad() yourself (as the
+        encoder side of a training step should, since the *target* features never need a gradient)
+        when the input doesn't need one; leave it unwrapped when it does (the DINO-latent-
+        consistency loss backprops through this call onto the reconstruction).
+        """
+        b, t, _, h, w = x.shape
+        x = rearrange(x, "b t c h w -> (b t) c h w")
+        x = self.image_normalization(x)
+        new_h = self.patch_size * (h // self.patch_size)
+        new_w = self.patch_size * (w // self.patch_size)
+        x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
+        features = self.dino_model.get_intermediate_layers(x, n=1, norm=True, reshape=True)[0]
+        return rearrange(features, "(b t) c h w -> b t c h w", b=b, t=t)
