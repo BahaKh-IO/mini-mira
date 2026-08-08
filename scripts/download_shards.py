@@ -40,8 +40,7 @@ def main() -> None:
           f"(~{args.shards * 2.65:.1f}GB total) ...")
     dataset = RocketScienceDataset.from_hub(args.repo_id, split=args.split, shards=args.shards)
     print(f"Done. {len(dataset.match_ids())} match(es) available across {args.shards} shard(s).")
-    print("Cached under ~/.cache/huggingface/hub -- nothing else to do with it yet; "
-          "the precompute script (not built yet) will read from this same cache next.")
+    print(f"Local index path (pass this to train_codec.py's --index-path): {dataset.root}")
 
 
 if __name__ == "__main__":
