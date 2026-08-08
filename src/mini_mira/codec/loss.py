@@ -1,12 +1,10 @@
-"""The codec training loss: L1 + LPIPS + DINO latent-consistency.
+"""The codec training loss: L1 + LPIPS + DINO latent-consistency, with auto_weight adaptive
+balancing (see below).
 
 Matches real mira's mira.codec.loss.CodecLoss (same three terms, same LPIPS net, same
-frame-subsampling trick for cost control), simplified: mini_mira's DinoModel returns a single
-Tensor (one layer), not a list, so there's one consistency term, not several averaged together --
-and there is no auto_weight adaptive balancing yet (see notes/deviations.md: real mira's version
-rescales LPIPS/consistency by the ratio of their gradient norms against the L1 anchor, which needs
-the decoder's last layer exposed plus torch.autograd.grad bookkeeping -- deferred deliberately;
-flat fixed weights, matching mira's own raw weight values, are used instead for now).
+frame-subsampling trick for cost control, same auto_weight math), simplified in one place:
+mini_mira's DinoModel returns a single Tensor (one layer), not a list, so there's one consistency
+term here, not several averaged together.
 
 Also: mira's codec has no ELBO and no KL divergence anywhere. Its bottleneck is a deterministic
 strided conv, not a VAE with reparameterization -- confirmed directly in
@@ -18,6 +16,13 @@ Pixel-range convention, matching real mira exactly (mira/src/mira/codec/codec_mo
 raw video is [0,1]; normalize_video maps it to [-1,1] -- the space the decoder's tanh output and
 the reconstruction loss both live in. denormalize_for_dino maps back to [0,1] whenever DINO needs
 to look at an image (DINO's own preprocessing expects [0,1]).
+
+auto_weight (VQ-GAN-style adaptive loss balancing, Esser et al. arXiv:2012.09841 S3.3) is now
+implemented too -- previously deferred (see notes/deviations.md for the original reasoning), built
+now because a real training run is imminent and flat fixed weights measurably under-weighted
+loss_mae relative to loss_lpips_perceptual (confirmed directly: 19% vs 57% drop over the same 30
+steps in an earlier check). calculate_adaptive_weight is ported verbatim from mira's version --
+generic autograd code with no model-specific coupling.
 """
 
 from dataclasses import dataclass
@@ -39,6 +44,22 @@ def normalize_video(x: Tensor) -> Tensor:
 def denormalize_for_dino(x: Tensor) -> Tensor:
     """[-1, 1] -> [0, 1]. DINO's own preprocessing expects [0, 1]."""
     return (x + 1) / 2
+
+
+def calculate_adaptive_weight(
+    anchor_loss: Tensor, other_loss: Tensor, last_layer: Tensor, max_weight: float = 1e4
+) -> Tensor:
+    """VQ-GAN-style adaptive weight (Esser et al., arXiv:2012.09841 S3.3), ported verbatim from
+    mira's mira.codec.loss.calculate_adaptive_weight.
+
+    Rescales other_loss so its gradient at `last_layer` matches anchor_loss's gradient there in
+    size -- so a term that naturally produces bigger/smaller gradients than the L1 anchor doesn't
+    end up dominating or being drowned out just because of that mismatch. The returned factor is
+    detached: it scales the loss but carries no gradient of its own.
+    """
+    anchor_grads = torch.autograd.grad(anchor_loss, last_layer, retain_graph=True)[0]
+    other_grads = torch.autograd.grad(other_loss, last_layer, retain_graph=True)[0]
+    return (anchor_grads.norm() / (other_grads.norm() + 1e-6)).clamp(0.0, max_weight).detach()
 
 
 @dataclass
@@ -66,6 +87,13 @@ class CodecLossWeights:
     loss_dino_latent_consistency: float = 1.0
     dino_latent_consistency_frame_frac: float = 0.25
 
+    # VQ-GAN-style adaptive rescaling of loss_lpips_perceptual/loss_dino_latent_consistency against
+    # the loss_mae anchor -- see calculate_adaptive_weight. Off by default (matches mira's own
+    # CodecLossWeights field default; mira's *shipped config* turns it on, same pattern followed
+    # here via CodecLoss(CodecLossWeights(auto_weight=True)) at the call sites).
+    auto_weight: bool = False
+    max_auto_weight: float = 1e4
+
 
 class CodecLoss(nn.Module):
     """Computes the codec's reconstruction loss terms and their weighted total.
@@ -91,10 +119,15 @@ class CodecLoss(nn.Module):
                 p.requires_grad = False
 
         self.dino: DinoModel | None = None  # bound post-init, see bind_encoder_dino
+        self._last_layer: Tensor | None = None  # bound post-init, see bind_last_layer
 
     def bind_encoder_dino(self, dino: DinoModel) -> None:
         """Share the encoder's already-loaded, frozen DINO backbone (no second copy loaded)."""
         self.dino = dino
+
+    def bind_last_layer(self, param: Tensor) -> None:
+        """Share the decoder's last-layer weight, needed only when weights.auto_weight is True."""
+        self._last_layer = param
 
     def forward(self, outputs: CodecOutputs) -> dict[str, Tensor]:
         predicted = outputs.output_video.float()  # [-1, 1]
@@ -136,6 +169,26 @@ class CodecLoss(nn.Module):
             t = F.normalize(target_features, dim=2, eps=1e-6)
             loss["loss_dino_latent_consistency"] = F.mse_loss(p, t)
 
-        weighted = [getattr(self.weights, name) * value for name, value in loss.items()]
+        if (
+            self.weights.auto_weight
+            and self._last_layer is not None
+            and "loss_mae" in loss
+            and loss["loss_mae"].requires_grad
+            and torch.is_grad_enabled()
+        ):
+            for name in ("loss_lpips_perceptual", "loss_dino_latent_consistency"):
+                if name not in loss or not loss[name].requires_grad:
+                    continue
+                factor = calculate_adaptive_weight(
+                    loss["loss_mae"], loss[name], self._last_layer, self.weights.max_auto_weight
+                )
+                loss[name] = factor * loss[name]
+                loss[f"{name}_auto_w"] = factor  # logged, not summed (not a real dict key below)
+
+        weighted = [
+            getattr(self.weights, name) * value
+            for name, value in loss.items()
+            if hasattr(self.weights, name)  # excludes the *_auto_w diagnostic entries above
+        ]
         loss["loss_total"] = torch.stack(weighted).sum()
         return loss

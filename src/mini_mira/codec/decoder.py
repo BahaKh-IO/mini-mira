@@ -75,6 +75,13 @@ class ViTVideoDecoder(nn.Module):
         self.norm_out = nn.LayerNorm(config.width, eps=config.eps)
         self.patch_unembed = PatchUnembed(config)
 
+    @property
+    def last_layer_weight(self):
+        """The decoder's final projection weight -- used by CodecLoss's auto_weight to measure
+        how hard each loss term pushes on the actual output, matching mira's vit_decoder.py
+        exactly (same PatchUnembed.proj role in both)."""
+        return self.patch_unembed.proj.weight
+
     def forward(self, z):
         b, t = z.shape[:2]
         x = rearrange(z, "b t c h w -> (b t) c h w")
