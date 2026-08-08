@@ -28,6 +28,7 @@ from PIL import Image
 from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.dino import DinoModel
+from mini_mira.codec.loss import denormalize_for_dino
 from mini_mira.ml.config_loading import load_pipeline_config
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -64,10 +65,18 @@ def load_video(path: str, height: int, width: int, num_frames: int) -> torch.Ten
 
 def save_comparison_grid(original: torch.Tensor, reconstructed: torch.Tensor, path: str) -> None:
     """One image file: top row = original frames concatenated left to right in time order,
-    bottom row = reconstructed frames, same column = same timestep."""
+    bottom row = reconstructed frames, same column = same timestep.
+
+    The decoder's raw output is [-1, 1] (its last layer is tanh) -- denormalize_for_dino's
+    [-1,1]->[0,1] conversion is reused here purely for correct display, nothing to do with DINO.
+    Clamping the raw [-1,1] output straight to [0,1] instead (an earlier bug here) would crush
+    every negative pixel to solid black rather than rescaling it.
+    """
     t = original.shape[1]
     top_row = torch.cat([original[0, i].clamp(0, 1) for i in range(t)], dim=2)  # cat along width
-    bottom_row = torch.cat([reconstructed[0, i].clamp(0, 1) for i in range(t)], dim=2)
+    bottom_row = torch.cat(
+        [denormalize_for_dino(reconstructed[0, i]).clamp(0, 1) for i in range(t)], dim=2
+    )
     grid = torch.cat([top_row, bottom_row], dim=1)  # cat along height: top row above bottom row
     grid = grid.permute(1, 2, 0).detach().numpy()
     Image.fromarray((grid * 255).astype("uint8")).save(path)
