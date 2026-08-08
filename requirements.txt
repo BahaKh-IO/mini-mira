@@ -28,3 +28,19 @@ torchmetrics>=1.9
 # DINO route this project still avoids (see the comment above torch>=2.0). First real use
 # downloads pretrained VGG16 ImageNet weights (~528MB, one-time, needs internet).
 torchvision>=0.20
+# Both of these are optional, lazily-imported dependencies of scripts/train_codec.py -- only
+# needed if you actually pass --wandb-project / --hf-backup-repo; every other script, and
+# train_codec.py itself without those flags, runs fine without either installed (verified
+# directly: the offline-mode wandb check and every prior verification run never imported them).
+wandb>=0.28          # --wandb-project: loss curves + preview images, in offline mode too.
+huggingface_hub>=0.20  # --hf-backup-repo: uploads each checkpoint, for a rented GPU whose disk
+                        # may not survive between rentals. Already a transitive dependency via
+                        # mira's own dataset.py (scripts/download_shards.py already relies on
+                        # it); listed directly now since train_codec.py imports it itself too.
+# Needed only for --index-path (real data): mira's own create_loader decodes video through
+# torchcodec internally, not imageio -- confirmed directly, not assumed, when wiring this up.
+# KNOWN WINDOWS ISSUE: torchcodec needs a "full-shared" FFmpeg build with DLLs; the bundled
+# standalone binary imageio-ffmpeg installs doesn't satisfy it (confirmed: it tried and failed to
+# load FFmpeg versions 4-8 on this machine). Expected to work normally on the Linux GPU machine
+# (a standard ffmpeg install there ships the shared libs it needs) -- see scripts/verify_dataloader.py.
+torchcodec
