@@ -1,7 +1,8 @@
 # Verified against the actual code paths this project uses (not against what happened to be
-# installed during development -- see notes/deviations.md 1.14 for why torchvision, torchmetrics,
-# and termcolor are all NOT listed here despite coming up while wiring up DINOv3: they're only
-# needed by torch.hub.load's hubconf.py route, which mini_mira deliberately bypasses).
+# installed during development -- see notes/deviations.md 1.14 for why termcolor is NOT listed
+# here despite coming up while wiring up DINOv3: it's only needed by torch.hub.load's
+# hubconf.py route, which mini_mira deliberately bypasses. torchvision and torchmetrics used to
+# be excluded for that same reason -- they're back below, but for a different, unrelated need).
 torch>=2.0
 einops>=0.8
 # Used directly by mini_mira.ml.config_loading to parse configs/*.yaml presets (previously only
@@ -17,3 +18,13 @@ pillow>=10.0
 # guess. imageio-ffmpeg is imageio's actual video-decoding backend, not optional.
 imageio>=2.30
 imageio-ffmpeg>=0.6
+# Used directly by mini_mira.codec.loss for the LPIPS perceptual loss term, per the supervisor's
+# own instruction to prefer torchmetrics/torchvision metrics over reimplementing from scratch.
+# 1.9.0 is the version already installed and verified against here.
+torchmetrics>=1.9
+# torchmetrics' LPIPS loads its VGG16 backbone through torchvision.models -- confirmed by reading
+# torchmetrics' own source (torchmetrics/functional/image/lpips.py), not assumed. A new,
+# deliberate need for this one purpose -- distinct from, and not a reversal of, the torch.hub.load
+# DINO route this project still avoids (see the comment above torch>=2.0). First real use
+# downloads pretrained VGG16 ImageNet weights (~528MB, one-time, needs internet).
+torchvision>=0.20

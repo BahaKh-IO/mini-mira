@@ -93,6 +93,7 @@ convenience for fast iteration, not the intended final scale.
 | `src/mini_mira/world_model/action_encoder.py` | `ActionEncoder` — encodes raw multi-hot key-press actions into per-latent-frame conditioning vectors |
 | `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos`/`clean_past` and `ActionEncoder` |
 | `src/mini_mira/codec/dino.py` | `DinoModel` — the real, frozen DINOv3 (ViT-B/16) backbone; loads real pretrained weights, wired into `MyPipeline` behind `PipelineConfig.use_real_dino` (see Scope) |
+| `src/mini_mira/codec/loss.py` | `CodecLoss`, `CodecLossWeights`, `CodecOutputs` — the codec's real training loss (L1 + LPIPS + DINO latent-consistency, matching mira's `CodecLoss` minus `auto_weight`); `normalize_video`/`denormalize_for_dino` — the `[0,1]`↔`[-1,1]` pixel-range conversions the codec and DINO each expect |
 | `scripts/test_shapes.py` | Shape-correctness checks for every stage of the pipeline |
 | `scripts/verify_rope.py` | Behavioral checks for RoPE: causal masking and position sensitivity |
 | `scripts/verify_conditioning.py` | Behavioral checks for AdaLN, clean-past, and actions: `tau`/`clean_past`/action sensitivity, determinism, and end-to-end pipeline checks |
@@ -101,8 +102,8 @@ convenience for fast iteration, not the intended final scale.
 | `src/mini_mira/ml/config_loading.py` | `load_pipeline_config` — builds a `PipelineConfig` from a YAML preset under `configs/` |
 | `configs/small.yaml` | Named preset mirroring today's dataclass defaults exactly (regression-safe baseline) |
 | `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target |
-| `scripts/verify_codec_training.py` | Mechanical proof the codec's training mechanism is wired correctly: overfits one fixed synthetic video and asserts the reconstruction loss drops substantially. Small config, random-init DINOv3 — no gated weights, runs in seconds |
-| `scripts/train_codec.py` | Config-driven codec training (real mira's `loss_mae`; LPIPS/DINO-consistency not implemented — see `notes/deviations.md`). Defaults to a fast toy size; `--config`/`--height`/`--width`/`--frames` point it at the real target scale once there's a GPU. No real dataset exists yet — trains on one fixed synthetic video |
+| `scripts/verify_codec_training.py` | Mechanical proof the codec's training mechanism is wired correctly: overfits one fixed synthetic video on the real `CodecLoss` and asserts the total loss drops substantially. Small config, random-init DINOv3 — no gated weights, runs in seconds |
+| `scripts/train_codec.py` | Config-driven codec training on the real `CodecLoss` (L1 + LPIPS + DINO latent-consistency; no `auto_weight` yet — see `notes/deviations.md`). Defaults to a fast toy size; `--config`/`--height`/`--width`/`--frames` point it at the real target scale once there's a GPU. No real dataset exists yet — trains on one fixed synthetic video |
 | `scripts/reconstruct.py` | Runs a real image or a real video clip (`.mp4`/`.mov`/`.avi`/`.mkv`/`.webm`, decoded frame-by-frame via `imageio`) through the codec once (untrained weights) and saves a side-by-side comparison grid — top row original frames, bottom row reconstructed, aligned by timestep. Proves the real-data path works mechanically — not that the reconstruction looks like anything yet |
 
 See [Scale](#scale) above for parameter counts at both the intended ~300M scale
@@ -152,14 +153,16 @@ found later:
   from the model's own previous output — see the note above.
 - **Streaming inference.** No KV-cache; every diffusion step recomputes the whole sequence.
 - **Grouped-query attention.** Attention here always uses as many KV heads as query heads.
-- **Training.** The codec (`DinoModel` → `MyBottleneck` → `ViTVideoDecoder`) has a real
-  reconstruction-loss training mechanism (`scripts/train_codec.py`, real mira's `loss_mae`),
-  verified to actually reduce loss (`scripts/verify_codec_training.py`) — but only on one fixed
-  synthetic video; no real dataset, no LPIPS/DINO-consistency loss terms, no LR schedule. The
-  world model has no training mechanism at all yet (only the inference-time sampling loop in
-  `MyPipeline.forward` exists) — deliberately deferred to a later task. Every weight starts
-  randomly initialized either way; this project mostly verifies architecture and shapes, not
-  learned behavior.
+- **Training.** The codec (`DinoModel` → `MyBottleneck` → `ViTVideoDecoder`) trains on the real
+  three-term reconstruction loss (`src/mini_mira/codec/loss.py`'s `CodecLoss`: L1 + LPIPS + DINO
+  latent-consistency, matching mira's own `CodecLoss` — mira's codec has no ELBO or KL anywhere;
+  it isn't a VAE), verified to actually reduce loss (`scripts/verify_codec_training.py`) — but
+  only on one fixed synthetic video; no real dataset, no `auto_weight` adaptive loss balancing
+  (needs the decoder's last-layer weight exposed plus gradient-norm bookkeeping — deferred, flat
+  fixed weights used instead), no LR schedule. The world model has no training mechanism at all
+  yet (only the inference-time sampling loop in `MyPipeline.forward` exists) — deliberately
+  deferred to a later task. Every weight starts randomly initialized either way; this project
+  mostly verifies architecture and shapes, not learned behavior.
 - **One shared implementation where the real repo has two.** The real codec and world model
   never share code with each other, even for identical logic (e.g. two separately-named but
   functionally identical MLP classes, two separate RoPE implementations). mini_mira
@@ -210,17 +213,22 @@ both:
 
 ## Getting started
 
-Requirements: Python ≥ 3.10, plus `requirements.txt` (`torch`, `einops`, `pyyaml` — verified
-against the actual code paths used, not against everything installed while debugging DINOv3
-loading; see `notes/deviations.md` 1.14). There is no packaging configuration — the scripts add
-`src/` to `sys.path` directly.
+Requirements: Python ≥ 3.10, plus `requirements.txt` (`torch`, `einops`, `pyyaml`, `pillow`,
+`imageio`/`imageio-ffmpeg`, `torchmetrics`, `torchvision` — each verified against the actual code
+path that uses it, not against everything installed while debugging DINOv3 loading; see
+`notes/deviations.md` 1.14 for why `termcolor` specifically is NOT listed). There is no packaging
+configuration — the scripts add `src/` to `sys.path` directly.
 
 ```
 pip install -r requirements.txt
 python scripts/test_shapes.py
 python scripts/verify_rope.py
 python scripts/verify_conditioning.py
+python scripts/verify_codec_training.py
 ```
+
+The first run of anything that builds a `CodecLoss` (`verify_codec_training.py`, `train_codec.py`)
+downloads pretrained VGG16 ImageNet weights for the LPIPS term (~528MB, one-time, needs internet).
 
 `scripts/verify_dino.py` additionally requires real, gated DINOv3 pretrained weights on disk
 (request access at
