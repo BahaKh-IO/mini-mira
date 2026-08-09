@@ -3,7 +3,13 @@
 # here despite coming up while wiring up DINOv3: it's only needed by torch.hub.load's
 # hubconf.py route, which mini_mira deliberately bypasses. torchvision and torchmetrics used to
 # be excluded for that same reason -- they're back below, but for a different, unrelated need).
-torch>=2.0
+#
+# torch is pinned, not >=2.0: confirmed directly on the GPU machine that an unpinned torch here
+# lets pip silently upgrade it (to satisfy torchvision's own resolution) to a version torchcodec's
+# compiled .so files can't load -- "RuntimeError: Could not load libtorchcodec" -- even though the
+# files exist and FFmpeg is fine. torch==2.8.0 is real mira's own documented "known-good" pairing
+# with torchcodec 0.7.0 (mira/pyproject.toml's decode extra comment).
+torch==2.8.0
 einops>=0.8
 # Used directly by mini_mira.ml.config_loading to parse configs/*.yaml presets (previously only
 # a transitive dependency pulled in by other installed packages; 6.0.2 is the version actually
@@ -27,7 +33,11 @@ torchmetrics>=1.9
 # deliberate need for this one purpose -- distinct from, and not a reversal of, the torch.hub.load
 # DINO route this project still avoids (see the comment above torch>=2.0). First real use
 # downloads pretrained VGG16 ImageNet weights (~528MB, one-time, needs internet).
-torchvision>=0.20
+#
+# Pinned to 0.23.0, not >=0.20: the version PyTorch's own release notes pair with torch==2.8.0
+# above. An unpinned/newer torchvision is exactly what pulled in a too-new torch in the first
+# place (see the torch==2.8.0 comment) -- these two lines must be changed together, never alone.
+torchvision==0.23.0
 # Both of these are optional, lazily-imported dependencies of scripts/train_codec.py -- only
 # needed if you actually pass --wandb-project / --hf-backup-repo; every other script, and
 # train_codec.py itself without those flags, runs fine without either installed (verified
@@ -41,6 +51,11 @@ huggingface_hub>=0.20  # --hf-backup-repo: uploads each checkpoint, for a rented
 # torchcodec internally, not imageio -- confirmed directly, not assumed, when wiring this up.
 # KNOWN WINDOWS ISSUE: torchcodec needs a "full-shared" FFmpeg build with DLLs; the bundled
 # standalone binary imageio-ffmpeg installs doesn't satisfy it (confirmed: it tried and failed to
-# load FFmpeg versions 4-8 on this machine). Expected to work normally on the Linux GPU machine
-# (a standard ffmpeg install there ships the shared libs it needs) -- see scripts/verify_dataloader.py.
-torchcodec
+# load FFmpeg versions 4-8 on this machine). Works on the Linux GPU machine's apt-installed FFmpeg
+# 6.1.1 instead (torchcodec supports FFmpeg 4-8) -- see scripts/verify_dataloader.py.
+#
+# Pinned to 0.7.0 (not left unpinned) for the same reason torch/torchvision above are pinned:
+# real mira's own docs call this out as the version that specifically pairs with torch==2.8.0;
+# an unpinned torchcodec risks the reverse mismatch (a newer torchcodec built for a newer torch
+# than the one pinned above).
+torchcodec==0.7.0
