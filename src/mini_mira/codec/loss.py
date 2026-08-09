@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from mini_mira.codec.dino import DinoModel
@@ -84,9 +85,12 @@ class CodecLoss(nn.Module):
     sharing the encoder's already-loaded DINO rather than loading a second copy).
     """
 
-    def __init__(self, weights: CodecLossWeights):
+    def __init__(self, weights: CodecLossWeights, use_checkpointing: bool = False):
         super().__init__()
         self.weights = weights
+        # Only the DINO call below needs it: it's the one that backprops through the whole
+        # backbone (onto the reconstruction), unlike the encoder's own no_grad call.
+        self.use_checkpointing = use_checkpointing
 
         self.lpips_perceptual_loss: nn.Module | None = None
         if weights.loss_lpips_perceptual > 0:
@@ -100,11 +104,23 @@ class CodecLoss(nn.Module):
                 p.requires_grad = False
 
         self.dino: DinoModel | None = None  # bound post-init, see bind_encoder_dino
+        self.perceptual_dino: DinoModel | None = None  # optional, see bind_perceptual_dino
         self._last_layer: Tensor | None = None  # bound post-init, see bind_last_layer
 
     def bind_encoder_dino(self, dino: DinoModel) -> None:
         """Share the encoder's already-loaded, frozen DINO backbone (no second copy loaded)."""
         self.dino = dino
+
+    def bind_perceptual_dino(self, dino: DinoModel) -> None:
+        """Optional: score the consistency term in a different (typically smaller) DINO's feature
+        space instead of the encoder's own -- e.g. ViT-S instead of ViT-B, since this is the one
+        DINO call each step that backprops (see forward below), so a smaller model here cuts real
+        compute/memory without touching the encoder or the bottleneck's input width at all.
+
+        Not bound by default: forward() falls back to the encoder's own DINO and its
+        already-computed target features (outputs.dino_features), matching mira's shipped config.
+        """
+        self.perceptual_dino = dino
 
     def bind_last_layer(self, param: Tensor) -> None:
         """Share the decoder's last-layer weight, needed only when weights.auto_weight is True."""
@@ -132,12 +148,27 @@ class CodecLoss(nn.Module):
 
         if self.weights.loss_dino_latent_consistency > 0:
             assert self.dino is not None, "call bind_encoder_dino before forward"
+            consistency_dino = self.perceptual_dino if self.perceptual_dino is not None else self.dino
             k = max(1, round(t_total * self.weights.dino_latent_consistency_frame_frac))
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
             # No no_grad here: needs to backprop from DINO's features on the reconstruction,
             # through the decoder and bottleneck. Target side is already detached.
-            pred_features = self.dino.dino_forward(denormalize_for_dino(predicted[:, t_idx]))
-            target_features = outputs.dino_features[:, t_idx].detach()
+            dino_input = denormalize_for_dino(predicted[:, t_idx])
+            if self.use_checkpointing:
+                pred_features = checkpoint(consistency_dino.dino_forward, dino_input, use_reentrant=False)
+            else:
+                pred_features = consistency_dino.dino_forward(dino_input)
+
+            if self.perceptual_dino is not None:
+                # outputs.dino_features is the encoder's own (different-sized) features -- can't
+                # reuse them here, so recompute the target in the perceptual model's feature
+                # space instead. No grad: the target side never needs one.
+                target_input = denormalize_for_dino(target[:, t_idx])
+                with torch.no_grad():
+                    target_features = consistency_dino.dino_forward(target_input)
+            else:
+                target_features = outputs.dino_features[:, t_idx].detach()
+
             # L2-normalize along the channel dim (dim=2 in this (B,T,C,H,W) layout) before MSE:
             # compares feature direction, not magnitude.
             p = F.normalize(pred_features, dim=2, eps=1e-6)
