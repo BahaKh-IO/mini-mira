@@ -26,14 +26,19 @@ PATCH_SIZE = 16
 
 # Real mira also lists vitl16 (1024-dim); mini_mira only loads vitb16, the variant actually
 # downloaded for this project, but both stay here since this is copied from mira's own DINO_DIM.
+# vits16 isn't in mira's own tables at all (mira never uses it) -- added here for the smaller
+# perceptual-loss-only DINO (see loss.py's bind_perceptual_dino). 384 is the standard DINOv3
+# ViT-S width; worth confirming against the loaded model on the GPU box the first time it's used.
 DINO_DIM = {
     "dinov3_vitl16": 1024,
     "dinov3_vitb16": 768,
+    "dinov3_vits16": 384,
 }
 
 DINO_WEIGHT_FILENAMES = {
     "dinov3_vitl16": "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
     "dinov3_vitb16": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "dinov3_vits16": "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
 }
 
 
