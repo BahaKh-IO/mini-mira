@@ -21,13 +21,14 @@ def init_wandb(project: str | None, config: dict[str, Any]) -> bool:
     return True
 
 
-def log_step(enabled: bool, step: int, losses: dict[str, Tensor], lr: float) -> None:
-    """Logs one step's loss terms (including loss_total) plus the current learning rate."""
+def log_step(enabled: bool, step: int, losses: dict[str, float], lr: float) -> None:
+    """Logs one step's loss terms (already scalar -- see train_codec.py's grad-accum averaging)
+    plus the current learning rate."""
     if not enabled:
         return
     import wandb  # noqa: PLC0415
 
-    wandb.log({**{k: v.item() for k, v in losses.items()}, "lr": lr}, step=step)
+    wandb.log({**losses, "lr": lr}, step=step)
 
 
 def log_preview(enabled: bool, step: int, original: Tensor, reconstructed: Tensor) -> None:
