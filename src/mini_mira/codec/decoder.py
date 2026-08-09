@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
 
 from mini_mira.ml.blocks import BlockConfig, SpaceTimeBlock
 from mini_mira.ml.rope import spatial_rope, temporal_rope
@@ -50,9 +51,10 @@ class PatchUnembed(nn.Module):
 
 
 class ViTVideoDecoder(nn.Module):
-    def __init__(self, config: ViTDecoderConfig):
+    def __init__(self, config: ViTDecoderConfig, use_checkpointing: bool = False):
         super().__init__()
         self.config = config
+        self.use_checkpointing = use_checkpointing
         self.head_dim = config.width // config.num_heads
 
         self.from_latent = nn.ConvTranspose2d(
@@ -93,7 +95,10 @@ class ViTVideoDecoder(nn.Module):
         rope_temporal = temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)
 
         for block in self.blocks:
-            x = block(x, rope_spatial, rope_temporal)
+            if self.use_checkpointing and self.training:
+                x = checkpoint(block, x, rope_spatial, rope_temporal, use_reentrant=False)
+            else:
+                x = block(x, rope_spatial, rope_temporal)
 
         x = self.norm_out(x)
         return torch.tanh(self.patch_unembed(x))
