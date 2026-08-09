@@ -110,7 +110,7 @@ as tau advances, since it can't see tau. Correct machinery around a network blin
 signal it's given.
 
 input_shape  = (2, 40, 1024, 18, 32)   # (B, T, dino_dim, H, W) -- DINO-shaped, matching Day 1
-output_shape = (2, 40, 3, 288, 512)    # real video -- matches the supervisor's exact ask:
+output_shape = (2, 40, 3, 288, 512)    # real video -- matches the exact ask:
                                          # "codec => latent diffusion => decode, whole forward
                                          # pass, correct output shapes"
 
