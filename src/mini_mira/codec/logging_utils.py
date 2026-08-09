@@ -32,11 +32,7 @@ def log_step(enabled: bool, step: int, losses: dict[str, Tensor], lr: float) -> 
 
 def log_preview(enabled: bool, step: int, original: Tensor, reconstructed: Tensor) -> None:
     """Logs one side-by-side preview image: original vs. reconstructed, first frame of the batch.
-
-    original: (b, t, 3, h, w) in [0, 1] (raw video). reconstructed: (b, t, 3, h, w) in [-1, 1]
-    (the decoder's raw tanh output) -- same denormalize-before-display convention as
-    reconstruct.py's save_comparison_grid, not a copy of it (that one builds a full multi-frame
-    grid to a PNG file; this logs a single lightweight frame to wandb every checkpoint interval).
+    original: (b, t, 3, h, w) in [0, 1]. reconstructed: (b, t, 3, h, w) in [-1, 1] (tanh output).
     """
     if not enabled:
         return

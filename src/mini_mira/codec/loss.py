@@ -1,28 +1,13 @@
 """The codec training loss: L1 + LPIPS + DINO latent-consistency, with auto_weight adaptive
-balancing (see below).
+balancing. Matches real mira's CodecLoss (same three terms, same LPIPS net, same frame-subsampling
+trick, same auto_weight math), simplified in one place: mini_mira's DinoModel returns a single
+Tensor, not a list, so there's one consistency term instead of several averaged together.
 
-Matches real mira's mira.codec.loss.CodecLoss (same three terms, same LPIPS net, same
-frame-subsampling trick for cost control, same auto_weight math), simplified in one place:
-mini_mira's DinoModel returns a single Tensor (one layer), not a list, so there's one consistency
-term here, not several averaged together.
+The codec is a deterministic autoencoder, not a VAE -- no ELBO, no KL divergence anywhere.
 
-Also: mira's codec has no ELBO and no KL divergence anywhere. Its bottleneck is a deterministic
-strided conv, not a VAE with reparameterization -- confirmed directly in
-mira/src/mira/codec/rae_encoder.py. The only stochastic element is noise_tau, a plain train-time
-Gaussian noise regularizer on the latent (disabled, 0.0, in mira's own shipped config), unrelated
-to any KL term. These three reconstruction losses are the whole of it.
-
-Pixel-range convention, matching real mira exactly (mira/src/mira/codec/codec_model.py):
-raw video is [0,1]; normalize_video maps it to [-1,1] -- the space the decoder's tanh output and
-the reconstruction loss both live in. denormalize_for_dino maps back to [0,1] whenever DINO needs
-to look at an image (DINO's own preprocessing expects [0,1]).
-
-auto_weight (VQ-GAN-style adaptive loss balancing, Esser et al. arXiv:2012.09841 S3.3) is now
-implemented too -- previously deferred (see notes/deviations.md for the original reasoning), built
-now because a real training run is imminent and flat fixed weights measurably under-weighted
-loss_mae relative to loss_lpips_perceptual (confirmed directly: 19% vs 57% drop over the same 30
-steps in an earlier check). calculate_adaptive_weight is ported verbatim from mira's version --
-generic autograd code with no model-specific coupling.
+Pixel-range convention (matches mira/src/mira/codec/codec_model.py): raw video is [0,1];
+normalize_video maps it to [-1,1] -- the space the decoder's tanh output and the reconstruction
+loss both live in. denormalize_for_dino maps back to [0,1] whenever DINO needs to look at an image.
 """
 
 from dataclasses import dataclass
@@ -49,13 +34,10 @@ def denormalize_for_dino(x: Tensor) -> Tensor:
 def calculate_adaptive_weight(
     anchor_loss: Tensor, other_loss: Tensor, last_layer: Tensor, max_weight: float = 1e4
 ) -> Tensor:
-    """VQ-GAN-style adaptive weight (Esser et al., arXiv:2012.09841 S3.3), ported verbatim from
-    mira's mira.codec.loss.calculate_adaptive_weight.
-
-    Rescales other_loss so its gradient at `last_layer` matches anchor_loss's gradient there in
-    size -- so a term that naturally produces bigger/smaller gradients than the L1 anchor doesn't
-    end up dominating or being drowned out just because of that mismatch. The returned factor is
-    detached: it scales the loss but carries no gradient of its own.
+    """VQ-GAN-style adaptive weight (Esser et al., arXiv:2012.09841 S3.3), ported from mira's
+    calculate_adaptive_weight. Rescales other_loss so its gradient at `last_layer` matches
+    anchor_loss's gradient there in size, so it neither dominates nor gets drowned out. Detached:
+    scales the loss but carries no gradient of its own.
     """
     anchor_grads = torch.autograd.grad(anchor_loss, last_layer, retain_graph=True)[0]
     other_grads = torch.autograd.grad(other_loss, last_layer, retain_graph=True)[0]
@@ -87,10 +69,9 @@ class CodecLossWeights:
     loss_dino_latent_consistency: float = 1.0
     dino_latent_consistency_frame_frac: float = 0.25
 
-    # VQ-GAN-style adaptive rescaling of loss_lpips_perceptual/loss_dino_latent_consistency against
-    # the loss_mae anchor -- see calculate_adaptive_weight. Off by default (matches mira's own
-    # CodecLossWeights field default; mira's *shipped config* turns it on, same pattern followed
-    # here via CodecLoss(CodecLossWeights(auto_weight=True)) at the call sites).
+    # Adaptive rescaling of the two perceptual terms against loss_mae -- see
+    # calculate_adaptive_weight. Off by default (matches mira's own field default); the actual
+    # training call sites turn it on, matching mira's shipped config.
     auto_weight: bool = False
     max_auto_weight: float = 1e4
 
@@ -141,11 +122,8 @@ class CodecLoss(nn.Module):
         t_total = predicted.shape[1]
 
         if self.lpips_perceptual_loss is not None:
-            # LPIPS expects (N, 3, H, W) in [-1, 1] -- matches this module's native range already.
-            # Only a random frame subset is scored per step (mira's own cost-control trick, not
-            # ours): running a full VGG forward+backward on every frame every step is expensive,
-            # and averaging over different random subsets across steps still covers all frames
-            # over the course of training.
+            # Only a random frame subset scored per step (mira's cost-control trick): cheaper
+            # than every frame, and different random subsets across steps still cover everything.
             k = max(1, round(t_total * self.weights.lpips_perceptual_frame_frac))
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
             pred_2d = rearrange(predicted[:, t_idx], "b t c h w -> (b t) c h w")
@@ -156,15 +134,12 @@ class CodecLoss(nn.Module):
             assert self.dino is not None, "call bind_encoder_dino before forward"
             k = max(1, round(t_total * self.weights.dino_latent_consistency_frame_frac))
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
-            # No no_grad here: this call needs to backprop from DINO's features on the
-            # reconstruction, through the decoder and bottleneck (see dino.py's dino_forward
-            # docstring). The target side is already detached -- it was computed on the real
-            # video by the encoder, before the decoder ever ran.
+            # No no_grad here: needs to backprop from DINO's features on the reconstruction,
+            # through the decoder and bottleneck. Target side is already detached.
             pred_features = self.dino.dino_forward(denormalize_for_dino(predicted[:, t_idx]))
             target_features = outputs.dino_features[:, t_idx].detach()
-            # L2-normalize along the channel dim before MSE: compares feature *direction*, not
-            # magnitude -- matches mira's DinoPerceptualLoss(normalize=True) latent-consistency
-            # variant (real mira's dim=2 is also the channel dim in its (B,T,C,H,W) layout).
+            # L2-normalize along the channel dim (dim=2 in this (B,T,C,H,W) layout) before MSE:
+            # compares feature direction, not magnitude.
             p = F.normalize(pred_features, dim=2, eps=1e-6)
             t = F.normalize(target_features, dim=2, eps=1e-6)
             loss["loss_dino_latent_consistency"] = F.mse_loss(p, t)

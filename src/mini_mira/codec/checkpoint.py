@@ -1,13 +1,7 @@
 """Minimal save/resume for codec training: bottleneck + decoder + optimizer + scheduler + step
-count, saved together as one file.
-
-Deliberately not a port of mira's CheckpointManager (mira/src/mira/training/checkpoint_manager.py):
-that class expects a single nn.Module with its own save_checkpoint() method, built for a
-multi-day, possibly-distributed production recipe with retention tiers and EMA-aware saving.
-mini_mira's codec is two separate modules (bottleneck, decoder) with no such combined class, and
-this is one short test run, not that recipe -- a class's generality isn't earning its complexity
-here. No EMA either (see mini_mira.codec.loss module docstring's sibling note in notes/deviations.md
-for the same "prove it works before polishing it" reasoning already applied elsewhere).
+count, saved together as one file. Not a port of mira's CheckpointManager (built for a
+multi-day, distributed recipe with retention tiers and EMA) -- this is a single short run with
+two known modules, so a simpler pair of functions covers it.
 """
 
 from pathlib import Path
