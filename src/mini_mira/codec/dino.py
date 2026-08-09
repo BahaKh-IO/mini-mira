@@ -70,7 +70,11 @@ def _load_dinov3_backbone_fn(dino_model: str):
     backbone functions.
 
     Relies on a private (underscore-prefixed) torch.hub function, so it isn't a guaranteed
-    stable API -- it could break on a future torch version. If it ever does, the fix is the
+    stable API -- it could break on a future torch version. This already happened once: torch
+    2.8.0 (the GPU machine) requires a `calling_fn` argument this function didn't need on
+    whatever older torch version was installed on the original (Windows) development machine --
+    confirmed directly by reading torch.hub.load's own source, which passes the literal string
+    "load" there. If this breaks again on some future torch version, the fallback fix is the
     same thing torch.hub.load does under the hood: locate (or download)
     <torch.hub.get_dir()>/facebookresearch_dinov3_main and import dinov3.hub.backbones from
     there directly.
@@ -79,6 +83,7 @@ def _load_dinov3_backbone_fn(dino_model: str):
         "facebookresearch/dinov3",
         force_reload=False,
         trust_repo=True,
+        calling_fn="load",  # matches torch.hub.load's own internal call exactly
         verbose=False,
         skip_validation=True,
     )
