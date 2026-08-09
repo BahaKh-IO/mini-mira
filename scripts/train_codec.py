@@ -43,10 +43,20 @@ from mini_mira.ml.config_loading import load_pipeline_config
 
 
 def _autocast(device: torch.device):
-    """bfloat16 autocast on CUDA, a no-op elsewhere (so this script runs unchanged on CPU) --
-    copied from mira's exact pattern (mira/scripts/train_codec.py)."""
+    """float16 autocast on CUDA, a no-op elsewhere (so this script runs unchanged on CPU).
+
+    Mira's own script uses bfloat16 (mira/scripts/train_codec.py) -- copied here originally, but
+    switched to float16 per the supervisor: the rented GPU is a V100 (Volta), which has hardware
+    tensor-core support for float16 but not bfloat16 (that arrived with Ampere/A100 and later).
+    Running bf16 on Volta works but gets none of the tensor-core speedup, defeating the point.
+
+    float16's tradeoff vs bf16: a much smaller exponent range, so small gradients can silently
+    underflow to zero -- unlike bf16, which shares fp32's exponent range and doesn't have this
+    problem. That's why a GradScaler is now used around the backward pass below (bf16 never
+    needed one); see the scaler.scale(...)/scaler.step(...)/scaler.update() calls in the loop.
+    """
     if device.type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
     return contextlib.nullcontext()
 
 
@@ -109,6 +119,10 @@ def main():
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     # betas/weight_decay match real mira's configs/train_codec.yaml.
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # Needed for float16 (see _autocast's docstring): temporarily scales the loss up before
+    # backward() so small gradients don't underflow to zero in fp16's narrow exponent range,
+    # then unscales before the optimizer step. A no-op when enabled=False (CPU).
+    scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
 
     # Warmup ~5% of steps, then cosine decay the rest -- proportional, not mira's literal
     # 1000/249000 (those were sized for a 250,001-step run; this preserves the same *shape* of
@@ -170,8 +184,15 @@ def main():
                 input_video=normalize_video(video), output_video=reconstructed, dino_features=dino_features
             )
             losses = loss_fn(outputs)
-        losses["loss_total"].backward()
-        optimizer.step()
+        # auto_weight's calculate_adaptive_weight (mini_mira.codec.loss) runs its own
+        # torch.autograd.grad calls *inside* loss_fn(outputs) above, separately from this
+        # backward() -- those are NOT covered by the scaler below, so in principle they could
+        # underflow in float16 the same way unscaled gradients can. Not worked around
+        # preemptively (no evidence yet this actually happens); if a logged *_auto_w factor ever
+        # shows up as exactly 0 or inf, that's the sign to revisit this.
+        scaler.scale(losses["loss_total"]).backward()
+        scaler.step(optimizer)
+        scaler.update()
         lr_scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
