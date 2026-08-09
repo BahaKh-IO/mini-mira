@@ -39,6 +39,16 @@ def main() -> None:
     print(f"Requesting {args.shards} shard(s) from {args.repo_id}/{args.split} "
           f"(~{args.shards * 2.65:.1f}GB total) ...")
     dataset = RocketScienceDataset.from_hub(args.repo_id, split=args.split, shards=args.shards)
+
+    # from_hub restricts dataset.index to only the downloaded shards, but only in memory -- the
+    # index.json FILE it leaves on disk is still the full, unfiltered index for the entire split
+    # (~2,821 shards for kyutai/rocket-science's train split). Confirmed directly: a later
+    # create_loader() reading this same directory has no way to know only args.shards shards are
+    # actually present, and eventually reaches for one that was never downloaded -> crash. Overwrite
+    # the file with the already-correctly-restricted in-memory index so every later read of this
+    # directory only ever sees shards that actually exist here.
+    dataset.index_path.write_text(dataset.index.model_dump_json())
+
     print(f"Done. {len(dataset.match_ids())} match(es) available across {args.shards} shard(s).")
     print(f"Local index path (pass this to train_codec.py's --index-path): {dataset.root}")
 
