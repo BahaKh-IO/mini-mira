@@ -4,8 +4,8 @@ Lightweight config system ("Option A"): one YAML file is one full preset mirrori
 PipelineConfig's whole nested shape (bottleneck / world_model / decoder sections, plus the
 top-level n_diffusion_steps / num_keys fields) -- not mira's own per-component-file
 composition system (no Hydra, no config groups, no CLI overrides). See configs/small.yaml
-(mirrors today's dataclass defaults exactly) and configs/scaled_300m.yaml (scaled toward the
-supervisor's ~300M parameter target) at the repo root.
+(mirrors today's dataclass defaults exactly) and configs/scaled_300m.yaml (scaled toward a
+~300M parameter target) at the repo root.
 
 Each section is keyword-unpacked straight into its dataclass's constructor -- an unrecognized
 key in that section's YAML (a typo) raises TypeError immediately, exactly as it would
