@@ -52,7 +52,7 @@ previous frame (`clean_past`) via an additive projection.
 
 ### Scale
 
-The supervisor's target is ~300M parameters. `configs/scaled_300m.yaml` is the real attempt at
+The target is ~300M parameters. `configs/scaled_300m.yaml` is the real attempt at
 that target — this is the architecture's intended scale, measured from a real instantiated
 `MyPipeline`, not estimated:
 
@@ -101,7 +101,7 @@ convenience for fast iteration, not the intended final scale.
 | `scripts/test_dino.py` | Raw sanity check for the dinov3_vitb16 backbone bypassing `DinoModel` entirely — a diagnostic to tell apart "mini_mira's wrapper is broken" from "the underlying library/weights are broken" if `verify_dino.py` ever fails |
 | `src/mini_mira/ml/config_loading.py` | `load_pipeline_config` — builds a `PipelineConfig` from a YAML preset under `configs/` |
 | `configs/small.yaml` | Named preset mirroring today's dataclass defaults exactly (regression-safe baseline) |
-| `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target |
+| `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward a ~300M parameter target |
 | `scripts/verify_codec_training.py` | Mechanical proof the codec's training mechanism is wired correctly: overfits one fixed synthetic video on the real `CodecLoss` and asserts the total loss drops substantially. Small config, random-init DINOv3 — no gated weights, runs in seconds |
 | `scripts/train_codec.py` | Config-driven codec training on the real `CodecLoss` (L1 + LPIPS + DINO latent-consistency; no `auto_weight` yet — see `notes/deviations.md`). Defaults to a fast toy size; `--config`/`--height`/`--width`/`--frames` point it at the real target scale once there's a GPU. No real dataset exists yet — trains on one fixed synthetic video |
 | `scripts/reconstruct.py` | Runs a real image or a real video clip (`.mp4`/`.mov`/`.avi`/`.mkv`/`.webm`, decoded frame-by-frame via `imageio`) through the codec once (untrained weights) and saves a side-by-side comparison grid — top row original frames, bottom row reconstructed, aligned by timestep. Proves the real-data path works mechanically — not that the reconstruction looks like anything yet |
@@ -251,7 +251,7 @@ system (no Hydra, no config groups, no CLI overrides).
 
 | File | Purpose |
 |---|---|
-| `configs/scaled_300m.yaml` | **The intended architecture scale** — scales `decoder`/`world_model` width and depth toward the supervisor's ~300M parameter target, tuned to also roughly match real mira's own world_model/decoder size ratio (1.82) rather than pinning the decoder to the frozen-encoder size exactly (measured: 292,457,344 parameters, ratio 1.81). See [Scale](#scale) above. |
+| `configs/scaled_300m.yaml` | **The intended architecture scale** — scales `decoder`/`world_model` width and depth toward a ~300M parameter target, tuned to also roughly match real mira's own world_model/decoder size ratio (1.82) rather than pinning the decoder to the frozen-encoder size exactly (measured: 292,457,344 parameters, ratio 1.81). See [Scale](#scale) above. |
 | `configs/small.yaml` | Mirrors `PipelineConfig()`'s own Python defaults exactly — the size every fast verification script uses (11,320,960 parameters), not the intended final scale |
 
 Load a preset with `load_pipeline_config` (`src/mini_mira/ml/config_loading.py`):

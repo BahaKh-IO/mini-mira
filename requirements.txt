@@ -24,8 +24,8 @@ pillow>=10.0
 # guess. imageio-ffmpeg is imageio's actual video-decoding backend, not optional.
 imageio>=2.30
 imageio-ffmpeg>=0.6
-# Used directly by mini_mira.codec.loss for the LPIPS perceptual loss term, per the supervisor's
-# own instruction to prefer torchmetrics/torchvision metrics over reimplementing from scratch.
+# Used directly by mini_mira.codec.loss for the LPIPS perceptual loss term, preferring
+# torchmetrics/torchvision metrics over reimplementing from scratch.
 # 1.9.0 is the version already installed and verified against here.
 torchmetrics>=1.9
 # torchmetrics' LPIPS loads its VGG16 backbone through torchvision.models -- confirmed by reading

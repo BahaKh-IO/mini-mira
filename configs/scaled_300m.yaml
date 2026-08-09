@@ -1,4 +1,4 @@
-# scaled_300m.yaml -- a real attempt at the supervisor's ~300M-parameter scaling target, tuned
+# scaled_300m.yaml -- a real attempt at a ~300M-parameter scaling target, tuned
 # to also roughly match real mira's own world_model/decoder size RATIO rather than pinning the
 # decoder to the frozen-encoder size exactly (an earlier draft of this file did that instead --
 # decoder=86,951,424 -- but that made world_model/decoder=2.43, notably MORE lopsided than real
