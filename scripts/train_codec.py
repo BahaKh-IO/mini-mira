@@ -13,6 +13,10 @@ Assumes a CUDA GPU (no CPU fallback) -- this script is for real training runs.
 Precision: bfloat16. float16 and float32 both hit a cuDNN "unable to find an engine" error on
 this project's V100 for DINOv3's patch_embed conv specifically; bfloat16 is the one that works.
 See notes/gpu_amp_investigation.md for the full investigation.
+
+Effective batch size is --batch-size (the real, per-forward micro-batch) times
+--grad-accum-steps -- see mini_mira.codec.lr_schedule for the LR schedule shape, and
+--activation-checkpointing to trade compute for the memory a larger micro-batch would need.
 """
 
 import argparse
@@ -20,12 +24,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-# Real mira, cloned as a sibling repo -- reused for the dataloader and LR schedule.
+# Real mira, cloned as a sibling repo -- reused for the dataloader.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "mira" / "src"))
 
 import torch
 from mira.data.training_loader import create_loader
-from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 
 from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.checkpoint import load_checkpoint, save_checkpoint
@@ -33,6 +36,7 @@ from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.dino import DinoModel
 from mini_mira.codec.logging_utils import init_wandb, log_preview, log_step
 from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
+from mini_mira.codec.lr_schedule import WarmupConstantLinearDecayLR
 from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
 
@@ -53,7 +57,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-pretrained-dino", action="store_true")
     parser.add_argument("--index-path", default=None, help="Real dataset dir from download_shards.py")
     parser.add_argument("--target-fps", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=4, help="Per-forward micro-batch size")
+    parser.add_argument(
+        "--grad-accum-steps", type=int, default=1,
+        help="Micro-batches accumulated per optimizer step (effective batch = batch-size * this)",
+    )
+    parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument(
+        "--perceptual-dino-model", default=None,
+        help="If set, score the DINO-consistency loss in a separate (typically smaller) DINO "
+        "variant's feature space instead of the encoder's own, e.g. dinov3_vits16",
+    )
+    parser.add_argument("--lr-warmup-start", type=float, default=1e-7)
+    parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 50")
+    parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps // 10")
+    parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--resume", action="store_true")
@@ -96,21 +114,31 @@ def main() -> None:
     dino = DinoModel(require_pretrained=args.require_pretrained_dino).cuda()
     dino.eval()
     bottleneck = MyBottleneck(config.bottleneck).cuda()
-    decoder = ViTVideoDecoder(config.decoder).cuda()
+    decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
 
-    loss_fn = CodecLoss(CodecLossWeights(auto_weight=True)).cuda()
+    loss_fn = CodecLoss(
+        CodecLossWeights(auto_weight=True), use_checkpointing=args.activation_checkpointing
+    ).cuda()
     loss_fn.bind_encoder_dino(dino)
+    if args.perceptual_dino_model:
+        perceptual_dino = DinoModel(
+            dino_model=args.perceptual_dino_model, require_pretrained=args.require_pretrained_dino
+        ).cuda()
+        perceptual_dino.eval()
+        loss_fn.bind_perceptual_dino(perceptual_dino)
     loss_fn.bind_last_layer(decoder.last_layer_weight)
 
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
 
-    # Warmup ~5% of steps then cosine decay the rest -- proportional to args.steps, not mira's
-    # literal 1000/249000 (those were sized for its 250,001-step run).
-    warmup_steps = max(1, args.steps // 20)
-    lr_scheduler = WarmupConstantCosineDecayLR(
-        optimizer, warmup_steps=warmup_steps, constant_steps=0,
-        decay_steps=max(1, args.steps - warmup_steps), min_lr=args.lr * 0.01,
+    # Long constant plateau in the middle -- proportional defaults (warmup ~2%, decay ~10% of
+    # args.steps) rather than mira's literal 1000/249000 (sized for its 250,001-step run).
+    warmup_steps = args.lr_warmup_steps if args.lr_warmup_steps is not None else max(1, args.steps // 50)
+    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else max(1, args.steps // 10)
+    min_lr = args.lr_min if args.lr_min is not None else args.lr * 0.01
+    lr_scheduler = WarmupConstantLinearDecayLR(
+        optimizer, warmup_steps=warmup_steps, constant_steps=max(0, args.steps - warmup_steps - decay_steps),
+        decay_steps=decay_steps, min_lr=min_lr, warmup_start_lr=args.lr_warmup_start,
     )
 
     next_video = build_next_video(args)
@@ -127,27 +155,31 @@ def main() -> None:
     wandb_enabled = init_wandb(args.wandb_project, vars(args))
 
     for step in range(start_step, args.steps):
-        video = next_video().cuda()
         optimizer.zero_grad()
-        with _autocast():
-            with torch.no_grad():  # encoder side: no grad needed here
-                dino_features = dino.dino_forward(video)
-            z = bottleneck(dino_features)
-            reconstructed = decoder(z)
-            outputs = CodecOutputs(
-                input_video=normalize_video(video), output_video=reconstructed, dino_features=dino_features
-            )
-            losses = loss_fn(outputs)
-        losses["loss_total"].backward()
+        accumulated: dict[str, float] = {}
+        for _ in range(args.grad_accum_steps):
+            video = next_video().cuda()
+            with _autocast():
+                with torch.no_grad():  # encoder side: no grad needed here
+                    dino_features = dino.dino_forward(video)
+                z = bottleneck(dino_features)
+                reconstructed = decoder(z)
+                outputs = CodecOutputs(
+                    input_video=normalize_video(video), output_video=reconstructed, dino_features=dino_features
+                )
+                losses = loss_fn(outputs)
+            (losses["loss_total"] / args.grad_accum_steps).backward()
+            for k, v in losses.items():
+                accumulated[k] = accumulated.get(k, 0.0) + v.item() / args.grad_accum_steps
         optimizer.step()
         lr_scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
         term_str = ", ".join(
-            f"{k}={v.item():.4f}" for k, v in losses.items() if k != "loss_total" and not k.endswith("_auto_w")
+            f"{k}={v:.4f}" for k, v in accumulated.items() if k != "loss_total" and not k.endswith("_auto_w")
         )
-        print(f"step {step}: lr={current_lr:.2e} loss_total={losses['loss_total'].item():.4f} ({term_str})")
-        log_step(wandb_enabled, step, losses, current_lr)
+        print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated['loss_total']:.4f} ({term_str})")
+        log_step(wandb_enabled, step, accumulated, current_lr)
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
