@@ -46,8 +46,8 @@ def _autocast(device: torch.device):
     """float16 autocast on CUDA, a no-op elsewhere (so this script runs unchanged on CPU).
 
     Mira's own script uses bfloat16 (mira/scripts/train_codec.py) -- copied here originally, but
-    switched to float16 per the supervisor: the rented GPU is a V100 (Volta), which has hardware
-    tensor-core support for float16 but not bfloat16 (that arrived with Ampere/A100 and later).
+    switched to float16: the rented GPU is a V100 (Volta), which has hardware tensor-core support
+    for float16 but not bfloat16 (that arrived with Ampere/A100 and later).
     Running bf16 on Volta works but gets none of the tensor-core speedup, defeating the point.
 
     float16's tradeoff vs bf16: a much smaller exponent range, so small gradients can silently
