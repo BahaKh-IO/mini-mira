@@ -230,8 +230,13 @@ def main() -> None:
                     path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint.pth",
                     repo_id=args.hf_backup_repo, repo_type="model",
                 )
-        if (step + 1) % args.preview_every == 0 or is_last:
-            log_preview(wandb_enabled, step, video, reconstructed, fps=args.target_fps)
+        # Always persist the first completed step so a new run proves its output path before
+        # committing hours of compute. Subsequent samples follow the configured interval.
+        if step == start_step or (step + 1) % args.preview_every == 0 or is_last:
+            log_preview(
+                wandb_enabled, step, video, reconstructed, fps=args.target_fps,
+                output_dir=checkpoint_dir / "previews",
+            )
 
 
 if __name__ == "__main__":
