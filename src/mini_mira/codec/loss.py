@@ -40,8 +40,17 @@ def calculate_adaptive_weight(
     anchor_loss's gradient there in size, so it neither dominates nor gets drowned out. Detached:
     scales the loss but carries no gradient of its own.
     """
-    anchor_grads = torch.autograd.grad(anchor_loss, last_layer, retain_graph=True)[0]
-    other_grads = torch.autograd.grad(other_loss, last_layer, retain_graph=True)[0]
+    # These probes happen before the training loop's GradScaler sees loss_total. Scale both
+    # equally under FP16 autocast to prevent their small last-layer gradients from underflowing;
+    # the common factor cancels in the norm ratio.
+    probe_scale = (
+        65536.0
+        if torch.is_autocast_enabled("cuda")
+        and torch.get_autocast_dtype("cuda") == torch.float16
+        else 1.0
+    )
+    anchor_grads = torch.autograd.grad(anchor_loss * probe_scale, last_layer, retain_graph=True)[0]
+    other_grads = torch.autograd.grad(other_loss * probe_scale, last_layer, retain_graph=True)[0]
     return (anchor_grads.norm() / (other_grads.norm() + 1e-6)).clamp(0.0, max_weight).detach()
 
 
@@ -85,12 +94,16 @@ class CodecLoss(nn.Module):
     sharing the encoder's already-loaded DINO rather than loading a second copy).
     """
 
-    def __init__(self, weights: CodecLossWeights, use_checkpointing: bool = False):
+    def __init__(
+        self, weights: CodecLossWeights, use_checkpointing: bool = False,
+        perceptual_chunk_size: int = 0,
+    ):
         super().__init__()
         self.weights = weights
         # Only the DINO call below needs it: it's the one that backprops through the whole
         # backbone (onto the reconstruction), unlike the encoder's own no_grad call.
         self.use_checkpointing = use_checkpointing
+        self.perceptual_chunk_size = perceptual_chunk_size
 
         self.lpips_perceptual_loss: nn.Module | None = None
         if weights.loss_lpips_perceptual > 0:
@@ -144,7 +157,13 @@ class CodecLoss(nn.Module):
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
             pred_2d = rearrange(predicted[:, t_idx], "b t c h w -> (b t) c h w")
             tgt_2d = rearrange(target[:, t_idx], "b t c h w -> (b t) c h w")
-            loss["loss_lpips_perceptual"] = self.lpips_perceptual_loss(pred_2d, tgt_2d)
+            chunk_size = self.perceptual_chunk_size or pred_2d.shape[0]
+            lpips_terms = []
+            for start in range(0, pred_2d.shape[0], chunk_size):
+                stop = min(start + chunk_size, pred_2d.shape[0])
+                weight = (stop - start) / pred_2d.shape[0]
+                lpips_terms.append(weight * self.lpips_perceptual_loss(pred_2d[start:stop], tgt_2d[start:stop]))
+            loss["loss_lpips_perceptual"] = torch.stack(lpips_terms).sum()
 
         if self.weights.loss_dino_latent_consistency > 0:
             assert self.dino is not None, "call bind_encoder_dino before forward"
@@ -153,27 +172,31 @@ class CodecLoss(nn.Module):
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
             # No no_grad here: needs to backprop from DINO's features on the reconstruction,
             # through the decoder and bottleneck. Target side is already detached.
-            dino_input = denormalize_for_dino(predicted[:, t_idx])
-            if self.use_checkpointing:
-                pred_features = checkpoint(consistency_dino.dino_forward, dino_input, use_reentrant=False)
-            else:
-                pred_features = consistency_dino.dino_forward(dino_input)
+            pred_frames = rearrange(predicted[:, t_idx], "b t c h w -> (b t) c h w")
+            target_frames = rearrange(target[:, t_idx], "b t c h w -> (b t) c h w")
+            chunk_size = self.perceptual_chunk_size or pred_frames.shape[0]
+            dino_terms = []
+            for start in range(0, pred_frames.shape[0], chunk_size):
+                stop = min(start + chunk_size, pred_frames.shape[0])
+                dino_input = denormalize_for_dino(pred_frames[start:stop]).unsqueeze(0)
+                if self.use_checkpointing:
+                    pred_features = checkpoint(consistency_dino.dino_forward, dino_input, use_reentrant=False)
+                else:
+                    pred_features = consistency_dino.dino_forward(dino_input)
 
-            if self.perceptual_dino is not None:
-                # outputs.dino_features is the encoder's own (different-sized) features -- can't
-                # reuse them here, so recompute the target in the perceptual model's feature
-                # space instead. No grad: the target side never needs one.
-                target_input = denormalize_for_dino(target[:, t_idx])
-                with torch.no_grad():
-                    target_features = consistency_dino.dino_forward(target_input)
-            else:
-                target_features = outputs.dino_features[:, t_idx].detach()
+                if self.perceptual_dino is not None:
+                    target_input = denormalize_for_dino(target_frames[start:stop]).unsqueeze(0)
+                    with torch.no_grad():
+                        target_features = consistency_dino.dino_forward(target_input)
+                else:
+                    selected = rearrange(outputs.dino_features[:, t_idx], "b t c h w -> (b t) c h w")
+                    target_features = selected[start:stop].unsqueeze(0).detach()
 
-            # L2-normalize along the channel dim (dim=2 in this (B,T,C,H,W) layout) before MSE:
-            # compares feature direction, not magnitude.
-            p = F.normalize(pred_features, dim=2, eps=1e-6)
-            t = F.normalize(target_features, dim=2, eps=1e-6)
-            loss["loss_dino_latent_consistency"] = F.mse_loss(p, t)
+                p = F.normalize(pred_features, dim=2, eps=1e-6)
+                t = F.normalize(target_features, dim=2, eps=1e-6)
+                weight = (stop - start) / pred_frames.shape[0]
+                dino_terms.append(weight * F.mse_loss(p, t))
+            loss["loss_dino_latent_consistency"] = torch.stack(dino_terms).sum()
 
         if (
             self.weights.auto_weight
