@@ -6,6 +6,7 @@ from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
 from mini_mira.ml.blocks import BlockConfig, SpaceTimeBlock
+from mini_mira.ml.init import init_weights
 from mini_mira.ml.rope import spatial_rope, temporal_rope
 
 
@@ -76,6 +77,8 @@ class ViTVideoDecoder(nn.Module):
         self.blocks = nn.ModuleList([SpaceTimeBlock(block_config) for _ in range(config.depth)])
         self.norm_out = nn.LayerNorm(config.width, eps=config.eps)
         self.patch_unembed = PatchUnembed(config)
+
+        self.apply(init_weights)
 
     @property
     def last_layer_weight(self):
