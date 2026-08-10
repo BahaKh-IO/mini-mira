@@ -124,11 +124,12 @@ class DinoModel(nn.Module):
         need a gradient (the encoder side); leave it unwrapped when it does (CodecLoss's
         DINO-consistency term backprops through this call onto the reconstruction).
         """
-        b, t, _, h, w = x.shape
-        x = rearrange(x, "b t c h w -> (b t) c h w")
-        x = self.image_normalization(x)
-        new_h = self.patch_size * (h // self.patch_size)
-        new_w = self.patch_size * (w // self.patch_size)
-        x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
-        features = self.dino_model.get_intermediate_layers(x, n=1, norm=True, reshape=True)[0]
-        return rearrange(features, "(b t) c h w -> b t c h w", b=b, t=t)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
+            b, t, _, h, w = x.shape
+            x = rearrange(x, "b t c h w -> (b t) c h w")
+            x = self.image_normalization(x)
+            new_h = self.patch_size * (h // self.patch_size)
+            new_w = self.patch_size * (w // self.patch_size)
+            x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
+            features = self.dino_model.get_intermediate_layers(x, n=1, norm=True, reshape=True)[0]
+            return rearrange(features, "(b t) c h w -> b t c h w", b=b, t=t)
