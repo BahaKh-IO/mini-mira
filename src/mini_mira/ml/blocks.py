@@ -50,6 +50,27 @@ def apply_rotary_emb(x: Tensor, freqs: tuple[Tensor, Tensor]) -> Tensor:
     return out
 
 
+class QKRMSNorm(nn.Module):
+    """Per-head RMSNorm for q/k, matching mira/src/mira/ml/attention.py's QKRMSNorm exactly.
+    Always computed in fp32 regardless of the ambient autocast dtype: without a fixed scale,
+    q/k magnitudes can grow unboundedly over training, and under fp16 specifically that growth
+    is much more likely to overflow or lose precision than under fp32/bf16.
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.qk_scale = nn.Parameter(torch.ones(num_heads, head_dim))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = self.qk_scale.to(torch.float32) * x
+        return x.to(input_dtype)
+
+
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int):
         super().__init__()
@@ -58,11 +79,17 @@ class SelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.wqkv = nn.Linear(dim, 3 * dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
+        self.q_ln = QKRMSNorm(num_heads, self.head_dim)
+        self.k_ln = QKRMSNorm(num_heads, self.head_dim)
 
     def forward(self, x, causal: bool, freqs: tuple[Tensor, Tensor] | None = None):
         b, n, c = x.shape
         qkv = self.wqkv(x).view(b, n, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
+        q = self.q_ln(q)
+        k = self.k_ln(k)
+        # Normalize before rotating, not after: normalizing rescales magnitude, rotating
+        # changes direction -- reversed, the norm would partly undo what RoPE set up.
         if freqs is not None:
             q = apply_rotary_emb(q, freqs)
             k = apply_rotary_emb(k, freqs)
