@@ -10,9 +10,9 @@ Two data modes:
 
 Assumes a CUDA GPU (no CPU fallback) -- this script is for real training runs.
 
-Precision: bfloat16. float16 and float32 both hit a cuDNN "unable to find an engine" error on
-this project's V100 for DINOv3's patch_embed conv specifically; bfloat16 is the one that works.
-See notes/gpu_amp_investigation.md for the full investigation.
+Precision: float16 autocast for the trainable codec, with its convolution-family modules and
+the complete frozen DINO backbones kept in bfloat16. This avoids this V100/cuDNN stack's FP16
+convolution engine failures and DINO's FP16 numerical instability.
 
 Effective batch size is --batch-size (the real, per-forward micro-batch) times
 --grad-accum-steps -- see mini_mira.codec.lr_schedule for the LR schedule shape, and
@@ -21,6 +21,7 @@ Effective batch size is --batch-size (the real, per-forward micro-batch) times
 
 import argparse
 import sys
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -42,8 +43,28 @@ from mini_mira.ml.config_loading import load_pipeline_config
 
 
 def _autocast() -> torch.autocast:
-    """bfloat16 -- the only precision that works for DINOv3's patch_embed conv on this GPU."""
-    return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
+    return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+
+
+_CONVOLUTION_TYPES = (
+    torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d,
+    torch.nn.ConvTranspose1d, torch.nn.ConvTranspose2d, torch.nn.ConvTranspose3d,
+)
+
+
+def _keep_convolutions_in_bf16(module: torch.nn.Module) -> None:
+    """Nest BF16 autocast around convolutions while the surrounding model uses FP16 AMP."""
+    for convolution in (m for m in module.modules() if isinstance(m, _CONVOLUTION_TYPES)):
+        if getattr(convolution, "_mini_mira_bf16_forward", False):
+            continue
+        original_forward = convolution.forward
+
+        def bf16_forward(_self, *args, _forward=original_forward, **kwargs):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                return _forward(*args, **kwargs)
+
+        convolution.forward = types.MethodType(bf16_forward, convolution)
+        convolution._mini_mira_bf16_forward = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +85,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--activation-checkpointing", action="store_true")
     parser.add_argument(
+        "--perceptual-chunk-size", type=int, default=0,
+        help="Frames per LPIPS/DINO loss forward (0 processes the selected frames together)",
+    )
+    parser.add_argument(
         "--perceptual-dino-model", default=None,
         help="If set, score the DINO-consistency loss in a separate (typically smaller) DINO "
         "variant's feature space instead of the encoder's own, e.g. dinov3_vits16",
@@ -74,6 +99,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--checkpoint-every", type=int, default=100)
+    parser.add_argument("--preview-every", type=int, default=100, help="W&B image/video preview interval")
+    parser.add_argument("--console-log-every", type=int, default=10, help="Loss/GPU-memory print interval")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--hf-backup-repo", default=None, help="Optional HF Hub repo to back up checkpoints to")
     parser.add_argument("--wandb-project", default=None)
@@ -113,11 +140,12 @@ def main() -> None:
     torch.manual_seed(0)
     dino = DinoModel(require_pretrained=args.require_pretrained_dino).cuda()
     dino.eval()
-    bottleneck = MyBottleneck(config.bottleneck).cuda()
+    bottleneck = MyBottleneck(config.bottleneck, use_checkpointing=args.activation_checkpointing).cuda()
     decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
 
     loss_fn = CodecLoss(
-        CodecLossWeights(auto_weight=True), use_checkpointing=args.activation_checkpointing
+        CodecLossWeights(auto_weight=True), use_checkpointing=args.activation_checkpointing,
+        perceptual_chunk_size=args.perceptual_chunk_size,
     ).cuda()
     loss_fn.bind_encoder_dino(dino)
     if args.perceptual_dino_model:
@@ -128,8 +156,12 @@ def main() -> None:
         loss_fn.bind_perceptual_dino(perceptual_dino)
     loss_fn.bind_last_layer(decoder.last_layer_weight)
 
+    for module in (dino, bottleneck, decoder, loss_fn):
+        _keep_convolutions_in_bf16(module)
+
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    grad_scaler = torch.amp.GradScaler("cuda")
 
     # Long constant plateau in the middle -- proportional defaults (warmup ~2%, decay ~10% of
     # args.steps) rather than mira's literal 1000/249000 (sized for its 250,001-step run).
@@ -153,6 +185,7 @@ def main() -> None:
         print(f"Resumed from {ckpt_path} at step {start_step}")
 
     wandb_enabled = init_wandb(args.wandb_project, vars(args))
+    torch.cuda.reset_peak_memory_stats()
 
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
@@ -168,23 +201,28 @@ def main() -> None:
                     input_video=normalize_video(video), output_video=reconstructed, dino_features=dino_features
                 )
                 losses = loss_fn(outputs)
-            (losses["loss_total"] / args.grad_accum_steps).backward()
+            grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
             for k, v in losses.items():
                 accumulated[k] = accumulated.get(k, 0.0) + v.item() / args.grad_accum_steps
-        optimizer.step()
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
         lr_scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
         term_str = ", ".join(
             f"{k}={v:.4f}" for k, v in accumulated.items() if k != "loss_total" and not k.endswith("_auto_w")
         )
-        print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated['loss_total']:.4f} ({term_str})")
+        if (step + 1) % args.console_log_every == 0 or step == start_step:
+            print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated['loss_total']:.4f} ({term_str})")
+            print(
+                f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
+                f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
+            )
         log_step(wandb_enabled, step, accumulated, current_lr)
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
             save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler)
-            log_preview(wandb_enabled, step, video, reconstructed)
             if args.hf_backup_repo:
                 from huggingface_hub import HfApi  # optional dep, only used here
 
@@ -192,6 +230,8 @@ def main() -> None:
                     path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint.pth",
                     repo_id=args.hf_backup_repo, repo_type="model",
                 )
+        if (step + 1) % args.preview_every == 0 or is_last:
+            log_preview(wandb_enabled, step, video, reconstructed, fps=args.target_fps)
 
 
 if __name__ == "__main__":
