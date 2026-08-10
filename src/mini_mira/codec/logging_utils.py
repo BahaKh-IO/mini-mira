@@ -5,7 +5,9 @@ Every function here is a no-op when disabled, and `wandb` is imported lazily ins
 all, matching how mira's own scripts scope the `wandb`/`lpips` imports to only where they're used.
 """
 
+from pathlib import Path
 from typing import Any
+import warnings
 
 import torch
 from torch import Tensor
@@ -32,25 +34,53 @@ def log_step(enabled: bool, step: int, losses: dict[str, float], lr: float) -> N
 
 
 def log_preview(
-    enabled: bool, step: int, original: Tensor, reconstructed: Tensor, fps: int = 20
-) -> None:
-    """Logs side-by-side original/reconstruction image and video previews for the first sample.
+    enabled: bool,
+    step: int,
+    original: Tensor,
+    reconstructed: Tensor,
+    fps: int = 20,
+    output_dir: str | Path | None = None,
+) -> Path | None:
+    """Saves and optionally logs an original/reconstruction preview for the first sample.
+
+    The MP4 is encoded before it is handed to W&B. Passing a filename to ``wandb.Video`` avoids
+    W&B's optional moviepy dependency, and retaining the file also makes early validation easy.
+    A W&B/media failure is intentionally non-fatal: observability must not stop training.
+
     original: (b, t, 3, h, w) in [0, 1]. reconstructed: (b, t, 3, h, w) in [-1, 1] (tanh output).
     """
-    if not enabled:
-        return
-    import wandb  # noqa: PLC0415
-
     from mini_mira.codec.loss import denormalize_for_dino
 
     original_display = original[0].clamp(0, 1)
     recon_display = denormalize_for_dino(reconstructed[0]).clamp(0, 1)
     comparison = torch.cat([original_display, recon_display], dim=3)  # side by side along width
-    video = (comparison.detach().cpu() * 255).round().to(torch.uint8).numpy()
-    wandb.log(
-        {
-            "preview": wandb.Image(comparison[0].permute(1, 2, 0).detach().cpu().numpy()),
-            "preview_video": wandb.Video(video, fps=fps, format="mp4"),
-        },
-        step=step,
-    )
+    video = (comparison.detach().cpu() * 255).round().to(torch.uint8).permute(0, 2, 3, 1).numpy()
+
+    video_path = None
+    if output_dir is not None:
+        try:
+            import imageio.v3 as iio  # noqa: PLC0415
+
+            preview_dir = Path(output_dir)
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            video_path = preview_dir / f"step_{step:06d}.mp4"
+            iio.imwrite(video_path, video, fps=fps, codec="libx264", pixelformat="yuv420p")
+            print(f"Saved preview to {video_path}")
+        except Exception as exc:  # media encoding must never discard a completed optimizer step
+            video_path = None
+            warnings.warn(f"Preview encoding failed at step {step}: {exc}", stacklevel=2)
+
+    if enabled:
+        try:
+            import wandb  # noqa: PLC0415
+
+            media: dict[str, Any] = {
+                "preview": wandb.Image(video[0]),
+            }
+            if video_path is not None:
+                media["preview_video"] = wandb.Video(str(video_path), fps=fps, format="mp4")
+            wandb.log(media, step=step)
+        except Exception as exc:  # logging must never discard a completed optimizer step
+            warnings.warn(f"W&B preview logging failed at step {step}: {exc}", stacklevel=2)
+
+    return video_path
