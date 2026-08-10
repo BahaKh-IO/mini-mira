@@ -6,3 +6,5 @@ venv/
 notes/
 weights/
 *.pth
+wandb/
+*.log
