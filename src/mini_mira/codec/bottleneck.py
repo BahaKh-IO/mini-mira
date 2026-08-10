@@ -4,6 +4,8 @@ import torch.nn as nn
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
+from mini_mira.ml.init import init_weights
+
 @dataclass
 class StridedConvBottleneckConfig :
     dino_dim : int = 768  # dinov3_vitb16's feature width -- the real variant this project loads
@@ -34,6 +36,8 @@ class MyBottleneck(nn.Module):
                 stride = (config.stride, config.stride),
                 bias=True
             )
+
+        self.apply(init_weights)
 
     def _project(self, x):
         if self.use_checkpointing and self.training:
