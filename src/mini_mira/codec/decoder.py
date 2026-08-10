@@ -87,7 +87,10 @@ class ViTVideoDecoder(nn.Module):
     def forward(self, z):
         b, t = z.shape[:2]
         x = rearrange(z, "b t c h w -> (b t) c h w")
-        x = self.from_latent(x)
+        if self.use_checkpointing and self.training:
+            x = checkpoint(self.from_latent, x, use_reentrant=False)
+        else:
+            x = self.from_latent(x)
         x = rearrange(x, "(b t) c h w -> b t h w c", b=b, t=t)
 
         _, t, h, w, _ = x.shape
@@ -100,5 +103,9 @@ class ViTVideoDecoder(nn.Module):
             else:
                 x = block(x, rope_spatial, rope_temporal)
 
-        x = self.norm_out(x)
-        return torch.tanh(self.patch_unembed(x))
+        def produce_pixels(hidden):
+            return torch.tanh(self.patch_unembed(self.norm_out(hidden)))
+
+        if self.use_checkpointing and self.training:
+            return checkpoint(produce_pixels, x, use_reentrant=False)
+        return produce_pixels(x)
