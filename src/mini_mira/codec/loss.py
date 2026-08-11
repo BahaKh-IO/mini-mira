@@ -1,7 +1,7 @@
 """The codec training loss: L1 + LPIPS + DINO latent-consistency, with auto_weight adaptive
-balancing. Matches real mira's CodecLoss (same three terms, same LPIPS net, same frame-subsampling
-trick, same auto_weight math), simplified in one place: mini_mira's DinoModel returns a single
-Tensor, not a list, so there's one consistency term instead of several averaged together.
+balancing. Matches real mira's CodecLoss: same three terms, same LPIPS net, same frame-subsampling
+trick, same auto_weight math, and the same multi-layer DINO consistency term when the bound
+DinoModel(s) are configured for it (see dino.py's last_layer_only/layer_indices).
 
 The codec is a deterministic autoencoder, not a VAE -- no ELBO, no KL divergence anywhere.
 
@@ -46,6 +46,23 @@ def _layer_averaged_mse(pred_features: Tensor | list[Tensor], target_features: T
     return torch.stack(layer_terms).mean()
 
 
+def _select_target_features(
+    features: Tensor | list[Tensor], t_idx: Tensor, start: int, stop: int
+) -> Tensor | list[Tensor]:
+    """Select/reshape/chunk/detach the encoder's own DINO features for the self-consistency
+    target, per layer -- matches mira's `real_lc = tuple(f[:, t_lc].detach() for f in
+    model_outputs.dino_features)`. `features` is a single Tensor in the old single-layer case.
+    """
+
+    def _one(f: Tensor) -> Tensor:
+        selected = rearrange(f[:, t_idx], "b t c h w -> (b t) c h w")
+        return selected[start:stop].unsqueeze(0).detach()
+
+    if isinstance(features, list):
+        return [_one(f) for f in features]
+    return _one(features)
+
+
 def calculate_adaptive_weight(
     anchor_loss: Tensor, other_loss: Tensor, last_layer: Tensor, max_weight: float = 1e4
 ) -> Tensor:
@@ -80,7 +97,10 @@ class CodecOutputs:
 
     input_video: Tensor  # (b, t, 3, h, w), [-1, 1] -- normalize_video(raw video)
     output_video: Tensor  # (b, t, 3, h, w), [-1, 1] -- decoder's raw tanh output
-    dino_features: Tensor  # (b, t, dino_dim, h', w') -- encoder-side, from the raw [0,1] video
+    # (b, t, dino_dim, h', w') -- encoder-side, from the raw [0,1] video. A list when the
+    # encoder's DinoModel is multi-layer (one tensor per aggregated layer), matching mira's own
+    # RAEEncoderOutputs.dino_features.
+    dino_features: Tensor | list[Tensor]
 
 
 @dataclass
@@ -223,8 +243,7 @@ class CodecLoss(nn.Module):
                     with torch.no_grad():
                         target_features = consistency_dino.dino_forward(target_input)
                 else:
-                    selected = rearrange(outputs.dino_features[:, t_idx], "b t c h w -> (b t) c h w")
-                    target_features = selected[start:stop].unsqueeze(0).detach()
+                    target_features = _select_target_features(outputs.dino_features, t_idx, start, stop)
 
                 weight = (stop - start) / pred_frames.shape[0]
                 dino_terms.append(weight * _layer_averaged_mse(pred_features, target_features))
