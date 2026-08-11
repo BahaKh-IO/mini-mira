@@ -102,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 20")
     parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps - warmup_steps")
     parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
+    parser.add_argument("--loss-mae-weight", type=float, default=1.0, help="CodecLossWeights.loss_mae")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--preview-every", type=int, default=100, help="W&B image/video preview interval")
@@ -149,7 +150,8 @@ def main() -> None:
     decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
 
     loss_fn = CodecLoss(
-        CodecLossWeights(auto_weight=True), use_checkpointing=args.activation_checkpointing,
+        CodecLossWeights(auto_weight=True, loss_mae=args.loss_mae_weight),
+        use_checkpointing=args.activation_checkpointing,
         perceptual_chunk_size=args.perceptual_chunk_size,
     ).cuda()
     loss_fn.bind_encoder_dino(dino)
