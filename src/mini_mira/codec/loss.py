@@ -32,6 +32,20 @@ def denormalize_for_dino(x: Tensor) -> Tensor:
     return (x + 1) / 2
 
 
+def _layer_averaged_mse(pred_features: Tensor | list[Tensor], target_features: Tensor | list[Tensor]) -> Tensor:
+    """Normalize (direction, not magnitude) then MSE per DINO layer, averaged across layers --
+    matches mira's DinoPerceptualLoss.forward exactly. Single-tensor inputs (the default,
+    last-layer-only case) reduce to one term, so this is a strict superset of the old behavior.
+    """
+    if not isinstance(pred_features, list):
+        pred_features, target_features = [pred_features], [target_features]
+    layer_terms = [
+        F.mse_loss(F.normalize(p, dim=2, eps=1e-6), F.normalize(t, dim=2, eps=1e-6))
+        for p, t in zip(pred_features, target_features)
+    ]
+    return torch.stack(layer_terms).mean()
+
+
 def calculate_adaptive_weight(
     anchor_loss: Tensor, other_loss: Tensor, last_layer: Tensor, max_weight: float = 1e4
 ) -> Tensor:
@@ -120,6 +134,23 @@ class CodecLoss(nn.Module):
         self.perceptual_dino: DinoModel | None = None  # optional, see bind_perceptual_dino
         self._last_layer: Tensor | None = None  # bound post-init, see bind_last_layer
 
+        # Per-term real gradient norms, populated during backward() -- see _hook_clone. Read
+        # after backward(), not before: empty until then. Matches mira's own backward_metrics.
+        self.backward_metrics: dict[str, Tensor] = {}
+
+    def _hook_clone(self, tensor: Tensor, loss_name: str) -> Tensor:
+        """Clone `tensor` and register a backward hook recording its gradient norm under
+        `loss_name` in backward_metrics -- lets training watch each term's real gradient
+        magnitude directly, not just auto_weight's derived ratio. Matches mira's own
+        CodecLoss._hook_clone exactly, including its dim=-1 norm convention."""
+        if not tensor.requires_grad:
+            return tensor
+        clone = tensor.clone()
+        clone.register_hook(
+            lambda grad: self.backward_metrics.update({loss_name: grad.data.norm(p=2, dim=-1).mean()})
+        )
+        return clone
+
     def bind_encoder_dino(self, dino: DinoModel) -> None:
         """Share the encoder's already-loaded, frozen DINO backbone (no second copy loaded)."""
         self.dino = dino
@@ -140,13 +171,14 @@ class CodecLoss(nn.Module):
         self._last_layer = param
 
     def forward(self, outputs: CodecOutputs) -> dict[str, Tensor]:
+        self.backward_metrics.clear()
         predicted = outputs.output_video.float()  # [-1, 1]
         target = outputs.input_video.float()  # [-1, 1]
 
         loss: dict[str, Tensor] = {}
 
         if self.weights.loss_mae > 0:
-            loss["loss_mae"] = F.l1_loss(predicted, target)
+            loss["loss_mae"] = F.l1_loss(self._hook_clone(predicted, "loss_mae"), target)
 
         t_total = predicted.shape[1]
 
@@ -155,7 +187,8 @@ class CodecLoss(nn.Module):
             # than every frame, and different random subsets across steps still cover everything.
             k = max(1, round(t_total * self.weights.lpips_perceptual_frame_frac))
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
-            pred_2d = rearrange(predicted[:, t_idx], "b t c h w -> (b t) c h w")
+            predicted_lpips = self._hook_clone(predicted, "loss_lpips_perceptual")
+            pred_2d = rearrange(predicted_lpips[:, t_idx], "b t c h w -> (b t) c h w")
             tgt_2d = rearrange(target[:, t_idx], "b t c h w -> (b t) c h w")
             chunk_size = self.perceptual_chunk_size or pred_2d.shape[0]
             lpips_terms = []
@@ -172,7 +205,8 @@ class CodecLoss(nn.Module):
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
             # No no_grad here: needs to backprop from DINO's features on the reconstruction,
             # through the decoder and bottleneck. Target side is already detached.
-            pred_frames = rearrange(predicted[:, t_idx], "b t c h w -> (b t) c h w")
+            predicted_dino = self._hook_clone(predicted, "loss_dino_latent_consistency")
+            pred_frames = rearrange(predicted_dino[:, t_idx], "b t c h w -> (b t) c h w")
             target_frames = rearrange(target[:, t_idx], "b t c h w -> (b t) c h w")
             chunk_size = self.perceptual_chunk_size or pred_frames.shape[0]
             dino_terms = []
@@ -192,10 +226,8 @@ class CodecLoss(nn.Module):
                     selected = rearrange(outputs.dino_features[:, t_idx], "b t c h w -> (b t) c h w")
                     target_features = selected[start:stop].unsqueeze(0).detach()
 
-                p = F.normalize(pred_features, dim=2, eps=1e-6)
-                t = F.normalize(target_features, dim=2, eps=1e-6)
                 weight = (stop - start) / pred_frames.shape[0]
-                dino_terms.append(weight * F.mse_loss(p, t))
+                dino_terms.append(weight * _layer_averaged_mse(pred_features, target_features))
             loss["loss_dino_latent_consistency"] = torch.stack(dino_terms).sum()
 
         if (
@@ -219,5 +251,8 @@ class CodecLoss(nn.Module):
             for name, value in loss.items()
             if hasattr(self.weights, name)  # excludes the *_auto_w diagnostic entries above
         ]
-        loss["loss_total"] = torch.stack(weighted).sum()
+        # weighted is non-empty for any sensible config (loss_mae is on by default); guard the
+        # degenerate all-zero-weights case so it returns a finite zero rather than raising on
+        # stack, matching mira's own guard.
+        loss["loss_total"] = torch.stack(weighted).sum() if weighted else predicted.new_zeros(())
         return loss
