@@ -51,6 +51,19 @@ DEFAULT_DINO_LAYERS = {
     "dinov3_vits16": (2, 5, 8, 11),
 }
 
+# mira's real encoder-side layer aggregation (mira/src/mira/codec/rae_encoder.py, config'd via
+# RAEEncoderConfig.aggregation_layers) -- a *different* layer selection than DEFAULT_DINO_LAYERS
+# above: this one is only ever shipped for vitl16 (RAE always uses the L backbone in real mira),
+# weighted toward the back half of the network (11-23 of 24 blocks) rather than spread across the
+# whole depth. vitb16/vits16 have no real mira value to port -- mira never runs the encoder on
+# either -- so these reuse DEFAULT_DINO_LAYERS's own real (not inferred) vitb16 value rather than
+# compounding a second guess on top of a proportional rescale of the vitl16 list.
+DEFAULT_ENCODER_AGGREGATION_LAYERS = {
+    "dinov3_vitl16": (11, 13, 15, 17, 19, 21, 23),
+    "dinov3_vitb16": (2, 5, 8, 11),
+    "dinov3_vits16": (2, 5, 8, 11),
+}
+
 
 def resolve_dino_weights(dino_model: str) -> Path | None:
     """Local DINOv3 weights file for `dino_model`, or None if RS_DINO_WEIGHTS_DIR isn't set."""
