@@ -15,8 +15,9 @@ the complete frozen DINO backbones kept in bfloat16. This avoids this V100/cuDNN
 convolution engine failures and DINO's FP16 numerical instability.
 
 Effective batch size is --batch-size (the real, per-forward micro-batch) times
---grad-accum-steps -- see mini_mira.codec.lr_schedule for the LR schedule shape, and
---activation-checkpointing to trade compute for the memory a larger micro-batch would need.
+--grad-accum-steps -- see mira.training.lr_schedule.WarmupConstantCosineDecayLR for the LR
+schedule shape, and --activation-checkpointing to trade compute for the memory a larger
+micro-batch would need.
 """
 
 import argparse
@@ -30,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "mira" / 
 
 import torch
 from mira.data.training_loader import create_loader
+from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 
 from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.checkpoint import load_checkpoint, save_checkpoint
@@ -37,7 +39,6 @@ from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.dino import DinoModel
 from mini_mira.codec.logging_utils import init_wandb, log_preview, log_step
 from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
-from mini_mira.codec.lr_schedule import WarmupConstantLinearDecayLR
 from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
 
@@ -98,9 +99,8 @@ def parse_args() -> argparse.Namespace:
         help="Aggregate multiple DINO layers for the consistency loss (matches mira's "
         "DinoPerceptualLoss) instead of just the last one. Requires --perceptual-dino-model.",
     )
-    parser.add_argument("--lr-warmup-start", type=float, default=1e-7)
-    parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 50")
-    parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps // 10")
+    parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 20")
+    parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps - warmup_steps")
     parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--checkpoint-every", type=int, default=100)
@@ -169,14 +169,14 @@ def main() -> None:
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     grad_scaler = torch.amp.GradScaler("cuda")
 
-    # Long constant plateau in the middle -- proportional defaults (warmup ~2%, decay ~10% of
-    # args.steps) rather than mira's literal 1000/249000 (sized for its 250,001-step run).
-    warmup_steps = args.lr_warmup_steps if args.lr_warmup_steps is not None else max(1, args.steps // 50)
-    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else max(1, args.steps // 10)
+    # mira's own schedule shape: warmup ~5% of args.steps, then cosine decay for the rest, no
+    # constant plateau -- proportional to args.steps rather than mira's literal 1000/249000
+    # (those were sized for its 250,001-step run).
+    warmup_steps = args.lr_warmup_steps if args.lr_warmup_steps is not None else max(1, args.steps // 20)
+    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else max(1, args.steps - warmup_steps)
     min_lr = args.lr_min if args.lr_min is not None else args.lr * 0.01
-    lr_scheduler = WarmupConstantLinearDecayLR(
-        optimizer, warmup_steps=warmup_steps, constant_steps=max(0, args.steps - warmup_steps - decay_steps),
-        decay_steps=decay_steps, min_lr=min_lr, warmup_start_lr=args.lr_warmup_start,
+    lr_scheduler = WarmupConstantCosineDecayLR(
+        optimizer, warmup_steps=warmup_steps, constant_steps=0, decay_steps=decay_steps, min_lr=min_lr,
     )
 
     next_video = build_next_video(args)
