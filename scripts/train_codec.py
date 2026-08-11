@@ -93,6 +93,11 @@ def parse_args() -> argparse.Namespace:
         help="If set, score the DINO-consistency loss in a separate (typically smaller) DINO "
         "variant's feature space instead of the encoder's own, e.g. dinov3_vits16",
     )
+    parser.add_argument(
+        "--perceptual-dino-multilayer", action="store_true",
+        help="Aggregate multiple DINO layers for the consistency loss (matches mira's "
+        "DinoPerceptualLoss) instead of just the last one. Requires --perceptual-dino-model.",
+    )
     parser.add_argument("--lr-warmup-start", type=float, default=1e-7)
     parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 50")
     parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps // 10")
@@ -150,7 +155,8 @@ def main() -> None:
     loss_fn.bind_encoder_dino(dino)
     if args.perceptual_dino_model:
         perceptual_dino = DinoModel(
-            dino_model=args.perceptual_dino_model, require_pretrained=args.require_pretrained_dino
+            dino_model=args.perceptual_dino_model, require_pretrained=args.require_pretrained_dino,
+            last_layer_only=not args.perceptual_dino_multilayer,
         ).cuda()
         perceptual_dino.eval()
         loss_fn.bind_perceptual_dino(perceptual_dino)
@@ -208,6 +214,10 @@ def main() -> None:
         grad_scaler.update()
         lr_scheduler.step()
 
+        # Last micro-step's real per-term gradient norms (see CodecLoss._hook_clone) -- same
+        # "last micro-step only" convention already used for the preview video below.
+        grad_norms = {f"grad_norm_{k}": v.item() for k, v in loss_fn.backward_metrics.items()}
+
         current_lr = optimizer.param_groups[0]["lr"]
         term_str = ", ".join(
             f"{k}={v:.4f}" for k, v in accumulated.items() if k != "loss_total" and not k.endswith("_auto_w")
@@ -218,7 +228,8 @@ def main() -> None:
                 f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
                 f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
             )
-        log_step(wandb_enabled, step, accumulated, current_lr)
+            print(", ".join(f"{k}={v:.4f}" for k, v in grad_norms.items()))
+        log_step(wandb_enabled, step, {**accumulated, **grad_norms}, current_lr)
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
