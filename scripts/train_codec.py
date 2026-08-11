@@ -36,7 +36,7 @@ from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.checkpoint import load_checkpoint, save_checkpoint
 from mini_mira.codec.decoder import ViTVideoDecoder
-from mini_mira.codec.dino import DinoModel
+from mini_mira.codec.dino import DEFAULT_ENCODER_AGGREGATION_LAYERS, DinoModel
 from mini_mira.codec.logging_utils import init_wandb, log_preview, log_step
 from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
 from mini_mira.codec.video_prep import resize_to_canonical
@@ -144,7 +144,14 @@ def main() -> None:
     config = load_pipeline_config(args.config)
 
     torch.manual_seed(0)
-    dino = DinoModel(require_pretrained=args.require_pretrained_dino).cuda()
+    # dinov3_vitb16 is the only variant with weights downloaded for this project (real mira's
+    # encoder always uses vitl16) -- matches mira's RAEEncoder in every other respect: multi-layer
+    # aggregation on, layer_indices from DEFAULT_ENCODER_AGGREGATION_LAYERS.
+    encoder_dino_model = "dinov3_vitb16"
+    dino = DinoModel(
+        dino_model=encoder_dino_model, require_pretrained=args.require_pretrained_dino,
+        last_layer_only=False, layer_indices=DEFAULT_ENCODER_AGGREGATION_LAYERS[encoder_dino_model],
+    ).cuda()
     dino.eval()
     bottleneck = MyBottleneck(config.bottleneck, use_checkpointing=args.activation_checkpointing).cuda()
     decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
