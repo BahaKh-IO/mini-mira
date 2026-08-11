@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
@@ -45,6 +46,13 @@ class MyBottleneck(nn.Module):
         return self.projection(x)
 
     def forward(self,x):
+        # Multi-layer DINO input (a list of (b,t,c,h,w) tensors): blend into one tensor the same
+        # way real mira's RAEEncoder.forward does before its own projection conv -- mean across
+        # layers, plus the last layer again (extra weight toward the most semantic/late features).
+        # A single tensor (the old single-layer case) passes through unchanged.
+        if isinstance(x, list):
+            x = torch.stack(x, dim=0).mean(dim=0) + x[-1]
+
         if self.config.temporal_stride>1:
             x=rearrange(x,"b t c h w -> b c t h w")
             z=self._project(x)
