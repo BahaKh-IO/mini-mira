@@ -193,6 +193,10 @@ class CodecLoss(nn.Module):
     def forward(self, outputs: CodecOutputs) -> dict[str, Tensor]:
         self.backward_metrics.clear()
         predicted = outputs.output_video.float()  # [-1, 1]
+        # Hooked once here too, matching mira: the three per-term hooks below all clone from this
+        # already-hooked tensor, so this one captures the combined gradient from all three loss
+        # terms together, not just one of them.
+        predicted = self._hook_clone(predicted, "loss_total_video")
         target = outputs.input_video.float()  # [-1, 1]
 
         loss: dict[str, Tensor] = {}
