@@ -41,6 +41,16 @@ DINO_WEIGHT_FILENAMES = {
     "dinov3_vits16": "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
 }
 
+# mira's own multi-layer default for the DINO-consistency loss (last_layer_only=False). Not in
+# mira's own table for vits16 (mira never uses that variant) -- inferred, not confirmed: DINOv2/v3's
+# S and B variants share the same 12-layer depth, differing only in width, so vitb16's depth-indexed
+# choice should carry over unchanged.
+DEFAULT_DINO_LAYERS = {
+    "dinov3_vitl16": (2, 6, 10, 14, 18, 22),
+    "dinov3_vitb16": (2, 5, 8, 11),
+    "dinov3_vits16": (2, 5, 8, 11),
+}
+
 
 def resolve_dino_weights(dino_model: str) -> Path | None:
     """Local DINOv3 weights file for `dino_model`, or None if RS_DINO_WEIGHTS_DIR isn't set."""
@@ -77,18 +87,29 @@ def _load_dinov3_backbone_fn(dino_model: str):
 
 
 class DinoModel(nn.Module):
-    """Frozen DINOv3 feature extractor, matching mira's DinoModel, trimmed to what mini_mira uses:
-    single-layer features only (mira's list-of-layers exists to feed its multi-layer perceptual
-    loss; mini_mira's CodecLoss uses a single layer), no torch.compile, and no internal
+    """Frozen DINOv3 feature extractor, matching mira's DinoModel. Single-layer by default (what
+    the encoder path needs); pass last_layer_only=False for the multi-layer mode mira's own
+    DinoPerceptualLoss uses, e.g. via bind_perceptual_dino. No torch.compile, and no internal
     torch.no_grad() -- gradient flow is left to the caller (see dino_forward below).
     """
 
-    def __init__(self, dino_model: str = "dinov3_vitb16", require_pretrained: bool = True):
+    def __init__(
+        self,
+        dino_model: str = "dinov3_vitb16",
+        require_pretrained: bool = True,
+        last_layer_only: bool = True,
+        layer_indices: tuple[int, ...] | None = None,
+    ):
         super().__init__()
         assert dino_model in DINO_DIM, f"unsupported dino_model {dino_model!r}"
+        if last_layer_only and layer_indices is not None:
+            raise ValueError("DinoModel: pass either last_layer_only=True OR layer_indices=(...), not both.")
         self.dino_model_name = dino_model
         self.dino_dim = DINO_DIM[dino_model]
         self.patch_size = PATCH_SIZE
+        self.layers = layer_indices if layer_indices is not None else (
+            1 if last_layer_only else DEFAULT_DINO_LAYERS[dino_model]
+        )
 
         backbone_fn = _load_dinov3_backbone_fn(dino_model)
         weights_path = resolve_dino_weights(dino_model)
@@ -117,8 +138,10 @@ class DinoModel(nn.Module):
     def image_normalization(self, x: Tensor) -> Tensor:
         return (x - self.mean) / self.std
 
-    def dino_forward(self, x: Tensor) -> Tensor:
-        """x: (b, t, 3, h, w), values in [0, 1]. Returns (b, t, dino_dim, h', w').
+    def dino_forward(self, x: Tensor) -> Tensor | list[Tensor]:
+        """x: (b, t, 3, h, w), values in [0, 1]. Returns (b, t, dino_dim, h', w') for the default
+        single-layer case, or a list of that shape (one per entry in self.layers) when built with
+        last_layer_only=False.
 
         No internal no_grad(): call it under torch.no_grad() yourself when the input doesn't
         need a gradient (the encoder side); leave it unwrapped when it does (CodecLoss's
@@ -131,5 +154,6 @@ class DinoModel(nn.Module):
             new_h = self.patch_size * (h // self.patch_size)
             new_w = self.patch_size * (w // self.patch_size)
             x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
-            features = self.dino_model.get_intermediate_layers(x, n=1, norm=True, reshape=True)[0]
-            return rearrange(features, "(b t) c h w -> b t c h w", b=b, t=t)
+            features = self.dino_model.get_intermediate_layers(x, n=self.layers, norm=True, reshape=True)
+            features = [rearrange(f, "(b t) c h w -> b t c h w", b=b, t=t) for f in features]
+            return features[0] if isinstance(self.layers, int) else features
