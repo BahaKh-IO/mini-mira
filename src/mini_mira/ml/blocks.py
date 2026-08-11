@@ -15,6 +15,7 @@ class BlockConfig:
     causal: bool = True
     eps: float = 1e-6
     layerscale_init: float = 1e-4
+    qk_norm: str = "layernorm"  # mira's shipped codec config overrides its own "rmsnorm" default to this
 
 
 class LayerScale(nn.Module):
@@ -71,16 +72,38 @@ class QKRMSNorm(nn.Module):
         return x.to(input_dtype)
 
 
+class QKLayerNorm(nn.Module):
+    """Per-head LayerNorm for q/k, matching mira/src/mira/ml/attention.py's QKLayerNorm exactly --
+    same as QKRMSNorm but mean-centered first. Same qk_scale shape as QKRMSNorm (no bias term
+    either), so the two are interchangeable at the parameter level, only the forward math differs.
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.qk_scale = nn.Parameter(torch.ones(num_heads, head_dim))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        mean = x.mean(-1, keepdim=True)
+        variance = (x - mean).pow(2).mean(-1, keepdim=True)
+        x = (x - mean) * torch.rsqrt(variance + self.eps)
+        x = self.qk_scale.to(torch.float32) * x
+        return x.to(input_dtype)
+
+
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, qk_norm: str = "layernorm"):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.wqkv = nn.Linear(dim, 3 * dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
-        self.q_ln = QKRMSNorm(num_heads, self.head_dim)
-        self.k_ln = QKRMSNorm(num_heads, self.head_dim)
+        qk_norm_cls = QKRMSNorm if qk_norm == "rmsnorm" else QKLayerNorm
+        self.q_ln = qk_norm_cls(num_heads, self.head_dim)
+        self.k_ln = qk_norm_cls(num_heads, self.head_dim)
 
     def forward(self, x, causal: bool, freqs: tuple[Tensor, Tensor] | None = None):
         b, n, c = x.shape
@@ -105,11 +128,11 @@ class SpaceTimeBlock(nn.Module):
         dim = config.width
 
         self.space_norm = nn.LayerNorm(dim, eps=config.eps)
-        self.space_attn = SelfAttention(dim, config.num_heads)
+        self.space_attn = SelfAttention(dim, config.num_heads, config.qk_norm)
         self.space_ls = LayerScale(dim, config.layerscale_init)
 
         self.time_norm = nn.LayerNorm(dim, eps=config.eps)
-        self.time_attn = SelfAttention(dim, config.num_heads)
+        self.time_attn = SelfAttention(dim, config.num_heads, config.qk_norm)
         self.time_ls = LayerScale(dim, config.layerscale_init)
         self.causal = config.causal
 
