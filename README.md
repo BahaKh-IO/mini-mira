@@ -148,6 +148,16 @@ See [Scale](#scale) above for parameter counts at both the intended ~300M scale
   directly; setting it `True` builds the real frozen backbone in `__init__` and switches
   `forward`'s first argument to raw video instead, verified end to end in
   `scripts/verify_dino.py`.
+- **Real codec training**, on a rented GPU, on real Rocket League data:
+  `scripts/train_codec.py` streams real clips (`mira.data.training_loader.create_loader`, real
+  shards from `scripts/download_shards.py`) through the real three-term loss
+  (`src/mini_mira/codec/loss.py`'s `CodecLoss`: L1 + LPIPS + DINO latent-consistency, matching
+  mira's own `CodecLoss` — mira's codec has no ELBO or KL anywhere; it isn't a VAE) with
+  `auto_weight` adaptive loss balancing on, mira's real cosine LR schedule, hybrid fp16/bf16
+  precision with `GradScaler`, gradient accumulation and activation checkpointing for
+  full-resolution batches, per-term gradient-norm instrumentation, and checkpoint save/resume.
+  `scripts/verify_codec_training.py` remains the fast, GPU-free mechanism check (one synthetic
+  video, random-init DINOv3, asserts loss drops); `train_codec.py` is the real thing.
 
 **Deliberately simplified or not yet implemented**, each a disclosed decision rather than a gap
 found later:
@@ -164,18 +174,7 @@ found later:
 - **Grouped-query attention.** Attention here always uses as many KV heads as query heads.
 - **World-model training.** The world model has no training mechanism at all yet (only the
   inference-time sampling loop in `MyPipeline.forward` exists) — deliberately deferred to a later
-  task, after the codec. The codec, by contrast, does train for real now — see below.
-- **The codec trains for real, on real data, on a rented GPU** — this is no longer a gap, but
-  worth being explicit about what "real" covers: `scripts/train_codec.py` streams real Rocket
-  League clips (`mira.data.training_loader.create_loader`, real shards from
-  `scripts/download_shards.py`) through the real three-term loss
-  (`src/mini_mira/codec/loss.py`'s `CodecLoss`: L1 + LPIPS + DINO latent-consistency, matching
-  mira's own `CodecLoss` — mira's codec has no ELBO or KL anywhere; it isn't a VAE) with
-  `auto_weight` adaptive loss balancing on, mira's real cosine LR schedule, hybrid fp16/bf16
-  precision with `GradScaler`, gradient accumulation and activation checkpointing for
-  full-resolution batches, per-term gradient-norm instrumentation, and checkpoint save/resume.
-  `scripts/verify_codec_training.py` remains the fast, GPU-free mechanism check (one synthetic
-  video, random-init DINOv3, asserts loss drops); `train_codec.py` is the real thing.
+  task, after the codec. The codec, by contrast, does train for real now — see Implemented above.
 - **One shared implementation where the real repo has two.** The real codec and world model
   never share code with each other, even for identical logic (e.g. two separately-named but
   functionally identical MLP classes, two separate RoPE implementations). mini_mira
