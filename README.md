@@ -3,8 +3,9 @@
 A from-scratch reimplementation of the core architecture behind **MIRA** — an
 action-conditioned latent world model for Rocket League built on a representation-autoencoder
 (RAEv2) codec and a flow-matching diffusion transformer. This project reimplements the codec
-and world-model architecture end to end and verifies it with shape and behavioral tests; it does
-not train a model.
+and world-model architecture end to end and verifies it with shape and behavioral tests. The
+codec is trained for real, on real Rocket League data (`scripts/train_codec.py`); the world
+model's architecture is implemented and verified but has no training mechanism yet.
 
 ## What this is
 
