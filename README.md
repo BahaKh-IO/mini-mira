@@ -88,13 +88,17 @@ convenience for fast iteration, not the intended final scale.
 | `src/mini_mira/codec/bottleneck.py` | `StridedConvBottleneckConfig`, `MyBottleneck` — the encoder-side strided-conv projection into the latent |
 | `src/mini_mira/codec/decoder.py` | `ViTDecoderConfig`, `ViTVideoDecoder`, `PatchUnembed` — the space-time ViT decoder |
 | `src/mini_mira/world_model/diffusion_transformer.py` | `LatentWorldModelConfig`, `DiffusionTransformer` — the AdaLN-conditioned diffusion transformer |
-| `src/mini_mira/ml/blocks.py` | Shared building blocks: `LayerScale`, `SwiGLU`, `SelfAttention`, `SpaceTimeBlock` (decoder), `AdaptiveLayerNorm`, `AdaSTBlock` (world model) |
+| `src/mini_mira/ml/blocks.py` | Shared building blocks: `LayerScale`, `SwiGLU`, `SelfAttention` (with `QKRMSNorm`/`QKLayerNorm`, selected per-block via `BlockConfig.qk_norm`), `SpaceTimeBlock` (decoder), `AdaptiveLayerNorm`, `AdaSTBlock` (world model) |
+| `src/mini_mira/ml/init.py` | `init_weights` — mira-matching initialization (`N(0, 0.02)` for Linear/Conv, unit weight/zero bias for norms, zeroed AdaLN conditioning projection), applied by the bottleneck and decoder |
 | `src/mini_mira/ml/rope.py` | Rotary position embeddings — one shared implementation (temporal + axial spatial), used by both the decoder and the world model |
 | `src/mini_mira/world_model/timestep_encoder.py` | `DiffusionTimeEmbedding` — sinusoidal embedding of the diffusion timestep `tau` |
 | `src/mini_mira/world_model/action_encoder.py` | `ActionEncoder` — encodes raw multi-hot key-press actions into per-latent-frame conditioning vectors |
 | `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos`/`clean_past` and `ActionEncoder` |
-| `src/mini_mira/codec/dino.py` | `DinoModel` — the real, frozen DINOv3 (ViT-B/16) backbone; loads real pretrained weights, wired into `MyPipeline` behind `PipelineConfig.use_real_dino` (see Scope) |
-| `src/mini_mira/codec/loss.py` | `CodecLoss`, `CodecLossWeights`, `CodecOutputs` — the codec's real training loss (L1 + LPIPS + DINO latent-consistency, matching mira's `CodecLoss` minus `auto_weight`); `normalize_video`/`denormalize_for_dino` — the `[0,1]`↔`[-1,1]` pixel-range conversions the codec and DINO each expect |
+| `src/mini_mira/codec/dino.py` | `DinoModel` — the real, frozen DINOv3 backbone (ViT-S/B/L/16, single- or multi-layer); loads real pretrained weights, wired into `MyPipeline` behind `PipelineConfig.use_real_dino` (see Scope). `DEFAULT_DINO_LAYERS`/`DEFAULT_ENCODER_AGGREGATION_LAYERS` — mira's real per-variant layer-selection tables for the perceptual loss and the encoder's own feature aggregation, respectively (two different selections, for two different purposes) |
+| `src/mini_mira/codec/loss.py` | `CodecLoss`, `CodecLossWeights`, `CodecOutputs` — the codec's real training loss (L1 + LPIPS + DINO latent-consistency, with `auto_weight` adaptive balancing and per-term gradient-norm instrumentation, matching mira's `CodecLoss`); `normalize_video`/`denormalize_for_dino` — the `[0,1]`↔`[-1,1]` pixel-range conversions the codec and DINO each expect |
+| `src/mini_mira/codec/video_prep.py` | `resize_to_canonical` — pads to the target aspect ratio then bilinear-resizes, matching mira's `VideoCodec.preprocess_batch`, so real clips of any native resolution land at the shape the model expects |
+| `src/mini_mira/codec/checkpoint.py` | `save_checkpoint`/`load_checkpoint` — minimal save/resume for codec training (bottleneck + decoder + optimizer + scheduler + step count in one file), not a port of mira's distributed `CheckpointManager` |
+| `src/mini_mira/codec/logging_utils.py` | Optional wandb logging for `train_codec.py` — `init_wandb`/`log_step`/`log_preview`; a no-op throughout if `--wandb-project` is omitted, so wandb is never a hard dependency |
 | `scripts/test_shapes.py` | Shape-correctness checks for every stage of the pipeline |
 | `scripts/verify_rope.py` | Behavioral checks for RoPE: causal masking and position sensitivity |
 | `scripts/verify_conditioning.py` | Behavioral checks for AdaLN, clean-past, and actions: `tau`/`clean_past`/action sensitivity, determinism, and end-to-end pipeline checks |
@@ -104,8 +108,9 @@ convenience for fast iteration, not the intended final scale.
 | `configs/small.yaml` | Named preset mirroring today's dataclass defaults exactly (regression-safe baseline) |
 | `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward a ~300M parameter target |
 | `scripts/verify_codec_training.py` | Mechanical proof the codec's training mechanism is wired correctly: overfits one fixed synthetic video on the real `CodecLoss` and asserts the total loss drops substantially. Small config, random-init DINOv3 — no gated weights, runs in seconds |
-| `scripts/train_codec.py` | Config-driven codec training on the real `CodecLoss` (L1 + LPIPS + DINO latent-consistency; no `auto_weight` yet — see `notes/deviations.md`). Defaults to a fast toy size; `--config`/`--height`/`--width`/`--frames` point it at the real target scale once there's a GPU. No real dataset exists yet — trains on one fixed synthetic video |
-| `scripts/reconstruct.py` | Runs a real image or a real video clip (`.mp4`/`.mov`/`.avi`/`.mkv`/`.webm`, decoded frame-by-frame via `imageio`) through the codec once (untrained weights) and saves a side-by-side comparison grid — top row original frames, bottom row reconstructed, aligned by timestep. Proves the real-data path works mechanically — not that the reconstruction looks like anything yet |
+| `scripts/download_shards.py` | Downloads N real Rocket League match shards via mira's own `RocketScienceDataset.from_hub`, straight from the gated `kyutai/rocket-science` HuggingFace dataset — the same mechanism for a quick correctness smoke test (`--shards 3`, the default) and for pulling the real training set on the GPU box (larger `--shards`) |
+| `scripts/train_codec.py` | Real GPU codec training: real streamed data (`--index-path`, from `download_shards.py`) or one fixed synthetic video (default, for fast local checks); mira's real `WarmupConstantCosineDecayLR` schedule; hybrid fp16/bf16 autocast + `GradScaler`; gradient accumulation and activation checkpointing for full-resolution batches; `auto_weight` on; per-term gradient-norm logging; checkpoint save/resume (`--checkpoint-dir`/`--resume`, optional HF Hub backup); optional wandb logging. See `--help` for the full flag list |
+| `scripts/reconstruct.py` | Runs a real image or a real video clip (`.mp4`/`.mov`/`.avi`/`.mkv`/`.webm`, decoded frame-by-frame via `imageio`) through the codec once and saves a side-by-side comparison grid — top row original frames, bottom row reconstructed, aligned by timestep |
 
 See [Scale](#scale) above for parameter counts at both the intended ~300M scale
 (`configs/scaled_300m.yaml`) and the small default used for fast testing (`configs/small.yaml`).
@@ -116,6 +121,9 @@ See [Scale](#scale) above for parameter counts at both the intended ~300M scale
 - Strided-conv bottleneck (encoder) and ViT space-time decoder, matching the real codec's shape
   contract and space/time attention factorization.
 - Rotary position embeddings (temporal + axial 2D spatial).
+- QK-norm (`QKRMSNorm`/`QKLayerNorm`, matching mira's shipped codec config's choice of
+  `layernorm`) and mira-matching weight initialization (`src/mini_mira/ml/init.py`), both applied
+  to the decoder.
 - AdaLN conditioning of the world model on the diffusion timestep `tau`, via a sinusoidal
   timestep embedding matched to the real implementation.
 - Clean-past conditioning: each denoising step additively conditions on the real, clean latent
@@ -154,16 +162,20 @@ found later:
   from the model's own previous output — see the note above.
 - **Streaming inference.** No KV-cache; every diffusion step recomputes the whole sequence.
 - **Grouped-query attention.** Attention here always uses as many KV heads as query heads.
-- **Training.** The codec (`DinoModel` → `MyBottleneck` → `ViTVideoDecoder`) trains on the real
-  three-term reconstruction loss (`src/mini_mira/codec/loss.py`'s `CodecLoss`: L1 + LPIPS + DINO
-  latent-consistency, matching mira's own `CodecLoss` — mira's codec has no ELBO or KL anywhere;
-  it isn't a VAE), verified to actually reduce loss (`scripts/verify_codec_training.py`) — but
-  only on one fixed synthetic video; no real dataset, no `auto_weight` adaptive loss balancing
-  (needs the decoder's last-layer weight exposed plus gradient-norm bookkeeping — deferred, flat
-  fixed weights used instead), no LR schedule. The world model has no training mechanism at all
-  yet (only the inference-time sampling loop in `MyPipeline.forward` exists) — deliberately
-  deferred to a later task. Every weight starts randomly initialized either way; this project
-  mostly verifies architecture and shapes, not learned behavior.
+- **World-model training.** The world model has no training mechanism at all yet (only the
+  inference-time sampling loop in `MyPipeline.forward` exists) — deliberately deferred to a later
+  task, after the codec. The codec, by contrast, does train for real now — see below.
+- **The codec trains for real, on real data, on a rented GPU** — this is no longer a gap, but
+  worth being explicit about what "real" covers: `scripts/train_codec.py` streams real Rocket
+  League clips (`mira.data.training_loader.create_loader`, real shards from
+  `scripts/download_shards.py`) through the real three-term loss
+  (`src/mini_mira/codec/loss.py`'s `CodecLoss`: L1 + LPIPS + DINO latent-consistency, matching
+  mira's own `CodecLoss` — mira's codec has no ELBO or KL anywhere; it isn't a VAE) with
+  `auto_weight` adaptive loss balancing on, mira's real cosine LR schedule, hybrid fp16/bf16
+  precision with `GradScaler`, gradient accumulation and activation checkpointing for
+  full-resolution batches, per-term gradient-norm instrumentation, and checkpoint save/resume.
+  `scripts/verify_codec_training.py` remains the fast, GPU-free mechanism check (one synthetic
+  video, random-init DINOv3, asserts loss drops); `train_codec.py` is the real thing.
 - **One shared implementation where the real repo has two.** The real codec and world model
   never share code with each other, even for identical logic (e.g. two separately-named but
   functionally identical MLP classes, two separate RoPE implementations). mini_mira
@@ -217,8 +229,12 @@ both:
 Requirements: Python ≥ 3.10, plus `requirements.txt` (`torch`, `einops`, `pyyaml`, `pillow`,
 `imageio`/`imageio-ffmpeg`, `torchmetrics`, `torchvision` — each verified against the actual code
 path that uses it, not against everything installed while debugging DINOv3 loading; see
-`notes/deviations.md` 1.14 for why `termcolor` specifically is NOT listed). There is no packaging
-configuration — the scripts add `src/` to `sys.path` directly.
+`notes/deviations.md` 1.14 for why `termcolor` specifically is NOT listed). `wandb` and
+`huggingface_hub` are optional, lazily-imported dependencies of `train_codec.py`'s
+`--wandb-project`/`--hf-backup-repo` flags only; `torchcodec` is needed only for `--index-path`
+(real streamed data) — see `requirements.txt`'s own comments for version-pinning details and a
+known Windows/FFmpeg issue with it. There is no packaging configuration — the scripts add `src/`
+to `sys.path` directly.
 
 ```
 pip install -r requirements.txt
@@ -239,6 +255,21 @@ pointed to via an environment variable — matching mira's own convention exactl
 ```
 RS_DINO_WEIGHTS_DIR=/path/to/dir/containing/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth python scripts/verify_dino.py
 ```
+
+**Real training** additionally needs a CUDA GPU and real data:
+
+```
+python scripts/download_shards.py --shards 50   # prints the local index path to pass below
+python scripts/train_codec.py --config configs/scaled_300m.yaml \
+  --index-path <path printed above> --require-pretrained-dino \
+  --height 288 --width 512 --frames 40 --batch-size 4 --grad-accum-steps 8 \
+  --activation-checkpointing --steps 1600
+```
+
+`train_codec.py --help` lists the full set of flags (LR schedule, `--loss-mae-weight`, chunked
+LPIPS/DINO scoring, checkpoint/resume, wandb). Without `--index-path`, it trains on one fixed
+synthetic video instead — no GPU or real data required, useful as a fast local mechanism check
+(same role as `scripts/verify_codec_training.py`, just via the real training script's own path).
 
 ## Configs
 
@@ -290,12 +321,24 @@ the original source under its Apache License 2.0 terms.
 
 ## Status
 
-Architecture-correctness work in progress. Completed so far: shared block/RoPE infrastructure
+Architecture-correctness work is complete for the codec: shared block/RoPE infrastructure
 decoupled from the decoder and world model, RoPE wired into both, AdaLN conditioning on `tau`,
 clean-past conditioning (with a learned `bos` for the first frame of a clip), action
 conditioning (with a learned `initial_action_token` playing the same role for the first frame's
 missing action), and the real, frozen DINOv3 backbone (loaded with real pretrained weights,
 wired into `MyPipeline` behind the opt-in `use_real_dino` flag so existing fast tests stay
 unaffected). The forward pass now conditions on every signal mira's real architecture conditions
-on. Remaining gaps are the ones listed in Scope above: no autoregressive rollout, no streaming
-inference, and no training.
+on.
+
+The codec is now in real training on a rented GPU, on real Rocket League data — see the Training
+bullet under [Scope](#scope) for what that covers. Getting there surfaced gaps that shape/behavior
+checks alone couldn't: QK-norm and weight initialization were both missing entirely until real
+training exposed why they matter (unbounded attention logits and a bad initial loss landscape,
+respectively, neither visible without an actual optimizer loop), and the encoder was silently
+feeding the bottleneck only its last DINO layer rather than mira's real multi-layer aggregation —
+a genuine information bottleneck, not just a training-stability issue. All are fixed and verified
+against mira's real source, not assumed. `notes/deviations.md` has the full, evidence-based audit
+trail for these and every other intentional or since-corrected difference from real mira.
+
+Remaining gaps are the ones listed in Scope above: no autoregressive rollout, no streaming
+inference, and no world-model training.
