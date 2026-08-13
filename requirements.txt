@@ -24,6 +24,11 @@ pillow>=10.0
 # guess. imageio-ffmpeg is imageio's actual video-decoding backend, not optional.
 imageio>=2.30
 imageio-ffmpeg>=0.6
+# Used directly by scripts/reconstruct.py (building comparison-grid arrays) and
+# scripts/verify_dataloader.py (a synthetic placeholder frame) -- already an implicit transitive
+# dependency of torch/imageio either way, but listed directly since real code imports it by name.
+# 2.2.6 is the version verified against here.
+numpy>=1.24
 # Used directly by mini_mira.codec.loss for the LPIPS perceptual loss term, preferring
 # torchmetrics/torchvision metrics over reimplementing from scratch.
 # 1.9.0 is the version already installed and verified against here.
