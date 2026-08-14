@@ -64,22 +64,29 @@ def _select_target_features(
 
 
 def calculate_adaptive_weight(
-    anchor_loss: Tensor, other_loss: Tensor, last_layer: Tensor, max_weight: float = 1e4
+    anchor_loss: Tensor, other_loss: Tensor, last_layer: Tensor, max_weight: float = 1e4,
+    probe_scale: float | None = None,
 ) -> Tensor:
     """VQ-GAN-style adaptive weight (Esser et al., arXiv:2012.09841 S3.3), ported from mira's
     calculate_adaptive_weight. Rescales other_loss so its gradient at `last_layer` matches
     anchor_loss's gradient there in size, so it neither dominates nor gets drowned out. Detached:
     scales the loss but carries no gradient of its own.
+
+    probe_scale: pass the training loop's actual GradScaler.get_scale() here under FP16 -- these
+    probes happen before GradScaler sees loss_total, so their own small last-layer gradients can
+    underflow without it; the common factor cancels in the norm ratio either way, so this doesn't
+    need to be exact, just present. GradScaler's scale drifts up/down during real training, so a
+    hardcoded constant (this used to just assume 65536, its default init_scale) silently drifts
+    out of sync with what the scaler is actually doing. Left as None (no scaler bound to pass a
+    real value), falls back to the same fp16-autocast-detection heuristic as before -- still a
+    real, if less precise, safety net for any caller that isn't threading a live scaler through.
     """
-    # These probes happen before the training loop's GradScaler sees loss_total. Scale both
-    # equally under FP16 autocast to prevent their small last-layer gradients from underflowing;
-    # the common factor cancels in the norm ratio.
-    probe_scale = (
-        65536.0
-        if torch.is_autocast_enabled("cuda")
-        and torch.get_autocast_dtype("cuda") == torch.float16
-        else 1.0
-    )
+    if probe_scale is None:
+        probe_scale = (
+            65536.0
+            if torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
+            else 1.0
+        )
     anchor_grads = torch.autograd.grad(anchor_loss * probe_scale, last_layer, retain_graph=True)[0]
     other_grads = torch.autograd.grad(other_loss * probe_scale, last_layer, retain_graph=True)[0]
     return (anchor_grads.norm() / (other_grads.norm() + 1e-6)).clamp(0.0, max_weight).detach()
@@ -153,6 +160,7 @@ class CodecLoss(nn.Module):
         self.dino: DinoModel | None = None  # bound post-init, see bind_encoder_dino
         self.perceptual_dino: DinoModel | None = None  # optional, see bind_perceptual_dino
         self._last_layer: Tensor | None = None  # bound post-init, see bind_last_layer
+        self._grad_scaler: torch.amp.GradScaler | None = None  # optional, see bind_grad_scaler
 
         # Per-term real gradient norms, populated during backward() -- see _hook_clone. Read
         # after backward(), not before: empty until then. Matches mira's own backward_metrics.
@@ -189,6 +197,12 @@ class CodecLoss(nn.Module):
     def bind_last_layer(self, param: Tensor) -> None:
         """Share the decoder's last-layer weight, needed only when weights.auto_weight is True."""
         self._last_layer = param
+
+    def bind_grad_scaler(self, grad_scaler: torch.amp.GradScaler) -> None:
+        """Optional: share the training loop's real GradScaler, so calculate_adaptive_weight's
+        underflow-guard probe_scale tracks its actual current scale instead of guessing at one.
+        Not bound by default: forward() falls back to a heuristic guess when this isn't set."""
+        self._grad_scaler = grad_scaler
 
     def forward(self, outputs: CodecOutputs) -> dict[str, Tensor]:
         self.backward_metrics.clear()
@@ -263,8 +277,10 @@ class CodecLoss(nn.Module):
             for name in ("loss_lpips_perceptual", "loss_dino_latent_consistency"):
                 if name not in loss or not loss[name].requires_grad:
                     continue
+                probe_scale = self._grad_scaler.get_scale() if self._grad_scaler is not None else None
                 factor = calculate_adaptive_weight(
-                    loss["loss_mae"], loss[name], self._last_layer, self.weights.max_auto_weight
+                    loss["loss_mae"], loss[name], self._last_layer, self.weights.max_auto_weight,
+                    probe_scale,
                 )
                 loss[name] = factor * loss[name]
                 loss[f"{name}_auto_w"] = factor  # logged, not summed (not a real dict key below)
