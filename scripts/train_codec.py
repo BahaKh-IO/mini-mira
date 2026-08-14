@@ -196,7 +196,7 @@ def main() -> None:
 
     start_step = 0
     if args.resume and ckpt_path.exists():
-        start_step = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler)
+        start_step = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
         # Two real bugs, verified directly, not just reasoned about:
         # 1. load_state_dict only updates the scheduler's own bookkeeping -- it never pushes a
         #    recomputed lr into optimizer.param_groups. Every --resume was silently leaving lr at
@@ -258,7 +258,7 @@ def main() -> None:
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
-            save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler)
+            save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
             if args.hf_backup_repo:
                 from huggingface_hub import HfApi  # optional dep, only used here
 
