@@ -171,7 +171,14 @@ def main() -> None:
         loss_fn.bind_perceptual_dino(perceptual_dino)
     loss_fn.bind_last_layer(decoder.last_layer_weight)
 
-    for module in (dino, bottleneck, decoder, loss_fn):
+    # dino isn't included here: DinoModel.dino_forward already wraps its whole body in its own
+    # bf16 autocast (dino.py), so every conv inside it is already covered -- same reason
+    # perceptual_dino (also a DinoModel, bound above when --perceptual-dino-model is set) was
+    # never in this list either. bottleneck/decoder/loss_fn have no autocast of their own, so
+    # they still need the monkey-patch. Two mechanisms covering the same convs was harmless
+    # (nested same-dtype autocasts don't conflict) but redundant enough to be worth removing
+    # rather than leaving as a trap for whoever touches this next.
+    for module in (bottleneck, decoder, loss_fn):
         _keep_convolutions_in_bf16(module)
 
     params = list(bottleneck.parameters()) + list(decoder.parameters())
