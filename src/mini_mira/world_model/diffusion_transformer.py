@@ -4,6 +4,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from mini_mira.ml.blocks import AdaSTBlock
+from mini_mira.ml.init import init_weights
 from mini_mira.ml.rope import spatial_rope, temporal_rope
 from mini_mira.world_model.timestep_encoder import DiffusionTimeEmbedding
 
@@ -44,6 +45,8 @@ class DiffusionTransformer(nn.Module):
         self.diffusion_time_embedding = DiffusionTimeEmbedding(dim=config.hidden_dim)
         self.norm_out = nn.LayerNorm(config.hidden_dim, eps=config.eps)
         self.out_proj = nn.Linear(config.hidden_dim, config.latent_dim)
+
+        self.apply(init_weights)
 
     def forward(self, z_t, a=None, tau=None, clean_past=None):
         b, t, c, h, w = z_t.shape

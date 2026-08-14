@@ -4,10 +4,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
+from mini_mira.ml.blocks import AdaptiveLayerNorm
 from mini_mira.pipeline import PipelineConfig, MyPipeline
 from mini_mira.world_model.diffusion_transformer import LatentWorldModelConfig, DiffusionTransformer
 
 torch.manual_seed(0)
+
+
+def _unzero_adaln_gates(model: torch.nn.Module) -> None:
+    """mira-matching init (mini_mira.ml.init) zeroes every AdaptiveLayerNorm's conditioning
+    projection (gamma_beta) -- a real, deliberate DiT-style technique so training starts
+    near-identity and *learns* to use conditioning gradually, not a bug. But it means a freshly
+    constructed, untrained model is genuinely blind to tau/actions at this exact point (they're
+    the two signals routed through AdaLN; clean_past goes through its own separate, non-zeroed
+    past_proj instead). The checks below need that gate un-zeroed to observe the wiring at all,
+    independent of whether real training has happened yet."""
+    for module in model.modules():
+        if isinstance(module, AdaptiveLayerNorm):
+            torch.nn.init.normal_(module.gamma_beta.weight, std=0.02)
+
 
 with torch.no_grad():
     # --- tau sensitivity ---
@@ -17,6 +32,7 @@ with torch.no_grad():
     wm_config = LatentWorldModelConfig()
     world_model = DiffusionTransformer(wm_config)
     world_model.eval()
+    _unzero_adaln_gates(world_model)
 
     z = torch.randn(1, 6, 32, 4, 4)
     clean_past = torch.randn(1, 6, 32, 4, 4)  # fixed, shared -- this section isn't testing it
@@ -70,6 +86,7 @@ with torch.no_grad():
     actions_config = PipelineConfig()
     pipeline_actions = MyPipeline(actions_config)
     pipeline_actions.eval()
+    _unzero_adaln_gates(pipeline_actions.world_model)
 
     same_video = torch.randn(1, 4, actions_config.bottleneck.dino_dim, 4, 4)
     keys_all_zero = torch.zeros(1, 2, 9, dtype=torch.long)  # no keys pressed, ever
