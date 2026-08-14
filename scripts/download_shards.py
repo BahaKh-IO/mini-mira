@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 # Real mira, cloned as a sibling repo next to mini_mira -- reused directly for this one step.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "mira" / "src"))
 
+from huggingface_hub import snapshot_download  # noqa: E402
 from mira.data.dataset import RocketScienceDataset  # noqa: E402
 
 
@@ -40,16 +41,40 @@ def main() -> None:
           f"(~{args.shards * 2.65:.1f}GB total) ...")
     dataset = RocketScienceDataset.from_hub(args.repo_id, split=args.split, shards=args.shards)
 
-    # from_hub restricts dataset.index to only the downloaded shards, but only in memory -- the
-    # index.json FILE it leaves on disk is still the full, unfiltered index for the entire split
-    # (~2,821 shards for kyutai/rocket-science's train split). Confirmed directly: a later
-    # create_loader() reading this same directory has no way to know only args.shards shards are
-    # actually present, and eventually reaches for one that was never downloaded -> crash. Overwrite
-    # the file with the already-correctly-restricted in-memory index so every later read of this
-    # directory only ever sees shards that actually exist here.
-    dataset.index_path.write_text(dataset.index.model_dump_json())
+    # from_hub restricts dataset.index to only the shards THIS call requested, but only in memory
+    # -- the index.json FILE it leaves on disk is still whatever was fetched, not necessarily
+    # everything actually downloaded here. Left unfixed, a later create_loader() reading this
+    # directory has no way to know which shards are actually present, and can reach for one
+    # that isn't -> crash. The earlier fix for that (blindly overwriting index.json with just
+    # this call's restricted set) had a real bug: a smaller --shards N on a later run would
+    # silently shrink an already-larger local dataset instead of growing it -- confirmed
+    # directly, not hypothetical (see notes/deviations.md). --shards N means "make sure at
+    # least N are downloaded", not "make it exactly N".
+    #
+    # The .tar shard files themselves are never deleted by any of this -- only ever added --
+    # so ground truth is: every match whose shard file actually exists in this directory,
+    # regardless of which run downloaded it. force_download=True re-fetches index.json fresh
+    # from the hub rather than trusting whatever's cached locally, since an earlier run's manual
+    # overwrite here can leave that local cache in a state snapshot_download doesn't expect.
+    index_dir = snapshot_download(
+        args.repo_id, repo_type="dataset", allow_patterns=[f"{args.split}/index.json"], force_download=True,
+    )
+    full_index = RocketScienceDataset(Path(index_dir) / args.split / "index.json")
+    present_shards = {e.shard for e in full_index.index.entries if (dataset.root / e.shard).exists()}
+    full_index.index.entries = [e for e in full_index.index.entries if e.shard in present_shards]
+    full_index.matches = {mid: e for mid, e in full_index.matches.items() if e.shard in present_shards}
 
-    print(f"Done. {len(dataset.match_ids())} match(es) available across {args.shards} shard(s).")
+    # dataset.index_path is a symlink into HuggingFace's content-addressed blob cache -- writing
+    # through it, as this script always used to, overwrites the blob's bytes in place, corrupting
+    # the cache's own bookkeeping (confirmed directly, not theoretical: this is *why* repeated runs
+    # here gave inconsistent results at different times, not because the remote data was changing).
+    # Unlink the symlink first so this write lands as a plain, ordinary file that a future run
+    # can't corrupt the same way -- same fix already applied by hand once to recover this
+    # particular directory; this makes the script itself safe to rely on going forward.
+    if dataset.index_path.is_symlink():
+        dataset.index_path.unlink()
+    dataset.index_path.write_text(full_index.index.model_dump_json())
+    print(f"Done. {len(full_index.matches)} match(es) available across {len(present_shards)} shard(s).")
     print(f"Local index path (pass this to train_codec.py's --index-path): {dataset.root}")
 
 
