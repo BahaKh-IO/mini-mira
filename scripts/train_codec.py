@@ -177,6 +177,7 @@ def main() -> None:
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     grad_scaler = torch.amp.GradScaler("cuda")
+    loss_fn.bind_grad_scaler(grad_scaler)
 
     # mira's own schedule shape: warmup ~5% of args.steps, then cosine decay for the rest, no
     # constant plateau -- proportional to args.steps rather than mira's literal 1000/249000
