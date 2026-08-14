@@ -197,6 +197,22 @@ def main() -> None:
     start_step = 0
     if args.resume and ckpt_path.exists():
         start_step = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler)
+        # Two real bugs, verified directly, not just reasoned about:
+        # 1. load_state_dict only updates the scheduler's own bookkeeping -- it never pushes a
+        #    recomputed lr into optimizer.param_groups. Every --resume was silently leaving lr at
+        #    whatever the freshly-constructed scheduler set at its OWN init (near-zero, deep in
+        #    warmup), not the correct value for the step actually being resumed from.
+        # 2. load_state_dict also restores the checkpoint's own warmup_steps/decay_steps/min_lr
+        #    wholesale, not just its step counter -- if --steps grew (extending a finished short
+        #    run, not resuming an interrupted one), that stale shape thinks decay already
+        #    finished, pinning lr at min_lr for the entire extension.
+        # Re-apply this run's own shape, then recompute+apply the real lr for the resumed step --
+        # a no-op for #2 when --steps didn't change, but always fixes #1 either way.
+        lr_scheduler.warmup_steps = warmup_steps
+        lr_scheduler.decay_steps = decay_steps
+        lr_scheduler.min_lr = min_lr
+        for group, lr in zip(optimizer.param_groups, lr_scheduler.get_lr()):
+            group["lr"] = lr
         print(f"Resumed from {ckpt_path} at step {start_step}")
 
     wandb_enabled = init_wandb(args.wandb_project, vars(args))
