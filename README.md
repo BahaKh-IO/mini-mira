@@ -97,7 +97,7 @@ convenience for fast iteration, not the intended final scale.
 | `src/mini_mira/codec/dino.py` | `DinoModel` — the real, frozen DINOv3 backbone (ViT-S/B/L/16, single- or multi-layer); loads real pretrained weights, wired into `MyPipeline` behind `PipelineConfig.use_real_dino` (see Scope). `DEFAULT_DINO_LAYERS`/`DEFAULT_ENCODER_AGGREGATION_LAYERS` — mira's real per-variant layer-selection tables for the perceptual loss and the encoder's own feature aggregation, respectively (two different selections, for two different purposes) |
 | `src/mini_mira/codec/loss.py` | `CodecLoss`, `CodecLossWeights`, `CodecOutputs` — the codec's real training loss (L1 + LPIPS + DINO latent-consistency, with `auto_weight` adaptive balancing and per-term gradient-norm instrumentation, matching mira's `CodecLoss`); `normalize_video`/`denormalize_for_dino` — the `[0,1]`↔`[-1,1]` pixel-range conversions the codec and DINO each expect |
 | `src/mini_mira/codec/video_prep.py` | `resize_to_canonical` — pads to the target aspect ratio then bilinear-resizes, matching mira's `VideoCodec.preprocess_batch`, so real clips of any native resolution land at the shape the model expects |
-| `src/mini_mira/codec/checkpoint.py` | `save_checkpoint`/`load_checkpoint` — minimal save/resume for codec training (bottleneck + decoder + optimizer + scheduler + step count in one file), not a port of mira's distributed `CheckpointManager` |
+| `src/mini_mira/codec/checkpoint.py` | `save_checkpoint`/`load_checkpoint` — minimal save/resume for codec training (bottleneck + decoder + optimizer + scheduler + `GradScaler` + step count in one file), not a port of mira's distributed `CheckpointManager` |
 | `src/mini_mira/codec/logging_utils.py` | Optional wandb logging for `train_codec.py` — `init_wandb`/`log_step`/`log_preview`; a no-op throughout if `--wandb-project` is omitted, so wandb is never a hard dependency |
 | `scripts/test_shapes.py` | Shape-correctness checks for every stage of the pipeline |
 | `scripts/verify_rope.py` | Behavioral checks for RoPE: causal masking and position sensitivity |
@@ -122,8 +122,10 @@ See [Scale](#scale) above for parameter counts at both the intended ~300M scale
   contract and space/time attention factorization.
 - Rotary position embeddings (temporal + axial 2D spatial).
 - QK-norm (`QKRMSNorm`/`QKLayerNorm`, matching mira's shipped codec config's choice of
-  `layernorm`) and mira-matching weight initialization (`src/mini_mira/ml/init.py`), both applied
-  to the decoder.
+  `layernorm`) and mira-matching weight initialization (`src/mini_mira/ml/init.py`). QK-norm
+  reaches both the decoder and the world model automatically, since both share the same
+  `SelfAttention` class; weight init is applied explicitly to the bottleneck, decoder, and
+  world model each.
 - AdaLN conditioning of the world model on the diffusion timestep `tau`, via a sinusoidal
   timestep embedding matched to the real implementation.
 - Clean-past conditioning: each denoising step additively conditions on the real, clean latent
@@ -226,8 +228,8 @@ both:
 ## Getting started
 
 Requirements: Python ≥ 3.10, plus `requirements.txt` (`torch`, `einops`, `pyyaml`, `pillow`,
-`imageio`/`imageio-ffmpeg`, `torchmetrics`, `torchvision` — each verified against the actual code
-path that uses it, not against everything installed while debugging DINOv3 loading; see
+`imageio`/`imageio-ffmpeg`, `numpy`, `torchmetrics`, `torchvision` — each verified against the
+actual code path that uses it, not against everything installed while debugging DINOv3 loading; see
 `notes/deviations.md` 1.14 for why `termcolor` specifically is NOT listed). `wandb` and
 `huggingface_hub` are optional, lazily-imported dependencies of `train_codec.py`'s
 `--wandb-project`/`--hf-backup-repo` flags only; `torchcodec` is needed only for `--index-path`
