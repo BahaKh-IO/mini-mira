@@ -1,0 +1,77 @@
+"""Lightweight autoregressive-rollout "drift" metrics for world-model training: how fast the
+rollout's DINO features and raw latents diverge from ground truth, frame by frame. Deliberately
+NOT real mira's full Frechet DINO/Inception Distance suite (needs pytorch-fid, scipy, a second
+lpips package, plotly, and a system ffmpeg binary, plus ~100+ forward passes per eval sample) --
+see notes/deviations.md entry 1.19 for the full writeup of that scope cut.
+
+RunningMean mirrors real mira's DistributedMetric contract (update(values)/compute()) minus its
+torch.distributed.all_reduce() -- mini_mira never runs distributed, so that machinery is omitted
+entirely rather than ported-then-stripped.
+"""
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+
+class RunningMean:
+    """Plain single-process running mean over however many values update() has seen so far."""
+
+    def __init__(self) -> None:
+        self._sum = torch.zeros((), dtype=torch.float64)
+        self._n = 0
+
+    def update(self, values: Tensor) -> None:
+        self._sum += values.detach().double().sum().cpu()
+        self._n += values.numel()
+
+    def compute(self) -> float:
+        if self._n == 0:
+            return 0.0
+        return (self._sum / self._n).item()
+
+
+def compute_drift_metrics(
+    model,
+    batch,
+    n_context_latents: int,
+    n_diffusion_steps: int = 4,
+    schedule_type: str = "linear",
+) -> dict[str, Tensor]:
+    """Runs model.rollout(...), decodes both the real and rolled-out latents to video, runs the
+    model's own (already-loaded) DINO on both, and returns three RAW per-element tensors (not
+    pre-reduced) -- so RunningMean.update() weights correctly across batches of different sizes,
+    matching real mira's DistributedMetric.update(values) contract:
+      dino_cos_drift = 1 - cosine_similarity(pred_dino, real_dino, over the channel dim)
+      dino_l2_drift  = mse(pred_dino, real_dino), averaged over the channel dim
+      latent_drift   = 1 - cosine_similarity(rolled-out latents, real latents, over the channel dim)
+    Only the GENERATED region (from n_context_latents onward) is scored -- the context region is
+    real ground truth on both sides by construction and would trivially read as zero drift.
+    """
+    z, z_t = model.rollout(batch, n_context_latents, n_diffusion_steps, schedule_type)
+
+    with torch.no_grad():
+        real_video = model.decode_to_video(z)
+        pred_video = model.decode_to_video(z_t)
+        real_dino = model.dino.dino_forward(real_video)
+        pred_dino = model.dino.dino_forward(pred_video)
+
+    # n_context_latents is in LATENT-frame units; decoded video/DINO features are in VIDEO-frame
+    # units, temporal_downsampling times longer (the decoder's own patch_size_t upsample, which
+    # matches bottleneck.temporal_stride by the codec's own encode/decode round-trip design) --
+    # scale the offset before slicing either.
+    n_context_frames = n_context_latents * model.temporal_downsampling
+    real_dino_gen = real_dino[:, n_context_frames:]
+    pred_dino_gen = pred_dino[:, n_context_frames:]
+
+    dino_cos_drift = 1 - F.cosine_similarity(pred_dino_gen, real_dino_gen, dim=2)
+    dino_l2_drift = F.mse_loss(pred_dino_gen, real_dino_gen, reduction="none").mean(dim=2)
+    latent_drift = 1 - F.cosine_similarity(
+        z_t[:, n_context_latents:], z[:, n_context_latents:], dim=2
+    )
+
+    return {
+        "dino_cos_drift": dino_cos_drift,
+        "dino_l2_drift": dino_l2_drift,
+        "latent_drift": latent_drift,
+    }
