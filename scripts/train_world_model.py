@@ -16,11 +16,14 @@ train_codec.py exactly -- the frozen bottleneck/decoder are bf16-conv-patched in
 LatentWorldModel's own __init__ (see notes/gpu_amp_investigation.md for why), so nothing extra is
 needed here beyond the ambient fp16 autocast.
 
-Eval: periodic validation loss (cheap, same forward as training, no backward) + lightweight
-DINO/latent "drift" metrics from an autoregressive rollout. Deliberately NOT real mira's full
-Frechet/FID/PSNR/LPIPS/SSIM/rollout-video suite -- see notes/deviations.md entry 1.19 for the full
-writeup of that scope cut and why it's flagged for a supervisor conversation, not silently
-dropped.
+Eval: periodic validation loss (cheap, same forward as training, no backward) + a merged full
+eval -- lightweight DINO/latent "drift" metrics, the full Frechet DINO/Inception Distance +
+PSNR/LPIPS/SSIM suite (mini_mira.world_model.full_eval_metrics), and a handful of rendered rollout
+videos for visual inspection (mini_mira.world_model.rollout_visualization) -- all sharing ONE
+model.rollout(...) call per eval batch rather than rolling out separately for each. This suite was
+originally scoped down to drift metrics only for compute/dependency-cost reasons
+(notes/deviations.md entry 1.19); that decision has since been reversed given eval only fires a
+handful of times across a run.
 """
 
 import argparse
@@ -42,7 +45,9 @@ from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
 from mini_mira.world_model.checkpoint import load_checkpoint, save_checkpoint
 from mini_mira.world_model.eval_metrics import RunningMean, compute_drift_metrics
+from mini_mira.world_model.full_eval_metrics import FullEvalMetrics, compute_full_eval_metrics
 from mini_mira.world_model.latent_world_model import LatentWorldModel
+from mini_mira.world_model.rollout_visualization import log_rollout_videos, render_rollout_sample
 
 
 def _autocast() -> torch.autocast:
@@ -90,6 +95,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drift-eval-context-latents", type=int, default=6)
     parser.add_argument("--drift-eval-diffusion-steps", type=int, default=4)
     parser.add_argument("--drift-eval-schedule", default="linear", choices=["linear", "linear_quadratic"])
+    parser.add_argument(
+        "--fdd-slice-frames", type=int, default=7,
+        help="Frechet-distance slice window, in GENERATED video frames -- must evenly divide "
+        "(--frames - drift_eval_context_latents*temporal_stride). Default 7 gives 4 slices at "
+        "this script's own defaults (28 generated video frames). Real mira's own default is 20 "
+        "(6 slices over 120 unrolled frames) -- scaled down proportionally.",
+    )
+    parser.add_argument(
+        "--viz-n-samples", type=int, default=2,
+        help="Rollout videos rendered for visual inspection per full eval run -- fixed and small, "
+        "logged as separate wandb.Video entries, not a gridded batch.",
+    )
 
     parser.add_argument("--checkpoint-dir", default="checkpoints_wm")
     parser.add_argument("--checkpoint-every", type=int, default=None, help="Default: steps // 10")
@@ -138,28 +155,64 @@ def run_validation(
     model.train()
 
 
-def run_drift_eval(
+def run_full_eval(
     model: LatentWorldModel, loader, step: int, wandb_enabled: bool, n_samples: int, batch_size: int,
     context_latents: int, diffusion_steps: int, schedule_type: str, height: int, width: int, lr: float,
+    full_eval_metrics: FullEvalMetrics, viz_n_samples: int, target_fps: int, checkpoint_dir: Path,
 ) -> None:
-    """Lightweight autoregressive-rollout drift metrics -- see mini_mira.world_model.eval_metrics
-    and notes/deviations.md 1.19 for what this deliberately is NOT (real mira's full Frechet/FID/
-    PSNR/LPIPS/SSIM/rollout-video suite)."""
+    """Merged eval: lightweight drift metrics + the full Frechet/PSNR/LPIPS/SSIM suite + a handful
+    of rendered rollout videos -- all sharing ONE model.rollout(...) call per eval batch rather
+    than rolling out separately for each (the autoregressive rollout is the expensive part)."""
     model.eval()
     n_batches = max(1, n_samples // batch_size)
-    metrics_iter = iter(loader)
-    trackers = {"dino_cos_drift": RunningMean(), "dino_l2_drift": RunningMean(), "latent_drift": RunningMean()}
+    eval_iter = iter(loader)
+    drift_trackers = {"dino_cos_drift": RunningMean(), "dino_l2_drift": RunningMean(), "latent_drift": RunningMean()}
+    viz_samples: list[torch.Tensor] = []
+    viz_key_presses: list[torch.Tensor] = []
+
     with torch.no_grad():
         for _ in range(n_batches):
-            batch, _metadata = next(metrics_iter)
+            batch, _metadata = next(eval_iter)
             batch = resize_batch(batch, height, width).to("cuda")
             with _autocast():
-                drift = compute_drift_metrics(model, batch, context_latents, diffusion_steps, schedule_type)
-            for name, tracker in trackers.items():
+                z, z_t = model.rollout(batch, context_latents, diffusion_steps, schedule_type)
+                drift = compute_drift_metrics(model, z, z_t, context_latents)
+                compute_full_eval_metrics(model, z, z_t, context_latents, full_eval_metrics)
+
+                # Render a few samples for visual inspection, drawn from whichever batches come
+                # first -- decodes z_t a second time (already decoded once inside
+                # compute_full_eval_metrics above) rather than threading decoded video through
+                # both call sites; a small, bounded extra cost since this only fires until
+                # viz_n_samples is reached, not every batch.
+                if len(viz_samples) < viz_n_samples:
+                    pred_video = model.decode_to_video(z_t)
+                    for i in range(min(viz_n_samples - len(viz_samples), pred_video.shape[0])):
+                        viz_samples.append(pred_video[i])
+                        viz_key_presses.append(batch.actions.key_presses[i])
+
+            for name, tracker in drift_trackers.items():
                 tracker.update(drift[name])
-    metrics = {f"drift_{name}": tracker.compute() for name, tracker in trackers.items()}
-    print(f"Drift eval at step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+
+    metrics = {f"drift_{name}": tracker.compute() for name, tracker in drift_trackers.items()}
+    full_scalars, full_curves = full_eval_metrics.compute_and_reset()
+    metrics.update(full_scalars)
+    for curve_name, values in full_curves.items():
+        for i, value in enumerate(values):
+            metrics[f"{curve_name}_at_{(i + 1) * full_eval_metrics.fdd_slice_frames}"] = value
+
+    print(f"Full eval at step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
     log_step(wandb_enabled, step, metrics, lr)
+
+    # key_presses is already 1:1 aligned with pred_video's raw frame count -- action_fps always
+    # equals video fps in this project (see LatentWorldModel._encode), and the raw (unsliced)
+    # key_presses tensor covers the whole clip, context and generated region alike.
+    n_context_frames = context_latents * model.temporal_downsampling
+    rendered = [
+        render_rollout_sample(pred_video, key_presses, n_context_frames)
+        for pred_video, key_presses in zip(viz_samples, viz_key_presses)
+    ]
+    log_rollout_videos(rendered, target_fps, step, wandb_enabled, checkpoint_dir)
+
     model.train()
 
 
@@ -181,6 +234,13 @@ def main() -> None:
         f"--drift-eval-context-latents ({args.drift_eval_context_latents}) must leave at least one "
         f"latent frame to generate (of {n_latent_frames} total at --frames {args.frames})"
     )
+    n_context_frames = args.drift_eval_context_latents * temporal_stride
+    generated_video_frames = args.frames - n_context_frames
+    assert generated_video_frames % args.fdd_slice_frames == 0, (
+        f"generated region ({generated_video_frames} video frames) must be a multiple of "
+        f"--fdd-slice-frames ({args.fdd_slice_frames})"
+    )
+    fdd_num_slices = generated_video_frames // args.fdd_slice_frames
 
     torch.manual_seed(0)
     latent_stats = json.loads(Path(args.latent_stats).read_text())
@@ -249,6 +309,11 @@ def main() -> None:
     wandb_run_id = get_wandb_run_id(wandb_enabled)
     torch.cuda.reset_peak_memory_stats()
 
+    # Built lazily on the first full eval: constructing it loads InceptionV3 + LPIPS's AlexNet
+    # backbone. If steps is small enough that eval never fires, that cost is never paid at all --
+    # matches real mira's own WorldModelMetrics lazy-construction pattern.
+    full_eval_metrics: FullEvalMetrics | None = None
+
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
         accumulated: dict[str, float] = {}
@@ -295,10 +360,16 @@ def main() -> None:
             )
 
         if (step + 1) % drift_eval_every == 0 or is_last:
-            run_drift_eval(
+            if full_eval_metrics is None:
+                full_eval_metrics = FullEvalMetrics(
+                    dino_dim=model.dino.dino_dim, fdd_slice_frames=args.fdd_slice_frames,
+                    num_slices=fdd_num_slices, device="cuda",
+                )
+            run_full_eval(
                 model, test_loader, step, wandb_enabled, args.drift_eval_n_samples, eval_batch_size,
                 args.drift_eval_context_latents, args.drift_eval_diffusion_steps, args.drift_eval_schedule,
-                args.height, args.width, current_lr,
+                args.height, args.width, current_lr, full_eval_metrics, args.viz_n_samples, args.target_fps,
+                checkpoint_dir,
             )
 
 
