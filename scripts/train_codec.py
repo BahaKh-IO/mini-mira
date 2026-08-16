@@ -43,8 +43,9 @@ from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
 
 
-def _autocast() -> torch.autocast:
-    return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+def _autocast(precision: str) -> torch.autocast:
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
 
 
 _CONVOLUTION_TYPES = (
@@ -108,6 +109,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview-every", type=int, default=100, help="W&B image/video preview interval")
     parser.add_argument("--console-log-every", type=int, default=10, help="Loss/GPU-memory print interval")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--reset-lr-schedule", action="store_true",
+        help="With --resume, restart the LR scheduler's own step clock at 0 instead of continuing "
+        "from the checkpoint's step count -- use when --resume starts a new fine-tune phase "
+        "(different --lr/--lr-min/--steps) rather than continuing an interrupted run.",
+    )
+    parser.add_argument(
+        "--wandb-new-run", action="store_true",
+        help="With --resume, start a fresh W&B run instead of continuing the checkpoint's saved one.",
+    )
+    parser.add_argument(
+        "--precision", choices=["fp16-hybrid", "bf16"], default="fp16-hybrid",
+        help="fp16-hybrid (default, unchanged): float16 autocast + GradScaler, convolutions "
+        "force-patched to bf16 -- the proven V100 setup (notes/gpu_amp_investigation.md). bf16: "
+        "plain bfloat16 autocast everywhere, GradScaler disabled (a documented no-op), no conv "
+        "patch needed. Opt-in only -- test against fp16-hybrid before switching a run over.",
+    )
     parser.add_argument("--hf-backup-repo", default=None, help="Optional HF Hub repo to back up checkpoints to")
     parser.add_argument("--wandb-project", default=None)
     return parser.parse_args()
@@ -178,12 +196,18 @@ def main() -> None:
     # they still need the monkey-patch. Two mechanisms covering the same convs was harmless
     # (nested same-dtype autocasts don't conflict) but redundant enough to be worth removing
     # rather than leaving as a trap for whoever touches this next.
-    for module in (bottleneck, decoder, loss_fn):
-        _keep_convolutions_in_bf16(module)
+    # Only needed under fp16-hybrid: with --precision bf16 the ambient autocast is already
+    # bfloat16, so forcing a nested bf16 override here would be a no-op, not a fix.
+    if args.precision == "fp16-hybrid":
+        for module in (bottleneck, decoder, loss_fn):
+            _keep_convolutions_in_bf16(module)
 
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
-    grad_scaler = torch.amp.GradScaler("cuda")
+    # GradScaler(enabled=False) is a documented no-op: .scale() returns the loss unchanged,
+    # .step() just calls optimizer.step(), .update() no-ops -- so the training loop below needs
+    # no branching to support both precisions. bf16 doesn't need loss scaling at all.
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16-hybrid"))
     loss_fn.bind_grad_scaler(grad_scaler)
 
     # mira's own schedule shape: warmup ~5% of args.steps, then cosine decay for the rest, no
@@ -206,6 +230,8 @@ def main() -> None:
     wandb_run_id = None
     if args.resume and ckpt_path.exists():
         start_step, wandb_run_id = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
+        if args.wandb_new_run:
+            wandb_run_id = None
         # Two real bugs, verified directly, not just reasoned about:
         # 1. load_state_dict only updates the scheduler's own bookkeeping -- it never pushes a
         #    recomputed lr into optimizer.param_groups. Every --resume was silently leaving lr at
@@ -217,6 +243,16 @@ def main() -> None:
         #    finished, pinning lr at min_lr for the entire extension.
         # Re-apply this run's own shape, then recompute+apply the real lr for the resumed step --
         # a no-op for #2 when --steps didn't change, but always fixes #1 either way.
+        if args.reset_lr_schedule:
+            # --resume's load_state_dict above restored last_epoch to the checkpoint's own step
+            # (e.g. ~3100). Even after warmup_steps/decay_steps/min_lr are re-applied below,
+            # get_lr() evaluates them against THIS stale clock -- for a schedule sized for a short
+            # new phase, that lands past the end, pinned at min_lr, not a fresh curve. Use 0, not
+            # -1: get_lr() is called directly below (not via .step()), and -1 would produce a
+            # negative warmup-phase lr (base_lr * -1 / warmup_steps). Only the schedule's own
+            # timing reference resets -- start_step (outer loop / checkpoint bookkeeping) and the
+            # loaded weights/optimizer momentum are untouched.
+            lr_scheduler.last_epoch = 0
         lr_scheduler.warmup_steps = warmup_steps
         lr_scheduler.decay_steps = decay_steps
         lr_scheduler.min_lr = min_lr
@@ -224,9 +260,17 @@ def main() -> None:
             group["lr"] = lr
         print(f"Resumed from {ckpt_path} at step {start_step}")
 
-    # wandb_run_id: None on a fresh run (wandb.init mints a new one, captured below) or the id
-    # loaded from the checkpoint above -- passing it back in continues that SAME wandb run
-    # instead of --resume silently fragmenting the loss/lr history into a new, disconnected one.
+    if args.steps <= start_step:
+        raise SystemExit(
+            f"--steps ({args.steps}) must be greater than the resumed step ({start_step}) -- "
+            f"otherwise range(start_step, args.steps) runs zero iterations and the script exits "
+            f"looking successful having trained nothing. Did you mean --steps {start_step + 200}?"
+        )
+
+    # wandb_run_id: None on a fresh run (wandb.init mints a new one, captured below), the id
+    # loaded from the checkpoint above (continues that SAME wandb run instead of --resume
+    # silently fragmenting the loss/lr history into a new, disconnected one), or forced back to
+    # None by --wandb-new-run above when a fresh chart is wanted despite resuming training state.
     wandb_enabled = init_wandb(args.wandb_project, vars(args), run_id=wandb_run_id)
     wandb_run_id = get_wandb_run_id(wandb_enabled)
     torch.cuda.reset_peak_memory_stats()
@@ -236,7 +280,7 @@ def main() -> None:
         accumulated: dict[str, float] = {}
         for _ in range(args.grad_accum_steps):
             video = next_video().cuda()
-            with _autocast():
+            with _autocast(args.precision):
                 with torch.no_grad():  # encoder side: no grad needed here
                     dino_features = dino.dino_forward(video)
                 z = bottleneck(dino_features)
