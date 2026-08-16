@@ -126,4 +126,40 @@ with torch.no_grad():
     assert pipeline_diff > 0.0, "pipeline still ignores its input -- clean_past isn't reaching the decoded output"
     print(f"[PASS] end-to-end: same noise seed, different input videos -> output diff={pipeline_diff:.6f}")
 
+    # --- PSD: tau_delta sensitivity, only when PSD is enabled ---
+    # A psd_weight>0 config must build the extra delta time-embedding and actually use it: two
+    # different tau_delta values (same everything else) must produce different velocities.
+    psd_config = LatentWorldModelConfig(psd_weight=0.1)
+    psd_world_model = DiffusionTransformer(psd_config)
+    psd_world_model.eval()
+    _unzero_adaln_gates(psd_world_model)
+    assert psd_world_model.diffusion_time_embedding_delta is not None, (
+        "psd_weight>0 must build the delta time embedding"
+    )
+
+    tau_delta_a = torch.zeros(1, 6, 1, 1, 1)
+    tau_delta_b = torch.ones(1, 6, 1, 1, 1)
+    out_delta_a = psd_world_model(z, a=a, tau=tau, tau_delta=tau_delta_a, clean_past=clean_past_a)
+    out_delta_b = psd_world_model(z, a=a, tau=tau, tau_delta=tau_delta_b, clean_past=clean_past_a)
+    delta_diff = (out_delta_a - out_delta_b).abs().max().item()
+    assert delta_diff > 0.0, "tau_delta-blind: two different tau_delta values produced the same velocity"
+    print(f"[PASS] tau_delta sensitivity: max abs diff={delta_diff:.6f}")
+
+    # --- Backward compatibility: PSD-disabled (the default) models must ignore tau_delta entirely ---
+    # This is the flip side of the check above -- proving the new parameter is genuinely additive,
+    # not just "usually a no-op": a default-config model must build no delta embedding at all, and
+    # passing a nonzero tau_delta into it must change nothing, since there's nowhere for it to go.
+    base_config = LatentWorldModelConfig()  # psd_loss_prob=0.0, psd_weight=0.0 -- unchanged default
+    base_world_model = DiffusionTransformer(base_config)
+    assert base_world_model.diffusion_time_embedding_delta is None, (
+        "PSD disabled by default -- must build no delta embedding"
+    )
+    base_world_model.eval()
+    _unzero_adaln_gates(base_world_model)
+    out_no_delta = base_world_model(z, a=a, tau=tau, clean_past=clean_past_a)
+    out_with_ignored_delta = base_world_model(z, a=a, tau=tau, tau_delta=tau_delta_b, clean_past=clean_past_a)
+    no_delta_diff = (out_no_delta - out_with_ignored_delta).abs().max().item()
+    assert no_delta_diff == 0.0, "PSD-disabled model must ignore tau_delta entirely (backward compatibility)"
+    print(f"[PASS] tau_delta ignored when PSD is disabled (backward-compatible default): diff={no_delta_diff}")
+
 print("\nAll conditioning checks passed.")

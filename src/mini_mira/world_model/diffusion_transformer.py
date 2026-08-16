@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 from einops import rearrange
 
@@ -20,6 +21,17 @@ class LatentWorldModelConfig:
     layerscale_init: float = 1e-4
     rope_theta_spatial: float = 100.0
     rope_theta_temporal: float = 64.0
+    # PSD self-distillation (mira's real world_model/config.py fields, same names/defaults --
+    # both off by default, matching mira's own shipped single-player config). See
+    # LatentWorldModel._compute_psdm_loss (mini_mira.world_model.latent_world_model) for the loss
+    # that actually uses these; DiffusionTransformer only needs to know whether to build the extra
+    # tau_delta embedding below.
+    psd_loss_prob: float = 0.0
+    psd_weight: float = 0.0
+
+    @property
+    def psd_enabled(self) -> bool:
+        return self.psd_loss_prob > 0 or self.psd_weight > 0
 
 
 class DiffusionTransformer(nn.Module):
@@ -43,12 +55,20 @@ class DiffusionTransformer(nn.Module):
             ]
         )
         self.diffusion_time_embedding = DiffusionTimeEmbedding(dim=config.hidden_dim)
+        # Second time embedding for PSD self-distillation's integration-step size (tau_delta),
+        # matching real mira's diffusion_transformer.py exactly: only built when PSD is actually
+        # enabled, so a default-config model has no extra parameters and no tau_delta pathway at
+        # all -- forward() below is fully backward-compatible when this stays None (see
+        # verify_conditioning.py's tau_delta backward-compatibility check).
+        self.diffusion_time_embedding_delta = None
+        if config.psd_enabled:
+            self.diffusion_time_embedding_delta = DiffusionTimeEmbedding(dim=config.hidden_dim)
         self.norm_out = nn.LayerNorm(config.hidden_dim, eps=config.eps)
         self.out_proj = nn.Linear(config.hidden_dim, config.latent_dim)
 
         self.apply(init_weights)
 
-    def forward(self, z_t, a=None, tau=None, clean_past=None):
+    def forward(self, z_t, a=None, tau=None, tau_delta=None, clean_past=None):
         b, t, c, h, w = z_t.shape
         x = rearrange(z_t, "b t c h w -> b t h w c")
         x = self.in_proj(x)
@@ -62,6 +82,13 @@ class DiffusionTransformer(nn.Module):
         rope_temporal = temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)
 
         tau_emb = self.diffusion_time_embedding(tau)  # (b, t, 1, 1, hidden_dim)
+        if self.diffusion_time_embedding_delta is not None:
+            # PSD-trained models take the integration-step size as input; None means "no delta"
+            # (a diagonal-loss forward pass through a PSD-enabled model), matching mira's own
+            # convention in latent_world_model.py's non-PSD call sites.
+            if tau_delta is None:
+                tau_delta = torch.zeros_like(tau)
+            tau_emb = tau_emb + self.diffusion_time_embedding_delta(tau_delta)
         a_broadcast = rearrange(a, "b t c -> b t 1 1 c").repeat(1, 1, h, w, 1)  # (b, t, h, w, hidden_dim)
         cond = a_broadcast + tau_emb.repeat(1, 1, h, w, 1)  # (b, t, h, w, hidden_dim)
 
