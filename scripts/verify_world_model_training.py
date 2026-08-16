@@ -161,7 +161,10 @@ with torch.no_grad():
     loss_before = model(batch)["loss_total"].item()
 
 tmp_path = Path(tempfile.mkdtemp()) / "wm_checkpoint_test.pth"
-save_checkpoint(tmp_path, STEPS - 1, model.world_model, model.action_encoder, model.bos, optimizer, lr_scheduler)
+save_checkpoint(
+    tmp_path, STEPS - 1, model.world_model, model.action_encoder, model.bos, optimizer, lr_scheduler,
+    wandb_run_id="fake-run-id-for-test",
+)
 
 # Mutate: replace the trainable components with fresh random-init ones on the SAME model instance
 # (same frozen dino/bottleneck/decoder throughout) -- isolates this check to exactly what the
@@ -177,14 +180,20 @@ optimizer2 = torch.optim.Adam(_trainable_params(model), lr=2e-3)
 lr_scheduler2 = WarmupConstantCosineDecayLR(
     optimizer2, warmup_steps=10, constant_steps=0, decay_steps=290, min_lr=2e-4
 )
-resume_step = load_checkpoint(tmp_path, model.world_model, model.action_encoder, model.bos, optimizer2, lr_scheduler2)
+resume_step, resume_wandb_run_id = load_checkpoint(
+    tmp_path, model.world_model, model.action_encoder, model.bos, optimizer2, lr_scheduler2
+)
 assert resume_step == STEPS, f"expected resume step {STEPS}, got {resume_step}"
+assert resume_wandb_run_id == "fake-run-id-for-test", f"wandb_run_id did not round-trip: {resume_wandb_run_id!r}"
 
 torch.manual_seed(123)  # same z_0/tau draws as loss_before, isolating the comparison to weights
 with torch.no_grad():
     loss_after = model(batch)["loss_total"].item()
 
 assert abs(loss_before - loss_after) < 1e-6, f"checkpoint round-trip mismatch: {loss_before} vs {loss_after}"
-print(f"[PASS] checkpoint round-trip: loss identical before/after save+load ({loss_before:.6f})")
+print(
+    f"[PASS] checkpoint round-trip: loss identical before/after save+load ({loss_before:.6f}), "
+    f"wandb_run_id round-tripped correctly"
+)
 
 print("\nAll world-model training checks passed.")

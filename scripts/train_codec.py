@@ -37,7 +37,7 @@ from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.checkpoint import load_checkpoint, save_checkpoint
 from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.dino import DEFAULT_ENCODER_AGGREGATION_LAYERS, DinoModel
-from mini_mira.codec.logging_utils import init_wandb, log_preview, log_step
+from mini_mira.codec.logging_utils import get_wandb_run_id, init_wandb, log_preview, log_step
 from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
 from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
@@ -203,8 +203,9 @@ def main() -> None:
     ckpt_path = checkpoint_dir / "checkpoint.pth"
 
     start_step = 0
+    wandb_run_id = None
     if args.resume and ckpt_path.exists():
-        start_step = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
+        start_step, wandb_run_id = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
         # Two real bugs, verified directly, not just reasoned about:
         # 1. load_state_dict only updates the scheduler's own bookkeeping -- it never pushes a
         #    recomputed lr into optimizer.param_groups. Every --resume was silently leaving lr at
@@ -223,7 +224,11 @@ def main() -> None:
             group["lr"] = lr
         print(f"Resumed from {ckpt_path} at step {start_step}")
 
-    wandb_enabled = init_wandb(args.wandb_project, vars(args))
+    # wandb_run_id: None on a fresh run (wandb.init mints a new one, captured below) or the id
+    # loaded from the checkpoint above -- passing it back in continues that SAME wandb run
+    # instead of --resume silently fragmenting the loss/lr history into a new, disconnected one.
+    wandb_enabled = init_wandb(args.wandb_project, vars(args), run_id=wandb_run_id)
+    wandb_run_id = get_wandb_run_id(wandb_enabled)
     torch.cuda.reset_peak_memory_stats()
 
     for step in range(start_step, args.steps):
@@ -266,7 +271,7 @@ def main() -> None:
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
-            save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
+            save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler, wandb_run_id)
             if args.hf_backup_repo:
                 from huggingface_hub import HfApi  # optional dep, only used here
 

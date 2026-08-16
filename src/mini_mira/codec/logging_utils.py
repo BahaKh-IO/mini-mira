@@ -13,14 +13,29 @@ import torch
 from torch import Tensor
 
 
-def init_wandb(project: str | None, config: dict[str, Any]) -> bool:
-    """Starts a wandb run if `project` is set. Returns whether logging is enabled."""
+def init_wandb(project: str | None, config: dict[str, Any], run_id: str | None = None) -> bool:
+    """Starts a wandb run if `project` is set. Returns whether logging is enabled.
+
+    run_id: pass a previously-saved run id (see get_wandb_run_id) to CONTINUE that run instead of
+    starting a fresh one. Without this, every --resume silently opened a brand-new wandb run,
+    fragmenting one training run's loss/lr history across several disconnected entries instead of
+    one continuous line."""
     if not project:
         return False
     import wandb  # noqa: PLC0415 -- optional dep, only imported when actually used
 
-    wandb.init(project=project, config=config)
+    wandb.init(project=project, config=config, id=run_id, resume="allow" if run_id else None)
     return True
+
+
+def get_wandb_run_id(enabled: bool) -> str | None:
+    """The current run's id, to save into a checkpoint so a future --resume can pass it back to
+    init_wandb's run_id param. None when wandb logging is disabled."""
+    if not enabled:
+        return None
+    import wandb  # noqa: PLC0415
+
+    return wandb.run.id if wandb.run is not None else None
 
 
 def log_step(enabled: bool, step: int, losses: dict[str, float], lr: float) -> None:

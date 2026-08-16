@@ -21,6 +21,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
     grad_scaler: torch.amp.GradScaler | None = None,
+    wandb_run_id: str | None = None,
 ) -> None:
     """Atomic write: save to a temp file, then rename -- a crash mid-save never leaves `path`
     pointing at a half-written file.
@@ -29,7 +30,11 @@ def save_checkpoint(
     notes/gpu_box_notes_backup.md for why this project uses fp16+GradScaler rather than bf16 for
     trainable ops) -- without it, --resume restarts the scaler at its default init_scale,
     discarding whatever it had actually converged to. Harmless, just wastes a few steps
-    re-calibrating after each resume."""
+    re-calibrating after each resume.
+
+    wandb_run_id: the current wandb run's id (mini_mira.codec.logging_utils.get_wandb_run_id), so
+    a future --resume can pass it back into init_wandb and continue the same run instead of
+    opening a new, disconnected one."""
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(
@@ -41,6 +46,7 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
             "grad_scaler": grad_scaler.state_dict() if grad_scaler is not None else None,
+            "wandb_run_id": wandb_run_id,
         },
         tmp,
     )
@@ -55,12 +61,13 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
     grad_scaler: torch.amp.GradScaler | None = None,
-) -> int:
-    """Loads every component in place. Returns the step to resume from (saved_step + 1).
+) -> tuple[int, str | None]:
+    """Loads every component in place. Returns (step to resume from (saved_step + 1), the saved
+    wandb run id or None).
 
-    Checkpoints saved before grad_scaler support existed simply have no "grad_scaler" key --
-    .get(...) treats that the same as grad_scaler=None was passed at save time, so older
-    checkpoints keep loading fine, just without restoring scaler state."""
+    Checkpoints saved before grad_scaler/wandb_run_id support existed simply have no matching
+    key -- .get(...) treats that the same as grad_scaler=None / wandb_run_id=None was passed at
+    save time, so older checkpoints keep loading fine, just without restoring that state."""
     ckpt: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
     world_model.load_state_dict(ckpt["world_model"])
     action_encoder.load_state_dict(ckpt["action_encoder"])
@@ -70,4 +77,4 @@ def load_checkpoint(
     lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
     if grad_scaler is not None and ckpt.get("grad_scaler") is not None:
         grad_scaler.load_state_dict(ckpt["grad_scaler"])
-    return ckpt["step"] + 1
+    return ckpt["step"] + 1, ckpt.get("wandb_run_id")
