@@ -64,3 +64,18 @@ huggingface_hub>=0.20  # --hf-backup-repo: uploads each checkpoint, for a rented
 # an unpinned torchcodec risks the reverse mismatch (a newer torchcodec built for a newer torch
 # than the one pinned above).
 torchcodec==0.7.0
+# Used directly by mini_mira.world_model.full_eval_metrics for the world-model eval suite's
+# Frechet Inception Distance (InceptionV3 + BLOCK_INDEX_BY_DIM) -- matches real mira's own import
+# (mira/src/mira/training/metrics/world_model_metrics.py). Not installed on this dev machine as of
+# this writing; fill in the real verified version once actually installed on the GPU box.
+pytorch-fid
+# Used directly by mini_mira.world_model.full_eval_metrics for the world-model eval suite's LPIPS
+# metric -- the raw lpips.LPIPS(net="alex") package, distinct from the codec's own
+# torchmetrics-based LPIPS (VGG16, mini_mira.codec.loss) -- real mira genuinely uses both for
+# different purposes, this isn't accidental duplication. Not installed on this dev machine as of
+# this writing.
+lpips
+# scipy.linalg.sqrtm for the Frechet-distance formula (mini_mira.world_model.full_eval_metrics).
+# Already present transitively (1.15.3 on this dev machine, via the torch/torchmetrics chain) but
+# listed directly now since new code imports it by name, same reasoning as numpy above.
+scipy>=1.11
