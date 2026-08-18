@@ -318,7 +318,10 @@ def main() -> None:
                 f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
                 f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
             )
-            print(", ".join(f"{k}={v:.4f}" for k, v in grad_norms.items()))
+            # :.6e, not :.4f -- a genuinely small-but-nonzero grad norm (plausible this deep into
+            # training, on an already-converged checkpoint) rounds to a misleading "0.0000" at 4
+            # decimal places, same illusion this project already hit once with the PSD loss print.
+            print(", ".join(f"{k}={v:.6e}" for k, v in grad_norms.items()))
         log_step(wandb_enabled, step, {**accumulated, **grad_norms}, current_lr)
 
         is_last = step == args.steps - 1
