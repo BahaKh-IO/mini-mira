@@ -5,7 +5,9 @@ action-conditioned latent world model for Rocket League built on a representatio
 (RAEv2) codec and a flow-matching diffusion transformer. This project reimplements the codec
 and world-model architecture end to end and verifies it with shape and behavioral tests. The
 codec is trained for real, on real Rocket League data (`scripts/train_codec.py`); the world
-model's architecture is implemented and verified but has no training mechanism yet.
+model has a real training mechanism too (`scripts/train_world_model.py`) — flow-matching
+diffusion loss, optional PSD self-distillation, checkpointing, and a full eval suite — verified
+by reading and CPU-mechanism tests, but not yet run on real hardware (see [Status](#status)).
 
 ## What this is
 
@@ -93,7 +95,12 @@ convenience for fast iteration, not the intended final scale.
 | `src/mini_mira/ml/rope.py` | Rotary position embeddings — one shared implementation (temporal + axial spatial), used by both the decoder and the world model |
 | `src/mini_mira/world_model/timestep_encoder.py` | `DiffusionTimeEmbedding` — sinusoidal embedding of the diffusion timestep `tau` |
 | `src/mini_mira/world_model/action_encoder.py` | `ActionEncoder` — encodes raw multi-hot key-press actions into per-latent-frame conditioning vectors |
-| `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos`/`clean_past` and `ActionEncoder` |
+| `src/mini_mira/pipeline.py` | `PipelineConfig`, `MyPipeline` — wires bottleneck → multi-step diffusion loop → decoder into one forward pass; owns `bos`/`clean_past` and `ActionEncoder`. Architecture demonstration only — never loads a real trained codec checkpoint (see `LatentWorldModel` below for the class that actually trains) |
+| `src/mini_mira/world_model/latent_world_model.py` | `LatentWorldModel` — the real training-time wrapper: a frozen, real-checkpoint-loaded codec (DINO + bottleneck + decoder) plus the trainable `DiffusionTransformer`/`ActionEncoder`/`bos`. Real mira's diagonal flow-matching loss + optional PSD self-distillation, ported 1:1; `rollout()` for autoregressive eval. See `notes/naming.md` for why this is a separate class from `MyPipeline` rather than a rename of it |
+| `src/mini_mira/world_model/checkpoint.py` | `save_checkpoint`/`load_checkpoint` for world-model training — structural sibling of `codec/checkpoint.py` |
+| `src/mini_mira/world_model/eval_metrics.py` | Cheap, always-on drift-metric eval tier: DINO cosine/L2 drift and latent drift between a real rollout and ground truth |
+| `src/mini_mira/world_model/full_eval_metrics.py` | Heavier eval tier: sliced Frechet DINO/Inception Distance, PSNR, LPIPS, SSIM — shares one `rollout()` call with the drift tier rather than rolling out twice |
+| `src/mini_mira/world_model/rollout_visualization.py` | Renders a small, fixed number of rollout samples as watchable video (keyboard-press HUD overlay + prediction-region border) for human inspection alongside the numeric eval metrics |
 | `src/mini_mira/codec/dino.py` | `DinoModel` — the real, frozen DINOv3 backbone (ViT-S/B/L/16, single- or multi-layer); loads real pretrained weights, wired into `MyPipeline` behind `PipelineConfig.use_real_dino` (see Scope). `DEFAULT_DINO_LAYERS`/`DEFAULT_ENCODER_AGGREGATION_LAYERS` — mira's real per-variant layer-selection tables for the perceptual loss and the encoder's own feature aggregation, respectively (two different selections, for two different purposes) |
 | `src/mini_mira/codec/loss.py` | `CodecLoss`, `CodecLossWeights`, `CodecOutputs` — the codec's real training loss (L1 + LPIPS + DINO latent-consistency, with `auto_weight` adaptive balancing and per-term gradient-norm instrumentation, matching mira's `CodecLoss`); `normalize_video`/`denormalize_for_dino` — the `[0,1]`↔`[-1,1]` pixel-range conversions the codec and DINO each expect |
 | `src/mini_mira/codec/video_prep.py` | `resize_to_canonical` — pads to the target aspect ratio then bilinear-resizes, matching mira's `VideoCodec.preprocess_batch`, so real clips of any native resolution land at the shape the model expects |
@@ -109,8 +116,12 @@ convenience for fast iteration, not the intended final scale.
 | `configs/scaled_300m.yaml` | Named preset scaling `decoder`/`world_model` width and depth toward a ~300M parameter target |
 | `scripts/verify_codec_training.py` | Mechanical proof the codec's training mechanism is wired correctly: overfits one fixed synthetic video on the real `CodecLoss` and asserts the total loss drops substantially. Small config, random-init DINOv3 — no gated weights, runs in seconds |
 | `scripts/download_shards.py` | Downloads N real Rocket League match shards via mira's own `RocketScienceDataset.from_hub`, straight from the gated `kyutai/rocket-science` HuggingFace dataset — the same mechanism for a quick correctness smoke test (`--shards 3`, the default) and for pulling the real training set on the GPU box (larger `--shards`) |
-| `scripts/train_codec.py` | Real GPU codec training: real streamed data (`--index-path`, from `download_shards.py`) or one fixed synthetic video (default, for fast local checks); mira's real `WarmupConstantCosineDecayLR` schedule; hybrid fp16/bf16 autocast + `GradScaler`; gradient accumulation and activation checkpointing for full-resolution batches; `auto_weight` on; per-term gradient-norm logging; checkpoint save/resume (`--checkpoint-dir`/`--resume`, optional HF Hub backup); optional wandb logging. See `--help` for the full flag list |
+| `scripts/train_codec.py` | Real GPU codec training: real streamed data (`--index-path`, from `download_shards.py`) or one fixed synthetic video (default, for fast local checks); mira's real `WarmupConstantCosineDecayLR` schedule; `--precision {fp16-hybrid,bf16}` (fp16-hybrid is the proven default; bf16 is opt-in, for hardware with native bf16 tensor cores); gradient accumulation and activation checkpointing for full-resolution batches; `auto_weight` on; per-term gradient-norm logging; checkpoint save/resume (`--checkpoint-dir`/`--resume`/`--reset-lr-schedule`/`--wandb-new-run`, optional HF Hub backup via `--hf-backup-repo`); optional wandb logging. See `--help` for the full flag list |
 | `scripts/reconstruct.py` | Runs a real image or a real video clip (`.mp4`/`.mov`/`.avi`/`.mkv`/`.webm`, decoded frame-by-frame via `imageio`) through the codec once and saves a side-by-side comparison grid — top row original frames, bottom row reconstructed, aligned by timestep |
+| `scripts/compute_latent_stats.py` | One-shot latent mean/std computation from a frozen codec checkpoint — its JSON output is `train_world_model.py`'s `--latent-stats` input |
+| `scripts/train_world_model.py` | Real GPU world-model training: a frozen codec checkpoint (`--codec-checkpoint`) plus a trainable `DiffusionTransformer`/`ActionEncoder`, real streamed data with real actions (unlike the codec, which ignores them), mira's real diagonal flow-matching loss with optional PSD self-distillation (`--psd-weight`/`--psd-loss-prob`), periodic validation loss plus the full drift/Frechet/PSNR/LPIPS/SSIM eval suite and rendered rollout videos, checkpoint save/resume, optional wandb/HF Hub backup. **Never yet run on real hardware** — verified by reading and CPU-mechanism tests only (`scripts/verify_world_model_training.py`, `scripts/verify_full_eval_metrics.py`), see [Status](#status) |
+| `scripts/verify_world_model_training.py` | CPU-friendly mechanism proof for `train_world_model.py`: overfit convergence, frozen/trainable gradient isolation, the PSD mechanism, checkpoint round-trip — a fake DINO stand-in, no gated weights or GPU needed |
+| `scripts/verify_full_eval_metrics.py` | CPU-friendly mechanism proof for the full eval suite (Frechet/PSNR/LPIPS/SSIM/rollout video) using fake DINO/Inception/LPIPS stand-ins, including genuine ffmpeg-encoded video output |
 
 See [Scale](#scale) above for parameter counts at both the intended ~300M scale
 (`configs/scaled_300m.yaml`) and the small default used for fast testing (`configs/small.yaml`).
@@ -160,6 +171,14 @@ See [Scale](#scale) above for parameter counts at both the intended ~300M scale
   full-resolution batches, per-term gradient-norm instrumentation, and checkpoint save/resume.
   `scripts/verify_codec_training.py` remains the fast, GPU-free mechanism check (one synthetic
   video, random-init DINOv3, asserts loss drops); `train_codec.py` is the real thing.
+- **World-model training mechanism**: `scripts/train_world_model.py` — a frozen, real-checkpoint
+  codec plus a trainable `DiffusionTransformer`/`ActionEncoder`, real mira's diagonal
+  flow-matching loss with optional PSD self-distillation, real streamed data now actually
+  consuming its action channel (unlike the codec, which ignores actions entirely), checkpoint
+  save/resume, and a full eval suite (drift metrics, Frechet DINO/Inception Distance, PSNR,
+  LPIPS, SSIM, rendered rollout videos). Verified by reading and by CPU-mechanism tests
+  (`scripts/verify_world_model_training.py`, `scripts/verify_full_eval_metrics.py`) — **not yet
+  run on a real GPU**, see [Status](#status).
 
 **Deliberately simplified or not yet implemented**, each a disclosed decision rather than a gap
 found later:
@@ -174,9 +193,9 @@ found later:
   from the model's own previous output — see the note above.
 - **Streaming inference.** No KV-cache; every diffusion step recomputes the whole sequence.
 - **Grouped-query attention.** Attention here always uses as many KV heads as query heads.
-- **World-model training.** The world model has no training mechanism at all yet (only the
-  inference-time sampling loop in `MyPipeline.forward` exists) — deliberately deferred to a later
-  task, after the codec. The codec, by contrast, does train for real now — see Implemented above.
+- **World-model training on real hardware.** `train_world_model.py` (see Implemented above) has
+  never actually been run on a GPU yet — no box has existed for it. Everything about it is
+  verified by reading and CPU-mechanism tests so far, not by an actual training run.
 - **One shared implementation where the real repo has two.** The real codec and world model
   never share code with each other, even for identical logic (e.g. two separately-named but
   functionally identical MLP classes, two separate RoPE implementations). mini_mira
@@ -272,6 +291,48 @@ LPIPS/DINO scoring, checkpoint/resume, wandb). Without `--index-path`, it trains
 synthetic video instead — no GPU or real data required, useful as a fast local mechanism check
 (same role as `scripts/verify_codec_training.py`, just via the real training script's own path).
 
+**Resuming into a new fine-tune phase** (different `--lr`/resolution/step budget than the
+checkpoint was originally trained under, e.g. moving to full resolution for the run's final
+steps) needs a few more flags together:
+
+```
+python scripts/train_codec.py --config configs/scaled_300m.yaml \
+  --index-path <path> --require-pretrained-dino \
+  --height 288 --width 512 --frames 40 --batch-size 1 --grad-accum-steps 32 \
+  --activation-checkpointing --resume --steps <checkpoint's resumed step + N> \
+  --lr 5e-5 --lr-min 1e-5 --lr-warmup-steps 0 --reset-lr-schedule \
+  --precision bf16 --wandb-new-run
+```
+
+- `--resume` alone restores weights *and* optimizer momentum, but leaves the LR schedule
+  continuing the checkpoint's original curve — add `--reset-lr-schedule` to instead start a
+  fresh warmup/decay shape sized for this new phase (using this run's own `--lr`/`--lr-min`/
+  `--lr-warmup-steps`/`--lr-decay-steps`, not the checkpoint's original ones).
+- **The resumed step count is `checkpoint's saved step + 1`, not the saved step itself** — e.g.
+  a checkpoint saved at step 3099 resumes training at step 3100. Off-by-one here silently runs
+  one fewer step than intended; there's no error, since `range(start_step, --steps)` just
+  produces a shorter-than-expected range.
+- `--precision bf16` is opt-in (default `fp16-hybrid`) — see the `Precision` note in
+  `train_codec.py`'s own module docstring for when each is the better choice.
+- `--wandb-new-run` opens a fresh chart instead of continuing the checkpoint's original run —
+  useful precisely when the phase itself is new (different resolution/LR/step budget), not a
+  continuation of an interrupted one.
+
+**World-model training** (never yet run for real, see [Status](#status)) needs a frozen codec
+checkpoint and its latent statistics, on top of everything the codec needs:
+
+```
+python scripts/compute_latent_stats.py --codec-checkpoint <checkpoint.pth> --index-path <path> \
+  > latent_stats.json
+python scripts/train_world_model.py --config configs/scaled_300m.yaml \
+  --codec-checkpoint <checkpoint.pth> --latent-stats latent_stats.json \
+  --index-path <train data> --test-index-path <held-out data> --require-pretrained-dino
+```
+
+`train_world_model.py --help` lists the full flag set (PSD self-distillation weights, eval
+cadence/scope, checkpoint/resume, wandb/HF Hub backup) — same shape as `train_codec.py`'s own
+flags wherever the concept is shared.
+
 ## Configs
 
 Named, comparable presets for `PipelineConfig` live in `configs/` at the repo root — data, not
@@ -341,5 +402,25 @@ a genuine information bottleneck, not just a training-stability issue. All are f
 against mira's real source, not assumed. `notes/deviations.md` has the full, evidence-based audit
 trail for these and every other intentional or since-corrected difference from real mira.
 
+The world model now has a real training mechanism too (`scripts/train_world_model.py`): mira's
+diagonal flow-matching loss, optional PSD self-distillation, real action conditioning from real
+streamed data, checkpointing, and a full eval suite. Every tensor shape along the loss's full
+computation path — encode → shift/bos → flow-matching targets → `DiffusionTransformer` (AdaLN
+conditioning, timestep embedding) → loss — has been checked against real mira's own source where
+a direct claim was checkable, not assumed from comments alone. It has **not yet been run on real
+hardware** — no GPU has existed for it — so this is verification by reading and CPU-mechanism
+testing only, not by an actual training run.
+
+Resuming a codec checkpoint into a *new* fine-tune phase (different resolution/LR/step budget
+than the checkpoint was originally trained under) surfaced a real, general bug class in this
+project's resume logic: `torch.optim.lr_scheduler.LRScheduler.load_state_dict` restores its
+*entire* internal state, including `base_lrs`, not just the step counter — so any resume that
+changes the LR schedule's shape needs to explicitly re-derive everything `get_lr()` depends on,
+or it silently keeps computing off the checkpoint's *original* values with no error. Found and
+fixed in both `train_codec.py` (where it was actually triggered, confirmed directly from a
+benchmark run's printed LR staying wrong despite a different `--lr`) and preemptively in
+`train_world_model.py` (same root cause, not yet triggered since that script has never run for
+real).
+
 Remaining gaps are the ones listed in Scope above: no autoregressive rollout, no streaming
-inference, and no world-model training.
+inference, and world-model training not yet exercised on real hardware.
