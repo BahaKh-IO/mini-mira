@@ -295,6 +295,17 @@ def main() -> None:
         # warmup/decay/min_lr shape wholesale (stale if --steps changed since the checkpoint was
         # made). Re-apply this run's own shape, then recompute+apply the real lr for the resumed
         # step -- see train_codec.py for the full writeup of why this matters for every --resume.
+        #
+        # load_state_dict above also restored base_lrs from the checkpoint (whatever --lr that
+        # earlier run used) -- unlike train_codec.py this script has no --reset-lr-schedule flag,
+        # but the same silent-override risk exists: a --resume with a DIFFERENT --lr than the
+        # checkpoint's original would otherwise keep training at the OLD lr with no error or
+        # warning. This script's own --lr is always meant to be authoritative (same "CLI overrides
+        # loaded state" convention used elsewhere), so always re-derive it here -- a no-op when
+        # --lr matches the checkpoint's original, a real fix when it doesn't.
+        lr_scheduler.base_lrs = [args.lr for _ in optimizer.param_groups]
+        for group in optimizer.param_groups:
+            group["initial_lr"] = args.lr
         lr_scheduler.warmup_steps = warmup_steps
         lr_scheduler.decay_steps = decay_steps
         lr_scheduler.min_lr = min_lr
