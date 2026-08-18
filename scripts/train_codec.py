@@ -253,6 +253,14 @@ def main() -> None:
             # timing reference resets -- start_step (outer loop / checkpoint bookkeeping) and the
             # loaded weights/optimizer momentum are untouched.
             lr_scheduler.last_epoch = 0
+            # load_state_dict above also restored base_lrs from the checkpoint (the ORIGINAL
+            # run's --lr, e.g. 1e-4) -- confirmed directly: a --reset-lr-schedule run with a new
+            # --lr still computed every phase (warmup/constant/decay) off the stale peak, since
+            # get_lr() reads self.base_lrs, and nothing below touches it. Re-derive it from this
+            # run's own --lr, same spirit as warmup_steps/decay_steps/min_lr just below.
+            lr_scheduler.base_lrs = [args.lr for _ in optimizer.param_groups]
+            for group in optimizer.param_groups:
+                group["initial_lr"] = args.lr
         lr_scheduler.warmup_steps = warmup_steps
         lr_scheduler.decay_steps = decay_steps
         lr_scheduler.min_lr = min_lr
