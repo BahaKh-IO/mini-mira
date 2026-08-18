@@ -261,6 +261,21 @@ def main() -> None:
             lr_scheduler.base_lrs = [args.lr for _ in optimizer.param_groups]
             for group in optimizer.param_groups:
                 group["initial_lr"] = args.lr
+            # warmup_steps/decay_steps above were sized off args.steps directly (e.g. 3299, the
+            # RESUMED run's absolute final step) -- correct for a fresh run, wrong here: last_epoch
+            # just reset to 0, so the scheduler's own clock only ever advances through THIS phase's
+            # actual length (args.steps - start_step, e.g. 200), never anywhere near 3299. Sizing
+            # decay_steps off the absolute count spreads the intended curve over ~16x too many
+            # steps -- confirmed directly: a 5-step console sample showed lr flat at the same
+            # printed value the whole time, consistent with a decay curve sized for a much longer
+            # run. Recompute both relative to the phase actually being run, but only when the
+            # caller didn't already explicitly pin one (an explicit --lr-warmup-steps/
+            # --lr-decay-steps is a deliberate choice, not something to override).
+            phase_steps = args.steps - start_step
+            if args.lr_warmup_steps is None:
+                warmup_steps = max(1, phase_steps // 20)
+            if args.lr_decay_steps is None:
+                decay_steps = max(1, phase_steps - warmup_steps)
         lr_scheduler.warmup_steps = warmup_steps
         lr_scheduler.decay_steps = decay_steps
         lr_scheduler.min_lr = min_lr
