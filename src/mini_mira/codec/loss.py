@@ -235,6 +235,12 @@ class CodecLoss(nn.Module):
                 weight = (stop - start) / pred_2d.shape[0]
                 lpips_terms.append(weight * self.lpips_perceptual_loss(pred_2d[start:stop], tgt_2d[start:stop]))
             loss["loss_lpips_perceptual"] = torch.stack(lpips_terms).sum()
+            # torchmetrics' Metric.forward() computes AND accumulates into internal state as a
+            # side effect (all_scores keeps growing every call) -- we only ever want the current
+            # step's value, never a running aggregate, so clear it immediately. Unlike real mira's
+            # plain stateless lpips.LPIPS module, torchmetrics' wrapper leaks memory every step
+            # without this (notes/session_handoff.md).
+            self.lpips_perceptual_loss.reset()
 
         if self.weights.loss_dino_latent_consistency > 0:
             assert self.dino is not None, "call bind_encoder_dino before forward"
