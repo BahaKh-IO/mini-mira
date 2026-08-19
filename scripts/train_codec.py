@@ -332,9 +332,23 @@ def main() -> None:
                 warmup_steps = max(1, phase_steps // 20)
             if args.lr_decay_steps is None:
                 decay_steps = max(1, phase_steps - warmup_steps)
-        lr_scheduler.warmup_steps = warmup_steps
-        lr_scheduler.decay_steps = decay_steps
-        lr_scheduler.min_lr = min_lr
+        # Only reapply warmup_steps/decay_steps/min_lr when there's an actual reason to: either
+        # --reset-lr-schedule (a genuinely new phase, sized above) or the caller explicitly passed
+        # the corresponding flag (a deliberate override mid-phase). A PLAIN resume with neither --
+        # e.g. splitting one long phase across multiple --steps invocations because the GPU is only
+        # available in windows -- must NOT touch these: load_checkpoint above already restored the
+        # checkpoint's own values, and warmup_steps/decay_steps computed earlier in this function
+        # are sized off THIS invocation's own (possibly much larger or smaller) absolute --steps,
+        # not the original phase length. Overwriting them unconditionally (the previous behavior)
+        # silently changed the decay curve's shape mid-phase -- last_epoch keeps advancing from
+        # where the checkpoint left off, but decay_steps would jump to a value sized for a whole
+        # different phase, moving the LR far from where the smooth curve actually was.
+        if args.reset_lr_schedule or args.lr_warmup_steps is not None:
+            lr_scheduler.warmup_steps = warmup_steps
+        if args.reset_lr_schedule or args.lr_decay_steps is not None:
+            lr_scheduler.decay_steps = decay_steps
+        if args.reset_lr_schedule or args.lr_min is not None:
+            lr_scheduler.min_lr = min_lr
         for group, lr in zip(optimizer.param_groups, lr_scheduler.get_lr()):
             group["lr"] = lr
         print(f"Resumed from {ckpt_path} at step {start_step}")
