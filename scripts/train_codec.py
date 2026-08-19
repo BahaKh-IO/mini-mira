@@ -116,6 +116,14 @@ def parse_args() -> argparse.Namespace:
         "(different --lr/--lr-min/--steps) rather than continuing an interrupted run.",
     )
     parser.add_argument(
+        "--reset-optimizer-state", action="store_true",
+        help="With --resume, load weights only and start AdamW with fresh (zero) momentum/variance "
+        "instead of the checkpoint's saved optimizer state -- use when the checkpoint's momentum "
+        "was calibrated under a different regime (resolution/precision) that may not transfer "
+        "cleanly. Independent of --reset-lr-schedule (that resets the LR curve's shape, this "
+        "resets AdamW's own state); most restarts of this kind want both.",
+    )
+    parser.add_argument(
         "--wandb-new-run", action="store_true",
         help="With --resume, start a fresh W&B run instead of continuing the checkpoint's saved one.",
     )
@@ -232,6 +240,17 @@ def main() -> None:
         start_step, wandb_run_id = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
         if args.wandb_new_run:
             wandb_run_id = None
+        if args.reset_optimizer_state:
+            # Fresh AdamW state (no momentum/variance carried over) bound to the SAME just-loaded
+            # weights -- load_checkpoint above already loaded the OLD optimizer state into the
+            # existing `optimizer` object; replacing it here discards that state entirely rather
+            # than editing it in place. Only the optimizer's own state resets -- loaded model
+            # weights and start_step are untouched. lr_scheduler was constructed bound to the old
+            # optimizer object (torch.optim.lr_scheduler stores this as self.optimizer), so it
+            # needs to be pointed at the new one or every later lr_scheduler.step()/get_lr() call
+            # would silently keep operating on the discarded optimizer instead.
+            optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+            lr_scheduler.optimizer = optimizer
         # Two real bugs, verified directly, not just reasoned about:
         # 1. load_state_dict only updates the scheduler's own bookkeeping -- it never pushes a
         #    recomputed lr into optimizer.param_groups. Every --resume was silently leaving lr at
