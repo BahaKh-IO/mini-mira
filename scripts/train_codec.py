@@ -243,6 +243,19 @@ def main() -> None:
         #    finished, pinning lr at min_lr for the entire extension.
         # Re-apply this run's own shape, then recompute+apply the real lr for the resumed step --
         # a no-op for #2 when --steps didn't change, but always fixes #1 either way.
+        # load_state_dict above restores base_lrs from whatever --lr the CHECKPOINT's own run
+        # used, and get_lr() reads self.base_lrs directly for every phase (warmup/constant/decay
+        # peak). Re-derive it from THIS run's own --lr unconditionally, not just under
+        # --reset-lr-schedule -- previously this was only done inside that branch, while --lr-min
+        # (below, via min_lr) was ALREADY being re-derived from the current args unconditionally,
+        # so a plain --resume with a different --lr than the checkpoint's original silently kept
+        # training at the OLD peak lr against a NEW floor -- a self-contradictory decay curve with
+        # no error. Matches train_world_model.py's own resume block, which does this
+        # unconditionally for the same reason ("this script's own --lr is always meant to be
+        # authoritative"). A no-op when --lr matches the checkpoint's original either way.
+        lr_scheduler.base_lrs = [args.lr for _ in optimizer.param_groups]
+        for group in optimizer.param_groups:
+            group["initial_lr"] = args.lr
         if args.reset_lr_schedule:
             # --resume's load_state_dict above restored last_epoch to the checkpoint's own step
             # (e.g. ~3100). Even after warmup_steps/decay_steps/min_lr are re-applied below,
@@ -253,14 +266,6 @@ def main() -> None:
             # timing reference resets -- start_step (outer loop / checkpoint bookkeeping) and the
             # loaded weights/optimizer momentum are untouched.
             lr_scheduler.last_epoch = 0
-            # load_state_dict above also restored base_lrs from the checkpoint (the ORIGINAL
-            # run's --lr, e.g. 1e-4) -- confirmed directly: a --reset-lr-schedule run with a new
-            # --lr still computed every phase (warmup/constant/decay) off the stale peak, since
-            # get_lr() reads self.base_lrs, and nothing below touches it. Re-derive it from this
-            # run's own --lr, same spirit as warmup_steps/decay_steps/min_lr just below.
-            lr_scheduler.base_lrs = [args.lr for _ in optimizer.param_groups]
-            for group in optimizer.param_groups:
-                group["initial_lr"] = args.lr
             # warmup_steps/decay_steps above were sized off args.steps directly (e.g. 3299, the
             # RESUMED run's absolute final step) -- correct for a fresh run, wrong here: last_epoch
             # just reset to 0, so the scheduler's own clock only ever advances through THIS phase's
@@ -298,6 +303,13 @@ def main() -> None:
     wandb_run_id = get_wandb_run_id(wandb_enabled)
     torch.cuda.reset_peak_memory_stats()
 
+    # Baseline for weight-drift logging below -- the actual starting point of THIS run (post-resume
+    # if --resume, post-init otherwise), moved to CPU so it doesn't compete with training for GPU
+    # memory. See notes/grad_norm_investigation.md: the existing grad_norm_loss_* metrics are
+    # activation gradients (CodecLoss._hook_clone), not parameter gradients, and can't answer "are
+    # the weights actually moving" on their own -- this does, directly.
+    initial_params = torch.cat([p.detach().flatten() for p in params]).cpu()
+
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
         accumulated: dict[str, float] = {}
@@ -315,6 +327,17 @@ def main() -> None:
             grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
             for k, v in losses.items():
                 accumulated[k] = accumulated.get(k, 0.0) + v.item() / args.grad_accum_steps
+        # Real total gradient norm across every trainable parameter (bottleneck + decoder) --
+        # unlike grad_norm_loss_* below, this is an actual parameter gradient, the quantity
+        # "is AdamW's update small" genuinely depends on (notes/grad_norm_investigation.md).
+        # unscale_ first: under --precision fp16-hybrid, .grad is still GradScaler-scaled at this
+        # point (unscaling normally only happens inside grad_scaler.step()) -- without this the
+        # logged norm would repeat the exact scale-factor confusion already found and corrected for
+        # the activation-gradient probes. A documented no-op under bf16 (scaler disabled). clip
+        # with max_norm=inf so this only ever measures the norm, never actually clips gradients --
+        # clipping isn't something this project has decided to do.
+        grad_scaler.unscale_(optimizer)
+        grad_norm_params_total = torch.nn.utils.clip_grad_norm_(params, float("inf")).item()
         grad_scaler.step(optimizer)
         grad_scaler.update()
         lr_scheduler.step()
@@ -322,6 +345,7 @@ def main() -> None:
         # Last micro-step's real per-term gradient norms (see CodecLoss._hook_clone) -- same
         # "last micro-step only" convention already used for the preview video below.
         grad_norms = {f"grad_norm_{k}": v.item() for k, v in loss_fn.backward_metrics.items()}
+        grad_norms["grad_norm_params_total"] = grad_norm_params_total
 
         current_lr = optimizer.param_groups[0]["lr"]
         term_str = ", ".join(
@@ -341,6 +365,15 @@ def main() -> None:
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
+            # L2 distance from this run's own starting weights (initial_params above) -- an
+            # unambiguous "did the model change at all" signal, independent of any
+            # gradient-interpretation question. Only at checkpoint cadence, not every step: needs
+            # a full param-vector CPU round-trip, not cheap enough for the hot loop.
+            current_params = torch.cat([p.detach().flatten() for p in params]).cpu()
+            weight_drift_l2 = (current_params - initial_params).norm().item()
+            print(f"step {step}: weight_drift_l2_from_run_start={weight_drift_l2:.6e}")
+            log_step(wandb_enabled, step, {"weight_drift_l2_from_run_start": weight_drift_l2}, current_lr)
+            del current_params
             save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler, wandb_run_id)
             if args.hf_backup_repo:
                 from huggingface_hub import HfApi  # optional dep, only used here
