@@ -52,6 +52,16 @@ def compute_drift_metrics(model, z: Tensor, z_t: Tensor, n_context_latents: int)
         pred_video = model.decode_to_video(z_t)
         real_dino = model.dino.dino_forward(real_video)
         pred_dino = model.dino.dino_forward(pred_video)
+        # model.dino is multi-layer (last_layer_only=False, for the bottleneck's own encoding
+        # needs) -- take the last layer, same convention as full_eval_metrics.py's
+        # compute_full_eval_metrics (the same feature real mira's separate single-layer
+        # DinoForMetrics would produce for eval; loss.py's training-time _layer_averaged_mse
+        # averages across all layers instead, a deliberately different convention for a
+        # deliberately different purpose).
+        if isinstance(real_dino, list):
+            real_dino = real_dino[-1]
+        if isinstance(pred_dino, list):
+            pred_dino = pred_dino[-1]
 
     # n_context_latents is in LATENT-frame units; decoded video/DINO features are in VIDEO-frame
     # units, temporal_downsampling times longer (the decoder's own patch_size_t upsample, which
