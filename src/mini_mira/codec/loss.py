@@ -137,7 +137,7 @@ class CodecLoss(nn.Module):
 
     def __init__(
         self, weights: CodecLossWeights, use_checkpointing: bool = False,
-        perceptual_chunk_size: int = 0,
+        perceptual_chunk_size: int = 0, log_activation_grad_norms: bool = False,
     ):
         super().__init__()
         self.weights = weights
@@ -145,6 +145,12 @@ class CodecLoss(nn.Module):
         # backbone (onto the reconstruction), unlike the encoder's own no_grad call.
         self.use_checkpointing = use_checkpointing
         self.perceptual_chunk_size = perceptual_chunk_size
+        # Off by default: these are activation gradients (see _hook_clone), not parameter
+        # gradients, and notes/grad_norm_investigation.md found them GradScaler-scale-confounded
+        # under --precision fp16-hybrid and generally less directly interpretable than
+        # train_codec.py's grad_norm_params_total. Costs a real (if modest) extra tensor clone per
+        # term per micro-step for a signal that's now mostly superseded -- opt-in only.
+        self.log_activation_grad_norms = log_activation_grad_norms
 
         self.lpips_perceptual_loss: nn.Module | None = None
         if weights.loss_lpips_perceptual > 0:
@@ -170,8 +176,9 @@ class CodecLoss(nn.Module):
         """Clone `tensor` and register a backward hook recording its gradient norm under
         `loss_name` in backward_metrics -- lets training watch each term's real gradient
         magnitude directly, not just auto_weight's derived ratio. Matches mira's own
-        CodecLoss._hook_clone exactly, including its dim=-1 norm convention."""
-        if not tensor.requires_grad:
+        CodecLoss._hook_clone exactly, including its dim=-1 norm convention.
+        A no-op (returns tensor unchanged, no clone/hook) unless log_activation_grad_norms is on."""
+        if not tensor.requires_grad or not self.log_activation_grad_norms:
             return tensor
         clone = tensor.clone()
         clone.register_hook(
