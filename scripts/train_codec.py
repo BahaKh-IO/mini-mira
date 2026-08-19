@@ -115,6 +115,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--checkpoint-every", type=int, default=100)
+    parser.add_argument(
+        "--hf-backup-every", type=int, default=None,
+        help="How often (in steps) to upload to --hf-backup-repo, independent of --checkpoint-"
+        "every's local-save cadence. Must be a multiple of --checkpoint-every to behave "
+        "predictably -- the upload check only runs on steps where a local save already happened, "
+        "so e.g. hf-backup-every=100 with checkpoint-every=50 uploads every 2nd local save; a "
+        "non-multiple would silently skip some intended upload steps. Default: same as "
+        "--checkpoint-every (upload on every local save, the original behavior). Useful when the "
+        "upload itself is slow -- frequent cheap local safety saves without paying the upload cost "
+        "every time.",
+    )
     parser.add_argument("--preview-every", type=int, default=100, help="W&B image/video preview interval")
     parser.add_argument("--console-log-every", type=int, default=10, help="Loss/GPU-memory print interval")
     parser.add_argument("--resume", action="store_true")
@@ -253,6 +264,7 @@ def main() -> None:
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = checkpoint_dir / "checkpoint.pth"
+    hf_backup_every = args.hf_backup_every if args.hf_backup_every is not None else args.checkpoint_every
 
     start_step = 0
     wandb_run_id = None
@@ -435,7 +447,11 @@ def main() -> None:
             log_step(wandb_enabled, step, {"weight_drift_l2_from_run_start": weight_drift_l2}, current_lr)
             del current_params
             save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler, wandb_run_id)
-            if args.hf_backup_repo:
+            # Decoupled from the local save above: local saves are cheap and want to be frequent
+            # for crash safety, but the HF upload itself can be slow (network-bound), so it runs on
+            # its own, sparser cadence -- always still fires on is_last so the FINAL state is never
+            # skipped regardless of where hf_backup_every's modulo lands.
+            if args.hf_backup_repo and ((step + 1) % hf_backup_every == 0 or is_last):
                 from huggingface_hub import HfApi  # optional dep, only used here
 
                 HfApi().upload_file(
