@@ -116,6 +116,16 @@ def parse_args() -> argparse.Namespace:
         "(different --lr/--lr-min/--steps) rather than continuing an interrupted run.",
     )
     parser.add_argument(
+        "--log-per-term-grad-norm", action="store_true",
+        help="Log each loss term's OWN real parameter-gradient norm separately (grad_norm_params_"
+        "loss_mae/loss_lpips_perceptual/loss_dino_latent_consistency), not just their combined "
+        "total (grad_norm_params_total) -- shows which term is actually driving the weight update "
+        "most. Costs ~3 extra backward-equivalent passes on the last micro-step of every optimizer "
+        "step (same 'last micro-step only' convention as grad_norm_loss_*), so opt-in rather than "
+        "always-on: skip this for real long runs where every bit of step time matters, use it for "
+        "runs where understanding per-term contribution is the actual point.",
+    )
+    parser.add_argument(
         "--reset-optimizer-state", action="store_true",
         help="With --resume, load weights only and start AdamW with fresh (zero) momentum/variance "
         "instead of the checkpoint's saved optimizer state -- use when the checkpoint's momentum "
@@ -332,7 +342,8 @@ def main() -> None:
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
         accumulated: dict[str, float] = {}
-        for _ in range(args.grad_accum_steps):
+        per_term_grad_norms: dict[str, float] = {}
+        for micro_step in range(args.grad_accum_steps):
             video = next_video().cuda()
             with _autocast(args.precision):
                 with torch.no_grad():  # encoder side: no grad needed here
@@ -343,6 +354,25 @@ def main() -> None:
                     input_video=normalize_video(video), output_video=reconstructed, dino_features=dino_features
                 )
                 losses = loss_fn(outputs)
+            if args.log_per_term_grad_norm and micro_step == args.grad_accum_steps - 1:
+                # Each term's OWN real parameter-gradient norm, computed independently via
+                # autograd.grad (doesn't touch .grad, doesn't affect the real training step below).
+                # Must run BEFORE the real .backward() call: that call frees the graph by default,
+                # and every one of these needs it still intact -- retain_graph=True on each so the
+                # next one (and the real backward() after) can still use it. allow_unused=True
+                # since a term with a zero weight (loss_mae/lpips/dino_latent_consistency can each
+                # be individually disabled via config) has no graph to differentiate through at
+                # all. Unlike grad_norm_params_total, these need no unscale_() step: they operate
+                # directly on the raw, not-yet-GradScaler-multiplied loss values (scaling only
+                # happens at the .backward() call below), so they're precision-comparable by
+                # construction -- see notes/grad_norm_investigation.md for why that matters here.
+                for term_name in ("loss_mae", "loss_lpips_perceptual", "loss_dino_latent_consistency"):
+                    if term_name not in losses:
+                        continue
+                    term_grads = torch.autograd.grad(losses[term_name], params, retain_graph=True, allow_unused=True)
+                    term_grads = [g for g in term_grads if g is not None]
+                    norm = torch.norm(torch.stack([g.norm() for g in term_grads])).item() if term_grads else 0.0
+                    per_term_grad_norms[f"grad_norm_params_{term_name}"] = norm
             grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
             for k, v in losses.items():
                 accumulated[k] = accumulated.get(k, 0.0) + v.item() / args.grad_accum_steps
@@ -365,6 +395,7 @@ def main() -> None:
         # "last micro-step only" convention already used for the preview video below.
         grad_norms = {f"grad_norm_{k}": v.item() for k, v in loss_fn.backward_metrics.items()}
         grad_norms["grad_norm_params_total"] = grad_norm_params_total
+        grad_norms.update(per_term_grad_norms)  # empty dict unless --log-per-term-grad-norm
 
         current_lr = optimizer.param_groups[0]["lr"]
         term_str = ", ".join(
