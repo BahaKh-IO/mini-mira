@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps - warmup_steps")
     parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
     parser.add_argument("--loss-mae-weight", type=float, default=1.0, help="CodecLossWeights.loss_mae")
+    parser.add_argument(
+        "--log-activation-grad-norms", action="store_true",
+        help="Log grad_norm_loss_mae/lpips_perceptual/dino_latent_consistency/total_video (the "
+        "ORIGINAL per-term activation-gradient hooks, CodecLoss._hook_clone) -- off by default. "
+        "notes/grad_norm_investigation.md found these GradScaler-scale-confounded under "
+        "--precision fp16-hybrid and generally less directly interpretable than "
+        "grad_norm_params_total (always on) or --log-per-term-grad-norm's real parameter "
+        "gradients. Costs a real extra tensor clone per term per micro-step -- opt-in.",
+    )
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--preview-every", type=int, default=100, help="W&B image/video preview interval")
@@ -196,6 +205,7 @@ def main() -> None:
         CodecLossWeights(auto_weight=True, loss_mae=args.loss_mae_weight),
         use_checkpointing=args.activation_checkpointing,
         perceptual_chunk_size=args.perceptual_chunk_size,
+        log_activation_grad_norms=args.log_activation_grad_norms,
     ).cuda()
     loss_fn.bind_encoder_dino(dino)
     if args.perceptual_dino_model:
