@@ -38,7 +38,7 @@ import torch
 from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.dino import DEFAULT_ENCODER_AGGREGATION_LAYERS, DinoModel
-from mini_mira.codec.logging_utils import log_preview
+from mini_mira.codec.logging_utils import init_wandb, log_preview
 from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, denormalize_for_dino, normalize_video
 from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-preview-videos", type=int, default=8, help="How many of those to also save as preview videos")
     parser.add_argument("--precision", choices=["fp16-hybrid", "bf16"], default="bf16")
     parser.add_argument("--output-dir", default="eval_previews")
+    parser.add_argument("--wandb-project", default=None)
     args = parser.parse_args()
     if args.num_preview_videos > args.num_samples:
         parser.error("--num-preview-videos can't exceed --num-samples")
@@ -138,6 +139,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    wandb_enabled = init_wandb(args.wandb_project, vars(args))
 
     n_batches = max(1, args.num_samples // args.batch_size)
     totals: dict[str, float] = {}
@@ -184,7 +186,7 @@ def main() -> None:
                 # batch as a whole, to get --num-preview-videos separate files rather than one.
                 for i in range(min(bs, args.num_preview_videos - n_previews_saved)):
                     log_preview(
-                        enabled=False, step=n_previews_saved,
+                        enabled=wandb_enabled, step=n_previews_saved,
                         original=video[i : i + 1], reconstructed=reconstructed[i : i + 1],
                         fps=args.target_fps, output_dir=output_dir,
                     )
@@ -202,6 +204,12 @@ def main() -> None:
     results_path.write_text(json.dumps(results, indent=2))
     print(f"\nWrote {results_path}")
     print(f"Saved {n_previews_saved} preview videos to {output_dir}/")
+
+    if wandb_enabled:
+        import wandb  # noqa: PLC0415
+
+        wandb.log(results)
+        wandb.finish()
 
 
 if __name__ == "__main__":
