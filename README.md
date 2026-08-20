@@ -120,7 +120,7 @@ convenience for fast iteration, not the intended final scale.
 | `scripts/download_shards.py` | Downloads N real Rocket League match shards via mira's own `RocketScienceDataset.from_hub`, straight from the gated `kyutai/rocket-science` HuggingFace dataset — the same mechanism for a quick correctness smoke test (`--shards 3`, the default) and for pulling the real training set on the GPU box (larger `--shards`) |
 | `scripts/train_codec.py` | Real GPU codec training: real streamed data (`--index-path`, from `download_shards.py`) or one fixed synthetic video (default, for fast local checks); mira's real `WarmupConstantCosineDecayLR` schedule; `--precision {fp16-hybrid,bf16}` (fp16-hybrid is the proven default; bf16 is opt-in, for hardware with native bf16 tensor cores); gradient accumulation and (optional — `--activation-checkpointing`) activation checkpointing for full-resolution batches; `auto_weight` on; always-on real diagnostics (`grad_norm_params_total`, correctly precision-unscaled; `weight_drift_l2_from_run_start` at checkpoint cadence) plus opt-in ones (`--log-per-term-grad-norm` for real per-loss-term parameter gradients, ~5% extra compute; `--log-activation-grad-norms` for the older, less-reliable activation-gradient probes, off by default); checkpoint save/resume (`--checkpoint-dir`/`--resume`/`--reset-lr-schedule`/`--reset-optimizer-state`/`--wandb-new-run`, optional HF Hub backup via `--hf-backup-repo`/`--hf-backup-every` — decoupled so a slow upload doesn't have to happen on every local save); optional wandb logging. See `--help` for the full flag list |
 | `scripts/reconstruct.py` | Runs a real image or a real video clip (`.mp4`/`.mov`/`.avi`/`.mkv`/`.webm`, decoded frame-by-frame via `imageio`) through the codec once and saves a side-by-side comparison grid — top row original frames, bottom row reconstructed, aligned by timestep. Random-init weights only, no `--codec-checkpoint` — a mechanism smoke test, not an evaluation of a trained checkpoint |
-| `scripts/evaluate_codec.py` | Real, quantitative evaluation of a **trained** codec checkpoint: the same three training-loss terms plus PSNR/SSIM/LPIPS (reusing `full_eval_metrics.py`'s functions), averaged over held-out-style data, plus a batch of saved preview videos (`log_preview`, called locally without wandb). "Held-out-style," not a true held-out split — see the script's own docstring |
+| `scripts/evaluate_codec.py` | Real, quantitative evaluation of a **trained** codec checkpoint: the same three training-loss terms plus PSNR/SSIM/LPIPS (reusing `full_eval_metrics.py`'s functions), plus a batch of saved preview videos (`log_preview`, works locally, optional `--wandb-project`). Point `--index-path` at genuinely unseen data via `kyutai/rocket-science`'s own dedicated `test` split (`scripts/download_shards.py --split test`) rather than the `train` split the codec streams from — `scripts/build_holdout_split.py` is also available for isolating extra `train` shards if a dataset elsewhere has no dedicated split. Only `loss_mae` in its output is comparable to `train_codec.py`'s own charts — see the script's own docstring for why the other two loss terms aren't |
 | `scripts/compute_latent_stats.py` | One-shot latent mean/std computation from a frozen codec checkpoint — its JSON output is `train_world_model.py`'s `--latent-stats` input |
 | `scripts/train_world_model.py` | Real GPU world-model training: a frozen codec checkpoint (`--codec-checkpoint`) plus a trainable `DiffusionTransformer`/`ActionEncoder`, real streamed data with real actions (unlike the codec, which ignores them), mira's real diagonal flow-matching loss with optional PSD self-distillation (`--psd-weight`/`--psd-loss-prob`), periodic validation loss plus the full drift/Frechet/PSNR/LPIPS/SSIM eval suite and rendered rollout videos, checkpoint save/resume, optional wandb/HF Hub backup. Its first real-GPU run confirmed the core training step, validation loop, and PSD loss all work correctly; it crashed one layer deeper, in the drift-metric eval (`compute_drift_metrics` assumed a tensor where multi-layer DINO aggregation returns a list) — found and fixed, not yet re-run to confirm past that point, see [Status](#status) |
 | `scripts/verify_world_model_training.py` | CPU-friendly mechanism proof for `train_world_model.py`: overfit convergence, frozen/trainable gradient isolation, the PSD mechanism, checkpoint round-trip — a fake DINO stand-in, no gated weights or GPU needed |
@@ -203,17 +203,17 @@ found later:
   step, validation loop, and PSD loss — it crashed in the drift-metric eval (now fixed, see
   [Status](#status)) before reaching the heavier Frechet/PSNR/LPIPS/SSIM suite or rollout video
   rendering, which remain unconfirmed on real hardware.
-- **Quantitative held-out evaluation for the codec — now built (`scripts/evaluate_codec.py`), not
-  yet run on real hardware.** `train_codec.py` itself still has no `--test-index-path`/validation
-  loss (`scripts/reconstruct.py` doesn't fill this either — no `--codec-checkpoint` flag at all,
-  random-init weights only, explicitly not for evaluating a trained checkpoint). The new script
-  loads a real trained checkpoint, reuses the exact PSNR/SSIM/LPIPS functions already proven for
-  the world-model eval suite, reports the same three training-loss terms averaged over held-out
-  data, and saves a batch of side-by-side preview videos. One honest caveat baked into its own
-  docstring: this project has no separate downloaded held-out shard split, so "held-out" here
-  means a different random draw (`--seed`) from the same shard pool `train_codec.py` streams
-  from, not clips the codec has architecturally never touched — upgradeable to a real held-out
-  split later without changing anything else about how the script works.
+- **Quantitative held-out evaluation for the codec — built, run for real, on genuinely unseen
+  data.** `train_codec.py` itself still has no `--test-index-path`/validation loss
+  (`scripts/reconstruct.py` doesn't fill this either — no `--codec-checkpoint` flag at all,
+  random-init weights only). `scripts/evaluate_codec.py` loads a real trained checkpoint, reuses
+  the exact PSNR/SSIM/LPIPS functions already proven for the world-model eval suite, and saves a
+  batch of side-by-side preview videos. Evaluated against `kyutai/rocket-science`'s own dedicated
+  `test` split (found while building this — a cleaner solution than isolating extra `train`
+  shards). First real numbers, on the step-3999 checkpoint: `psnr=19.56dB, ssim=0.552,
+  lpips_standardized=0.486` — by standard external benchmarks, still solidly "poor" quality,
+  consistent with (and now a quantitative confirmation of) the qualitative preview-frame
+  assessment throughout this document.
 - **One shared implementation where the real repo has two.** The real codec and world model
   never share code with each other, even for identical logic (e.g. two separately-named but
   functionally identical MLP classes, two separate RoPE implementations). mini_mira
