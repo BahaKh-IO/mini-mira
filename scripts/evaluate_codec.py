@@ -1,24 +1,20 @@
 """Real, quantitative held-out evaluation for a TRAINED codec checkpoint -- the gap
 scripts/reconstruct.py doesn't fill (that script has no --codec-checkpoint at all and only ever
-uses random-init weights; see its own module docstring). Loads the real bottleneck/decoder
-weights, runs them on clips, and reports both:
-  - the same three loss terms train_codec.py trains on (MAE, LPIPS, DINO latent-consistency),
-    averaged over held-out data -- directly comparable to the training-loss numbers already
-    being watched, just on data the model didn't train on
-  - standardized reconstruction-quality metrics (PSNR, SSIM, LPIPS) via the exact same functions
-    already built and proven for the world-model eval suite (full_eval_metrics.py), so this isn't
-    a second, differently-behaved implementation of the same idea
-plus a batch of side-by-side original/reconstruction preview videos for visual spot-checking,
-reusing codec/logging_utils.py's log_preview (already proven -- it's what every training run's
-preview videos have been all along), just called locally without wandb.
+uses random-init weights). Loads the real bottleneck/decoder weights, runs them on clips, reports:
+  - loss_mae, loss_lpips_perceptual, loss_dino_latent_consistency, loss_total -- CAUTION: only
+    loss_mae is directly comparable to train_codec.py's own charts. The other two are auto_weight
+    OFF here (this script has no gradients to compute that rescaling from, running entirely under
+    torch.no_grad()), while training's charts show them auto_weight-rescaled -- often a 10-50x
+    difference in magnitude, not a real quality gap. Fine to compare across two eval runs of this
+    script; not fine to compare against a training chart.
+  - psnr/ssim/lpips_standardized (AlexNet-based, matching full_eval_metrics.py's world-model
+    convention) -- never computed during training at all, so no such caveat applies to these
+plus a batch of side-by-side preview videos (reusing codec/logging_utils.py's log_preview).
 
-Held-out caveat, stated plainly rather than silently assumed: this project has no separate
-downloaded held-out shard split (see notes/session_handoff.md) -- pointing --index-path at the
-same directory train_codec.py streams from, with a --seed different from training's default,
-gives DIFFERENT random draws from the same shard pool, not clips the codec has architecturally
-never had access to. Real held-out data would need a second, disjoint shard download. This script
-still gives you the two things asked for -- held-out-*style* metrics/previews now, upgradeable to
-a real held-out split later without changing anything else about how this script works.
+Point --index-path at data the codec genuinely never trained on, e.g. the dataset's own "test"
+split (scripts/download_shards.py --split test) rather than the "train" split it streams from --
+build_holdout_split.py is also available for isolating newly-downloaded train shards if a
+dedicated split isn't an option for some other dataset later.
 
 No backward pass anywhere, so memory is far lower than training -- no --activation-checkpointing
 flag needed, and --batch-size can safely be larger than what training used.
@@ -198,6 +194,7 @@ def main() -> None:
     results = {k: v / n_seen for k, v in totals.items()}
     results["n_clips"] = n_seen
     print("\nHeld-out evaluation results:")
+    print("  (only loss_mae is comparable to train_codec.py's charts -- see module docstring)")
     for k, v in results.items():
         print(f"  {k}: {v:.6f}" if k != "n_clips" else f"  {k}: {v}")
 
