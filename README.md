@@ -8,8 +8,8 @@ codec is trained for real, on real Rocket League data (`scripts/train_codec.py`)
 model has a real training mechanism too (`scripts/train_world_model.py`) — flow-matching
 diffusion loss, optional PSD self-distillation, checkpointing, and a full eval suite — verified
 by reading and CPU-mechanism tests, and now confirmed to execute on real hardware as well (its
-first real-GPU smoke test caught and fixed a genuine runtime bug the reading-only verification
-couldn't have found; see [Status](#status)).
+first real-GPU smoke tests caught and fixed two genuine runtime bugs the reading-only
+verification couldn't have found; see [Status](#status)).
 
 ## What this is
 
@@ -181,8 +181,9 @@ See [Scale](#scale) above for parameter counts at both the intended ~300M scale
   save/resume, and a full eval suite (drift metrics, Frechet DINO/Inception Distance, PSNR,
   LPIPS, SSIM, rendered rollout videos). Verified by reading and by CPU-mechanism tests
   (`scripts/verify_world_model_training.py`, `scripts/verify_full_eval_metrics.py`), and its
-  **first real-GPU smoke test** confirmed the training step/validation loop/PSD loss all work —
-  see [Status](#status) for the one bug that test caught, and what's still unconfirmed past it.
+  **first real-GPU smoke tests** confirmed the training step, validation loop, PSD loss, drift
+  metrics, and the full Frechet/PSNR/LPIPS/SSIM suite all work — see [Status](#status) for the
+  two bugs those runs caught, and rollout video rendering, the one piece still unconfirmed.
 
 **Deliberately simplified or not yet implemented**, each a disclosed decision rather than a gap
 found later:
@@ -464,9 +465,16 @@ one layer deeper: `eval_metrics.py`'s `compute_drift_metrics` assumed `model.din
 always returns a tensor, but it returns a **list** under multi-layer DINO aggregation (the mode
 this project actually uses) — exactly the kind of bug reading-only verification can't catch.
 Fixed to match the same last-layer convention `full_eval_metrics.py`'s sibling function already
-used correctly for the identical situation. Not yet re-run to confirm past that point — the
-heavier Frechet/PSNR/LPIPS/SSIM suite and rollout video rendering remain unconfirmed on real
-hardware. Three further architectural divergences from real mira's `DiffusionTransformer` were
+used correctly for the identical situation. Re-run after that fix, the heavier Frechet DINO/
+Inception Distance, PSNR, LPIPS, and SSIM suite (`full_eval_metrics.py`) now works correctly on
+real hardware too, producing real numbers for the first time. Rollout video rendering
+(`rollout_visualization.py`) hit a second real bug one step further: `render_rollout_sample`
+blends a GPU-resident video with a keyboard-HUD overlay that's inherently built on CPU
+(`draw_key_grid_video`, via PIL/numpy) without ever moving it to the video's device first — a
+device-mismatch crash no CPU-only fake-component test could have caught, since everything would
+already be on the same (CPU) device there. Fixed by moving the overlay to the video's device at
+the call site, not inside the ported-verbatim `overlay_video` itself. Not yet re-run to confirm.
+Three further architectural divergences from real mira's `DiffusionTransformer` were
 also found (an extra, unconditioned `LayerNorm` with no equivalent in real mira; AdaLN
 conditioning hardcoded onto the attention sublayers where real mira defaults it off; clean-past
 conditioning unconditionally on where real mira defaults it off too) — none of these crash
