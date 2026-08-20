@@ -137,7 +137,12 @@ def render_rollout_sample(pred_video: Tensor, key_presses: Tensor, n_context_fra
     video = video_to_uint8(pred_video)
     overlay_height = video.shape[2] // 4
     overlay_width = int(overlay_height * 2.5)
-    key_overlay = draw_key_grid_video(key_presses, width=overlay_width, height=overlay_height)
+    # draw_key_grid_video is inherently CPU-only (PIL/numpy, torch.from_numpy) -- move its result
+    # onto video's device before overlay_video blends the two together, or a real-GPU run crashes
+    # ("Expected all tensors to be on the same device"). add_prediction_border below already
+    # avoids this same trap by building its border-color tensor directly on video_output.device;
+    # this call site just didn't have the equivalent move.
+    key_overlay = draw_key_grid_video(key_presses, width=overlay_width, height=overlay_height).to(video.device)
     video = overlay_video(video, key_overlay, corner="top-right", xpad=10, ypad=10, opacity=0.5)
     return add_prediction_border(video, context=n_context_frames)
 
