@@ -192,7 +192,8 @@ def main() -> None:
                     )
                     n_previews_saved += 1
 
-            print(f"batch {batch_idx + 1}/{n_batches} ({n_seen} clips seen)")
+            peak = torch.cuda.max_memory_allocated() / 2**30
+            print(f"batch {batch_idx + 1}/{n_batches} ({n_seen} clips seen), cuda_peak_allocated={peak:.2f}GiB")
 
     results = {k: v / n_seen for k, v in totals.items()}
     results["n_clips"] = n_seen
