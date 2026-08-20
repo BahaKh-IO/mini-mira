@@ -111,6 +111,13 @@ def main() -> None:
     loss_fn = CodecLoss(CodecLossWeights()).cuda()
     loss_fn.bind_encoder_dino(dino)
 
+    # Same conditional as train_codec.py: only needed under fp16-hybrid (bf16's ambient autocast
+    # already covers these convs; dino is never included here either, for the same reason --
+    # DinoModel.dino_forward wraps its own body in bf16 autocast internally regardless).
+    if args.precision == "fp16-hybrid":
+        for module in (bottleneck, decoder, loss_fn):
+            _keep_convolutions_in_bf16(module)
+
     # Second frozen conv-heavy net (LPIPS's AlexNet backbone) -- same bf16-conv-patch insurance
     # already applied to bottleneck/decoder/loss_fn elsewhere in this project, against the V100
     # cuDNN crash class documented in notes/gpu_amp_investigation.md.
@@ -151,8 +158,13 @@ def main() -> None:
                 )
                 losses = loss_fn(outputs)
 
-            video_01 = video.clamp(0, 1)
-            recon_01 = denormalize_for_dino(reconstructed).clamp(0, 1)
+            # .float() before scoring, matching CodecLoss.forward's own convention (predicted =
+            # outputs.output_video.float()) -- `reconstructed` was produced inside the autocast
+            # block above and likely still carries bf16/fp16 dtype even after it exits, while
+            # `video` was never autocast at all (stays fp32); comparing the two directly would
+            # silently mix precisions in the metric computation instead of scoring at full fp32.
+            video_01 = video.float().clamp(0, 1)
+            recon_01 = denormalize_for_dino(reconstructed.float()).clamp(0, 1)
             psnr = compute_psnr(recon_01, video_01).mean().item()
             ssim = compute_ssim(recon_01, video_01).mean().item()
             lpips_score = compute_lpips(lpips_fn, recon_01, video_01).mean().item()
