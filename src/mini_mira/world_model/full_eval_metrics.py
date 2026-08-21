@@ -9,8 +9,6 @@ This is the heavier tier on top of eval_metrics.py's always-on drift metrics -- 
 docstring and notes/deviations.md entry 1.19 for the scope-cut history and its reversal.
 """
 
-from typing import Any
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -262,27 +260,16 @@ class FullEvalMetrics(nn.Module):
         return scalars, curves
 
 
-def compute_full_eval_metrics(model, z: Tensor, z_t: Tensor, n_context_latents: int, metrics: FullEvalMetrics) -> None:
-    """Given one rollout's (z, z_t) -- the SAME tensors compute_drift_metrics consumes, from a
-    single model.rollout(...) call made once by the caller -- decodes and DINOs the generated
-    region again (one extra decoder + DINO forward pass; the expensive part, the rollout's
-    autoregressive diffusion-step loop, already ran exactly once, outside this function) and
-    updates `metrics`'s running accumulators in place.
+def compute_full_eval_metrics(
+    real_video: Tensor, pred_video: Tensor, real_dino: Tensor, pred_dino: Tensor,
+    n_context_latents: int, temporal_downsampling: int, metrics: FullEvalMetrics,
+) -> None:
+    """Given the (real_video, pred_video, real_dino, pred_dino) already produced by
+    eval_metrics.decode_and_dino -- computed once by the caller and shared with
+    compute_drift_metrics and rollout-video rendering, not redone here -- slices to the generated
+    region and updates `metrics`'s running accumulators in place.
     """
-    with torch.no_grad():
-        real_video = model.decode_to_video(z)
-        pred_video = model.decode_to_video(z_t)
-        real_dino: Any = model.dino.dino_forward(real_video)
-        pred_dino: Any = model.dino.dino_forward(pred_video)
-        # model.dino is multi-layer (last_layer_only=False, for the bottleneck's own encoding
-        # needs) -- take the last layer, the same feature real mira's separate single-layer
-        # DinoForMetrics would produce.
-        if isinstance(real_dino, list):
-            real_dino = real_dino[-1]
-        if isinstance(pred_dino, list):
-            pred_dino = pred_dino[-1]
-
-    n_context_frames = n_context_latents * model.temporal_downsampling
+    n_context_frames = n_context_latents * temporal_downsampling
     metrics.update(
         real_video[:, n_context_frames:],
         pred_video[:, n_context_frames:],

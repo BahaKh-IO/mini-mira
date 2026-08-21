@@ -2,11 +2,12 @@
 rollout's DINO features and raw latents diverge from ground truth, frame by frame. This is the
 cheap, always-on tier -- mini_mira.world_model.full_eval_metrics (Frechet DINO/Inception Distance,
 PSNR, LPIPS, SSIM) and mini_mira.world_model.rollout_visualization (rendered rollout videos) are
-the heavier tier, both consuming the SAME model.rollout(...) call this module's
-compute_drift_metrics consumes -- see scripts/train_world_model.py's run_full_eval, which calls
-rollout() exactly once per eval batch and feeds its output to all three. (notes/deviations.md
-entry 1.19 previously described the full suite as deliberately unbuilt for cost reasons; that
-decision has since been reversed.)
+the heavier tier, both consuming the SAME model.rollout(...) call AND the same decode_and_dino(...)
+call this module provides -- see scripts/train_world_model.py's run_full_eval, which calls
+rollout() and decode_and_dino() exactly once per eval batch and feeds their output to all three,
+rather than each of the three decoding/DINO-ing independently. (notes/deviations.md entry 1.19
+previously described the full suite as deliberately unbuilt for cost reasons; that decision has
+since been reversed.)
 
 RunningMean mirrors real mira's DistributedMetric contract (update(values)/compute()) minus its
 torch.distributed.all_reduce() -- mini_mira never runs distributed, so that machinery is omitted
@@ -35,39 +36,47 @@ class RunningMean:
         return (self._sum / self._n).item()
 
 
-def compute_drift_metrics(model, z: Tensor, z_t: Tensor, n_context_latents: int) -> dict[str, Tensor]:
-    """Given one rollout's (z, z_t) -- from a single model.rollout(...) call made once by the
-    caller and shared with compute_full_eval_metrics, not re-rolled-out here -- decodes both to
-    video, runs the model's own (already-loaded) DINO on both, and returns three RAW per-element
-    tensors (not pre-reduced) -- so RunningMean.update() weights correctly across batches of
-    different sizes, matching real mira's DistributedMetric.update(values) contract:
+def decode_and_dino(model, z: Tensor, z_t: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """The one decode + DINO pass every eval tier needs (compute_drift_metrics,
+    full_eval_metrics.compute_full_eval_metrics, and rollout-video rendering) -- factored out so
+    the caller (train_world_model.py's run_full_eval) runs it exactly once per eval batch and
+    shares the result, instead of each of those three redoing it independently.
+
+    Returns (real_video, pred_video, real_dino, pred_dino), the last two already reduced to the
+    last DINO layer (model.dino is multi-layer, last_layer_only=False, for the bottleneck's own
+    encoding needs -- same last-layer convention loss.py's training-time _layer_averaged_mse
+    deliberately does NOT use, a different purpose)."""
+    with torch.no_grad():
+        real_video = model.decode_to_video(z)
+        pred_video = model.decode_to_video(z_t)
+        real_dino = model.dino.dino_forward(real_video)
+        pred_dino = model.dino.dino_forward(pred_video)
+        if isinstance(real_dino, list):
+            real_dino = real_dino[-1]
+        if isinstance(pred_dino, list):
+            pred_dino = pred_dino[-1]
+    return real_video, pred_video, real_dino, pred_dino
+
+
+def compute_drift_metrics(
+    z: Tensor, z_t: Tensor, n_context_latents: int, real_dino: Tensor, pred_dino: Tensor, temporal_downsampling: int
+) -> dict[str, Tensor]:
+    """Given one rollout's (z, z_t) and the (real_dino, pred_dino) already produced by
+    decode_and_dino -- computed once by the caller and shared with compute_full_eval_metrics and
+    rollout-video rendering, not redone here -- returns three RAW per-element tensors (not
+    pre-reduced) -- so RunningMean.update() weights correctly across batches of different sizes,
+    matching real mira's DistributedMetric.update(values) contract:
       dino_cos_drift = 1 - cosine_similarity(pred_dino, real_dino, over the channel dim)
       dino_l2_drift  = mse(pred_dino, real_dino), averaged over the channel dim
       latent_drift   = 1 - cosine_similarity(rolled-out latents, real latents, over the channel dim)
     Only the GENERATED region (from n_context_latents onward) is scored -- the context region is
     real ground truth on both sides by construction and would trivially read as zero drift.
     """
-    with torch.no_grad():
-        real_video = model.decode_to_video(z)
-        pred_video = model.decode_to_video(z_t)
-        real_dino = model.dino.dino_forward(real_video)
-        pred_dino = model.dino.dino_forward(pred_video)
-        # model.dino is multi-layer (last_layer_only=False, for the bottleneck's own encoding
-        # needs) -- take the last layer, same convention as full_eval_metrics.py's
-        # compute_full_eval_metrics (the same feature real mira's separate single-layer
-        # DinoForMetrics would produce for eval; loss.py's training-time _layer_averaged_mse
-        # averages across all layers instead, a deliberately different convention for a
-        # deliberately different purpose).
-        if isinstance(real_dino, list):
-            real_dino = real_dino[-1]
-        if isinstance(pred_dino, list):
-            pred_dino = pred_dino[-1]
-
     # n_context_latents is in LATENT-frame units; decoded video/DINO features are in VIDEO-frame
     # units, temporal_downsampling times longer (the decoder's own patch_size_t upsample, which
     # matches bottleneck.temporal_stride by the codec's own encode/decode round-trip design) --
     # scale the offset before slicing either.
-    n_context_frames = n_context_latents * model.temporal_downsampling
+    n_context_frames = n_context_latents * temporal_downsampling
     real_dino_gen = real_dino[:, n_context_frames:]
     pred_dino_gen = pred_dino[:, n_context_frames:]
 

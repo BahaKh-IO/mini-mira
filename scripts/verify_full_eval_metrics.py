@@ -8,9 +8,9 @@ Seven checks in one script:
   2. compute_psnr / compute_ssim directly.
   3. compute_lpips's per-video loop/flatten logic, fake lpips_fn.
   4. FullEvalMetrics end-to-end, fake inception/lpips_fn.
-  5. compute_drift_metrics's new (model, z, z_t, n_context_latents) signature + compute_full_eval_
-     metrics on the SAME shared rollout -- also regression-tests that removing the internal
-     model.rollout() call from compute_drift_metrics didn't break anything.
+  5. decode_and_dino + compute_drift_metrics + compute_full_eval_metrics all sharing ONE decode/
+     DINO pass on the SAME rollout -- regression-tests that factoring the decode+DINO pass out of
+     both metric functions didn't break anything.
   6. render_rollout_sample / draw_key_grid_video / overlay_video / add_prediction_border /
      video_to_uint8 -- pure tensor/PIL ops.
   7. write_video_ffmpeg / log_rollout_videos -- genuinely end-to-end here (not mechanism-only):
@@ -32,7 +32,7 @@ from mira.world_model.actions_config import ActionConfig, ActionTensors
 from mini_mira.codec.bottleneck import StridedConvBottleneckConfig
 from mini_mira.codec.decoder import ViTDecoderConfig
 from mini_mira.world_model.diffusion_transformer import LatentWorldModelConfig
-from mini_mira.world_model.eval_metrics import compute_drift_metrics
+from mini_mira.world_model.eval_metrics import compute_drift_metrics, decode_and_dino
 from mini_mira.world_model.full_eval_metrics import (
     FullEvalMetrics,
     OnlineGaussian,
@@ -152,7 +152,7 @@ assert all(torch.isfinite(torch.tensor(v)) for v in scalars.values())
 assert len(curves["fdd"]) == 3 and len(curves["fid"]) == 3
 print(f"[PASS] FullEvalMetrics end-to-end: {scalars}")
 
-# --- Check 5: compute_drift_metrics's new signature + compute_full_eval_metrics on ONE shared rollout ---
+# --- Check 5: decode_and_dino + compute_drift_metrics + compute_full_eval_metrics, one shared decode ---
 NUM_KEYS = 9
 HEIGHT = WIDTH = 64
 RAW_FRAMES = 12  # -> 6 latent frames at temporal_stride=2
@@ -176,11 +176,12 @@ model.eval()
 
 N_CONTEXT_LATENTS = 3
 z, z_t = model.rollout(batch, n_context_latents=N_CONTEXT_LATENTS, n_diffusion_steps=2, schedule_type="linear")
+real_video, pred_video, real_dino, pred_dino = decode_and_dino(model, z, z_t)
 
-drift = compute_drift_metrics(model, z, z_t, N_CONTEXT_LATENTS)
+drift = compute_drift_metrics(z, z_t, N_CONTEXT_LATENTS, real_dino, pred_dino, model.temporal_downsampling)
 assert set(drift.keys()) == {"dino_cos_drift", "dino_l2_drift", "latent_drift"}
 assert all(torch.isfinite(v).all() for v in drift.values())
-print(f"[PASS] compute_drift_metrics (new signature): shapes={ {k: tuple(v.shape) for k, v in drift.items()} }")
+print(f"[PASS] compute_drift_metrics (shared decode): shapes={ {k: tuple(v.shape) for k, v in drift.items()} }")
 
 generated_video_frames = (6 - N_CONTEXT_LATENTS) * bottleneck_config.temporal_stride  # (6-3)*2=6
 fdd_slice_frames = 3  # 2 slices of 3 frames
@@ -189,7 +190,10 @@ full_metrics_shared = FullEvalMetrics(
     num_slices=generated_video_frames // fdd_slice_frames, device="cpu",
     inception=_FakeInception(), lpips_fn=_FakeLpipsFn(),
 )
-compute_full_eval_metrics(model, z, z_t, N_CONTEXT_LATENTS, full_metrics_shared)
+compute_full_eval_metrics(
+    real_video, pred_video, real_dino, pred_dino,
+    N_CONTEXT_LATENTS, model.temporal_downsampling, full_metrics_shared,
+)
 shared_scalars, _shared_curves = full_metrics_shared.compute_and_reset()
 assert all(torch.isfinite(torch.tensor(v)) for v in shared_scalars.values())
 print(f"[PASS] compute_full_eval_metrics on the same shared rollout: {shared_scalars}")
