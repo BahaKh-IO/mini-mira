@@ -11,10 +11,14 @@ settled on, and --latent-stats at that checkpoint's scripts/compute_latent_stats
 Assumes a CUDA GPU (no CPU fallback) -- this script is for real training runs; see
 scripts/verify_world_model_training.py for the CPU-friendly mechanism check.
 
-Precision: float16 autocast for the trainable world model/action encoder (+ GradScaler), matching
-train_codec.py exactly -- the frozen bottleneck/decoder are bf16-conv-patched inside
-LatentWorldModel's own __init__ (see notes/gpu_amp_investigation.md for why), so nothing extra is
-needed here beyond the ambient fp16 autocast.
+Precision: --precision (default bf16) picks the autocast dtype for the trainable world
+model/action encoder, same flag/choices as train_codec.py. bf16 needs no GradScaler (disabled as a
+documented no-op) and is what real training on this project's current GPU (native bf16 tensor
+cores) actually uses -- fp16-hybrid (+ GradScaler) is kept only for parity with train_codec.py's
+own V100-era fallback, not the expected choice here. The frozen bottleneck/decoder are always
+bf16-conv-patched inside LatentWorldModel's own __init__ regardless of --precision (see
+notes/gpu_amp_investigation.md for why) -- harmless overlap under --precision bf16, load-bearing
+under fp16-hybrid.
 
 Eval: periodic validation loss (cheap, same forward as training, no backward) + a merged full
 eval -- lightweight DINO/latent "drift" metrics, the full Frechet DINO/Inception Distance +
@@ -44,14 +48,15 @@ from mini_mira.codec.logging_utils import get_wandb_run_id, init_wandb, log_step
 from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
 from mini_mira.world_model.checkpoint import load_checkpoint, save_checkpoint
-from mini_mira.world_model.eval_metrics import RunningMean, compute_drift_metrics
+from mini_mira.world_model.eval_metrics import RunningMean, compute_drift_metrics, decode_and_dino
 from mini_mira.world_model.full_eval_metrics import FullEvalMetrics, compute_full_eval_metrics
 from mini_mira.world_model.latent_world_model import LatentWorldModel
 from mini_mira.world_model.rollout_visualization import log_rollout_videos, render_rollout_sample
 
 
-def _autocast() -> torch.autocast:
-    return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+def _autocast(precision: str) -> torch.autocast:
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +67,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codec-checkpoint", required=True, help="Frozen codec checkpoint (bottleneck+decoder)")
     parser.add_argument("--latent-stats", required=True, help="scripts/compute_latent_stats.py JSON output")
     parser.add_argument("--require-pretrained-dino", action="store_true")
+    parser.add_argument(
+        "--precision", choices=["fp16-hybrid", "bf16"], default="bf16",
+        help="bf16 (default): plain bfloat16 autocast, GradScaler disabled (a documented no-op) "
+        "-- the actual setup real training uses on this project's current GPU. fp16-hybrid: "
+        "float16 autocast + GradScaler, kept only for parity with train_codec.py's own V100-era "
+        "fallback -- see this script's module docstring before picking it.",
+    )
 
     parser.add_argument("--height", type=int, default=288)
     parser.add_argument("--width", type=int, default=512)
@@ -132,7 +144,7 @@ def resize_batch(batch: VideoActionBatch, height: int, width: int) -> VideoActio
 
 def run_validation(
     model: LatentWorldModel, loader, step: int, wandb_enabled: bool, n_samples: int, batch_size: int,
-    height: int, width: int, lr: float,
+    height: int, width: int, lr: float, precision: str,
 ) -> None:
     """Averages the same forward loss training uses (no backward) over a fixed-seed held-out
     subsample. Fresh iterator each call so the same subsample is scored every time, matching real
@@ -145,7 +157,7 @@ def run_validation(
         for _ in range(n_batches):
             batch, _metadata = next(val_iter)
             batch = resize_batch(batch, height, width).to("cuda")
-            with _autocast():
+            with _autocast(precision):
                 losses = model(batch)
             for k, v in losses.items():
                 totals[k] = totals.get(k, 0.0) + v.item() / n_batches
@@ -159,6 +171,7 @@ def run_full_eval(
     model: LatentWorldModel, loader, step: int, wandb_enabled: bool, n_samples: int, batch_size: int,
     context_latents: int, diffusion_steps: int, schedule_type: str, height: int, width: int, lr: float,
     full_eval_metrics: FullEvalMetrics, viz_n_samples: int, target_fps: int, checkpoint_dir: Path,
+    precision: str,
 ) -> None:
     """Merged eval: lightweight drift metrics + the full Frechet/PSNR/LPIPS/SSIM suite + a handful
     of rendered rollout videos -- all sharing ONE model.rollout(...) call per eval batch rather
@@ -174,18 +187,22 @@ def run_full_eval(
         for _ in range(n_batches):
             batch, _metadata = next(eval_iter)
             batch = resize_batch(batch, height, width).to("cuda")
-            with _autocast():
+            with _autocast(precision):
                 z, z_t = model.rollout(batch, context_latents, diffusion_steps, schedule_type)
-                drift = compute_drift_metrics(model, z, z_t, context_latents)
-                compute_full_eval_metrics(model, z, z_t, context_latents, full_eval_metrics)
+                # One shared decode + DINO pass, reused by all three eval tiers below instead of
+                # each redoing it independently (used to be 2-3x redundant).
+                real_video, pred_video, real_dino, pred_dino = decode_and_dino(model, z, z_t)
+                drift = compute_drift_metrics(
+                    z, z_t, context_latents, real_dino, pred_dino, model.temporal_downsampling
+                )
+                compute_full_eval_metrics(
+                    real_video, pred_video, real_dino, pred_dino,
+                    context_latents, model.temporal_downsampling, full_eval_metrics,
+                )
 
                 # Render a few samples for visual inspection, drawn from whichever batches come
-                # first -- decodes z_t a second time (already decoded once inside
-                # compute_full_eval_metrics above) rather than threading decoded video through
-                # both call sites; a small, bounded extra cost since this only fires until
-                # viz_n_samples is reached, not every batch.
+                # first -- reuses pred_video from the shared decode above.
                 if len(viz_samples) < viz_n_samples:
-                    pred_video = model.decode_to_video(z_t)
                     for i in range(min(viz_n_samples - len(viz_samples), pred_video.shape[0])):
                         viz_samples.append(pred_video[i])
                         viz_key_presses.append(batch.actions.key_presses[i])
@@ -255,7 +272,9 @@ def main() -> None:
     # Matches mira's own world-model optimizer betas (0.9, 0.99) -- note this differs from
     # train_codec.py's own (0.9, 0.95) for the codec.
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.99), weight_decay=0.1)
-    grad_scaler = torch.amp.GradScaler("cuda")
+    # GradScaler(enabled=False) is a documented no-op under --precision bf16 -- same "no branching
+    # to support both precisions" convention as train_codec.py; bf16 doesn't need loss scaling.
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16-hybrid"))
 
     eval_batch_size = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
     val_every = args.val_every if args.val_every is not None else max(1, args.steps // 50)
@@ -270,6 +289,11 @@ def main() -> None:
         optimizer, warmup_steps=warmup_steps, constant_steps=0, decay_steps=decay_steps, min_lr=min_lr,
     )
 
+    # No seed passed here -- create_loader's own default (2025) applies every launch, and
+    # num_workers isn't passed either (default 0, single-process). Both matter: dataloader-
+    # position fast-forwarding below (skip N already-consumed batches on --resume) is only correct
+    # because the un-seeded, single-process stream is deterministic across relaunches. Passing an
+    # explicit seed or num_workers here later would silently break that assumption.
     train_loader = create_loader(
         index_path=args.index_path, clip_len=args.frames, target_fps=args.target_fps,
         n_players=1, batch_size=args.batch_size, frame_size=None,
@@ -286,10 +310,38 @@ def main() -> None:
 
     start_step = 0
     wandb_run_id = None
+    batches_consumed = 0
     if args.resume and ckpt_path.exists():
-        start_step, wandb_run_id = load_checkpoint(
+        start_step, wandb_run_id, provenance = load_checkpoint(
             ckpt_path, model.world_model, model.action_encoder, model.bos, optimizer, lr_scheduler, grad_scaler
         )
+        # Real risk this checks for: nothing else stops a --resume from silently pairing against a
+        # different codec checkpoint or latent-stats file than the run was actually trained
+        # against (the codec is loaded fresh from --codec-checkpoint every launch, never saved
+        # into this checkpoint). A mismatch here doesn't crash -- it just trains on latents that
+        # mean something different than what the model already learned. Warn loudly, don't block:
+        # a moved/renamed-but-identical checkpoint file would otherwise trip this unnecessarily.
+        prev_codec = provenance["codec_checkpoint"]
+        if prev_codec is not None and prev_codec != str(Path(args.codec_checkpoint)):
+            print(
+                f"WARNING: this checkpoint was trained against codec checkpoint {prev_codec!r}, "
+                f"but --codec-checkpoint is {args.codec_checkpoint!r} -- if these aren't the same "
+                f"weights, training will silently corrupt on mismatched latents."
+            )
+        prev_mean, prev_std = provenance["latent_mean"], provenance["latent_std"]
+        if prev_mean is not None and (prev_mean != latent_stats["latent_mean"] or prev_std != latent_stats["latent_std"]):
+            print(
+                f"WARNING: this checkpoint was trained with latent_mean={prev_mean}, "
+                f"latent_std={prev_std}, but --latent-stats gives "
+                f"{latent_stats['latent_mean']}/{latent_stats['latent_std']} -- mismatched "
+                f"normalization, training will silently corrupt."
+            )
+        batches_consumed = provenance["dataloader_batches_consumed"]
+        if batches_consumed > 0:
+            print(f"Fast-forwarding dataloader past {batches_consumed} already-consumed batches...")
+            for _ in range(batches_consumed):
+                next(train_iter)
+            print("Dataloader caught up.")
         # Same real, verified bug fix as train_codec.py: load_state_dict never pushes a
         # recomputed lr into optimizer.param_groups, and it restores the checkpoint's OWN
         # warmup/decay/min_lr shape wholesale (stale if --steps changed since the checkpoint was
@@ -330,8 +382,9 @@ def main() -> None:
         accumulated: dict[str, float] = {}
         for _ in range(args.grad_accum_steps):
             batch, _metadata = next(train_iter)
+            batches_consumed += 1
             batch = resize_batch(batch, args.height, args.width).to("cuda")
-            with _autocast():
+            with _autocast(args.precision):
                 losses = model(batch)
             grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
             for k, v in losses.items():
@@ -355,6 +408,9 @@ def main() -> None:
             save_checkpoint(
                 ckpt_path, step, model.world_model, model.action_encoder, model.bos, optimizer, lr_scheduler,
                 grad_scaler, wandb_run_id,
+                codec_checkpoint=args.codec_checkpoint,
+                latent_mean=latent_stats["latent_mean"], latent_std=latent_stats["latent_std"],
+                dataloader_batches_consumed=batches_consumed,
             )
             if args.hf_backup_repo:
                 from huggingface_hub import HfApi  # noqa: PLC0415 -- optional dep, only used here
@@ -367,7 +423,7 @@ def main() -> None:
         if (step + 1) % val_every == 0 or is_last:
             run_validation(
                 model, test_loader, step, wandb_enabled, args.val_n_samples, eval_batch_size,
-                args.height, args.width, current_lr,
+                args.height, args.width, current_lr, args.precision,
             )
 
         if (step + 1) % drift_eval_every == 0 or is_last:
@@ -380,7 +436,7 @@ def main() -> None:
                 model, test_loader, step, wandb_enabled, args.drift_eval_n_samples, eval_batch_size,
                 args.drift_eval_context_latents, args.drift_eval_diffusion_steps, args.drift_eval_schedule,
                 args.height, args.width, current_lr, full_eval_metrics, args.viz_n_samples, args.target_fps,
-                checkpoint_dir,
+                checkpoint_dir, args.precision,
             )
 
 
