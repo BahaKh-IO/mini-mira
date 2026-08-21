@@ -180,7 +180,7 @@ optimizer2 = torch.optim.Adam(_trainable_params(model), lr=2e-3)
 lr_scheduler2 = WarmupConstantCosineDecayLR(
     optimizer2, warmup_steps=10, constant_steps=0, decay_steps=290, min_lr=2e-4
 )
-resume_step, resume_wandb_run_id = load_checkpoint(
+resume_step, resume_wandb_run_id, _resume_provenance = load_checkpoint(
     tmp_path, model.world_model, model.action_encoder, model.bos, optimizer2, lr_scheduler2
 )
 assert resume_step == STEPS, f"expected resume step {STEPS}, got {resume_step}"
