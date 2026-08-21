@@ -68,6 +68,14 @@ class DiffusionTransformer(nn.Module):
 
         self.apply(init_weights)
 
+        # RoPE tables only depend on (h, w) / t / head_dim / theta / device -- all constant across
+        # an entire training run, and across most calls within one rollout too. Single-slot cache
+        # (not a dict) since in practice only one (h, w) and one t are ever in play per process;
+        # avoids recomputing the same table on literally every forward call. Tables have no grad
+        # (plain cos/sin, see ml/rope.py), so caching across train/eval calls is safe.
+        self._rope_spatial_cache: tuple | None = None
+        self._rope_temporal_cache: tuple | None = None
+
     def forward(self, z_t, a=None, tau=None, tau_delta=None, clean_past=None):
         b, t, c, h, w = z_t.shape
         x = rearrange(z_t, "b t c h w -> b t h w c")
@@ -78,8 +86,19 @@ class DiffusionTransformer(nn.Module):
         clean_past = rearrange(clean_past, "b t c h w -> b t h w c")
         x = x + self.past_proj(clean_past)
 
-        rope_spatial = spatial_rope(h, w, self.head_dim, self.config.rope_theta_spatial, x.device)
-        rope_temporal = temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)
+        spatial_key = (h, w, x.device)
+        if self._rope_spatial_cache is None or self._rope_spatial_cache[0] != spatial_key:
+            self._rope_spatial_cache = (
+                spatial_key, spatial_rope(h, w, self.head_dim, self.config.rope_theta_spatial, x.device)
+            )
+        rope_spatial = self._rope_spatial_cache[1]
+
+        temporal_key = (t, x.device)
+        if self._rope_temporal_cache is None or self._rope_temporal_cache[0] != temporal_key:
+            self._rope_temporal_cache = (
+                temporal_key, temporal_rope(t, self.head_dim, self.config.rope_theta_temporal, x.device)
+            )
+        rope_temporal = self._rope_temporal_cache[1]
 
         tau_emb = self.diffusion_time_embedding(tau)  # (b, t, 1, 1, hidden_dim)
         if self.diffusion_time_embedding_delta is not None:
