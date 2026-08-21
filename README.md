@@ -474,12 +474,15 @@ blends a GPU-resident video with a keyboard-HUD overlay that's inherently built 
 device-mismatch crash no CPU-only fake-component test could have caught, since everything would
 already be on the same (CPU) device there. Fixed by moving the overlay to the video's device at
 the call site, not inside the ported-verbatim `overlay_video` itself. Not yet re-run to confirm.
-Three further architectural divergences from real mira's `DiffusionTransformer` were
-also found (an extra, unconditioned `LayerNorm` with no equivalent in real mira; AdaLN
-conditioning hardcoded onto the attention sublayers where real mira defaults it off; clean-past
-conditioning unconditionally on where real mira defaults it off too) — none of these crash
-anything, but they mean the architecture doesn't yet match real mira exactly. Deliberately not
-fixed yet, pending a confirmed end-to-end run first.
+Three further points of comparison against real mira's `DiffusionTransformer` were checked, and
+only one is a genuine open divergence: an extra, unconditioned `LayerNorm` before the output
+projection with no equivalent in real mira. The other two — AdaLN conditioning hardcoded onto the
+attention sublayers, and clean-past conditioning unconditionally on — were flagged earlier as
+divergences because real mira's *Python class defaults* are off for both. But real mira's actual
+*shipped, trained-with* config overrides both to on (`ada_attn_ln: true`, `use_clean_past: true`
+in its `configs/model/latent_world_model.yaml`) — so mini_mira hardcoding them on actually matches
+what real mira trains with in practice; the class defaults were never the recipe. Only the extra
+final `LayerNorm` remains open, and it's low-risk either way — not urgent to fix.
 
 Resuming a codec checkpoint into a *new* fine-tune phase (different resolution/LR/step budget
 than the checkpoint was originally trained under) surfaced a real, general bug class in this
@@ -502,6 +505,34 @@ A real, since-fixed correctness bug and a real, since-fixed memory leak were als
 local GPU to run the codec training loop itself on).
 
 Remaining gaps are the ones listed in Scope above: no autoregressive rollout, no streaming
-inference, world-model training not yet exercised past its first smoke test, the three
-world-model architectural divergences from real mira noted above, and no quantitative held-out
-evaluation for the codec (training-loss and qualitative previews only).
+inference, and the one remaining world-model architectural divergence from real mira noted above
+(the extra final `LayerNorm`). Quantitative held-out codec evaluation is no longer a gap — see
+`scripts/evaluate_codec.py` above.
+
+Several safety-net and efficiency fixes landed in `train_world_model.py` ahead of a real
+(non-smoke-test) run:
+- **Checkpoint provenance**: a checkpoint now records which codec checkpoint and latent-stats
+  values it was trained against, and `--resume` warns (doesn't block) if a future run pairs it with
+  different ones — closes the same class of silent-mismatch risk that caused the codec's
+  LR-schedule continuity bug.
+- **RNG state and dataloader position are now both saved/restored across `--resume`**: a resumed
+  run continues the same random stream (noise/tau draws) and fast-forwards a fresh dataloader past
+  already-consumed batches, instead of silently restarting both from scratch every relaunch. The
+  dataloader fast-forward relies on `create_loader`'s un-seeded default (fixed seed, single
+  process) staying un-overridden — documented at the call site.
+- **Eval no longer redoes the same decode+DINO pass 2-3 times per batch**: `compute_drift_metrics`,
+  `compute_full_eval_metrics`, and rollout-video rendering now all share one
+  `eval_metrics.decode_and_dino(...)` call instead of each decoding/DINO-ing independently.
+- **RoPE tables are now cached** on the `DiffusionTransformer` instance instead of rebuilt on every
+  forward call — they only depend on (height, width, frame count), which are constant for the
+  whole life of a model instance.
+- **`--precision` flag added** (`fp16-hybrid` / `bf16`, default `bf16`), matching `train_codec.py`'s
+  own flag. Previously hardcoded to `fp16-hybrid` + GradScaler unconditionally, a leftover of the
+  project's old V100-only workaround — the codec script itself moved to a plain-`bf16`-by-default
+  setup once the project moved to a GPU with native bf16 tensor cores, but the world-model script
+  never got the same update until now.
+
+An `--activation-checkpointing` flag (no equivalent exists for the world model at all yet — no
+KV-cache, full temporal attention every layer) was scoped but deliberately held back until the
+supervisor confirms a real batch-size/resolution target for this run, since that's what would
+determine whether it's actually needed.
