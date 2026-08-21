@@ -68,10 +68,10 @@ ratio (1.82), not picked by feel. Fast verification scripts instead use `configs
 **Codec**: step 3,999 of training, full resolution (288×512, 40-frame clips), real Rocket League
 data, real mira's cosine LR schedule and three-term loss (L1 + LPIPS + DINO latent-consistency).
 Real held-out evaluation on 20 clips it never trained on (`scripts/evaluate_codec.py`):
-`PSNR 19.56dB, SSIM 0.552, LPIPS 0.486` — reads as "poor" by standard external benchmarks. The
-supervisor reviewed training curves and preview videos (not these numbers) and called it
-"genuinely decent and good." Real mira's own recipe for this component runs 250,001 steps — we're
-at roughly 1.6% of that, which is the most likely explanation for the quality gap.
+`PSNR 19.56dB, SSIM 0.552, LPIPS 0.486` — reads as "poor" by standard external benchmarks, though
+an earlier read based on training curves and preview videos alone (not these numbers) judged it
+"genuinely decent." Real mira's own recipe for this component runs 250,001 steps — we're at
+roughly 1.6% of that, which is the most likely explanation for the quality gap.
 
 ![Decoder reconstruction preview](assets/decoder_preview.gif)
 
@@ -83,7 +83,7 @@ hardware**, including multi-session `--resume` — RNG state, dataloader positio
 codec/latent-stats provenance all persist and were verified in a real two-phase smoke test (fresh
 run → resume). Two real bugs were found and fixed this way (a list-vs-tensor crash in drift-metric
 eval, a device-mismatch crash in rollout video rendering) — the kind reading-only verification
-can't catch. Real (full-scale) training hasn't started yet — waiting on a supervisor-set
+can't catch. Real (full-scale) training hasn't started yet — waiting on a confirmed
 step-count/batch-size target. One open architectural divergence from real mira remains (an extra,
 unconditioned final `LayerNorm`) — low-risk, not urgent to fix.
 
