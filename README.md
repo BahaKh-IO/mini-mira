@@ -73,7 +73,7 @@ supervisor reviewed training curves and preview videos (not these numbers) and c
 "genuinely decent and good." Real mira's own recipe for this component runs 250,001 steps — we're
 at roughly 1.6% of that, which is the most likely explanation for the quality gap.
 
-<video controls width="480" src="assets/decoder_preview.mp4"></video>
+![Decoder reconstruction preview](assets/decoder_preview.gif)
 
 **World model**: `scripts/train_world_model.py` fully implements real mira's diagonal
 flow-matching loss (+ optional PSD self-distillation), real action conditioning from real streamed
