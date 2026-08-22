@@ -83,9 +83,11 @@ hardware**, including multi-session `--resume` — RNG state, dataloader positio
 codec/latent-stats provenance all persist and were verified in a real two-phase smoke test (fresh
 run → resume). Two real bugs were found and fixed this way (a list-vs-tensor crash in drift-metric
 eval, a device-mismatch crash in rollout video rendering) — the kind reading-only verification
-can't catch. Real (full-scale) training hasn't started yet — waiting on a confirmed
-step-count/batch-size target. One open architectural divergence from real mira remains (an extra,
-unconditioned final `LayerNorm`) — low-risk, not urgent to fix.
+can't catch. Real (full-scale) training config is now confirmed — `--batch-size 4
+--grad-accum-steps 4` (effective batch 16), full resolution, `--precision bf16` — and the first
+real training run is launching, time-boxed rather than left running indefinitely given the shared,
+rotating GPU access this project runs on. One open architectural divergence from real mira remains
+(an extra, unconditioned final `LayerNorm`) — low-risk, not urgent to fix.
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
