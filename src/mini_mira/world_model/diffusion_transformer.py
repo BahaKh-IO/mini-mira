@@ -28,6 +28,11 @@ class LatentWorldModelConfig:
     # tau_delta embedding below.
     psd_loss_prob: float = 0.0
     psd_weight: float = 0.0
+    # Scheduled sampling: probability of training on a self-generated (not real) clean_past, so
+    # the model practices the same imperfect-reference situation it actually faces at rollout
+    # time. Not a mira field -- mira's own shipped config doesn't have this either. Off by
+    # default; see LatentWorldModel._fake_shifted_z for the mechanism.
+    scheduled_sampling_prob: float = 0.0
 
     @property
     def psd_enabled(self) -> bool:

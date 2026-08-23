@@ -184,8 +184,26 @@ class LatentWorldModel(nn.Module):
         bos = self.bos.view(1, 1, c, 1, 1).expand(b, 1, c, h, w)
         return torch.cat([bos, z[:, :-1]], dim=1)
 
+    def _fake_shifted_z(self, z: torch.Tensor, a: torch.Tensor, shifted_z: torch.Tensor) -> torch.Tensor:
+        """Scheduled sampling: a cheap, single-step self-generated estimate of clean_past, so
+        training occasionally sees the same kind of imperfect reference a real rollout actually
+        produces, instead of always-real. One extra no-grad forward pass, not a full recursive
+        rollout -- this auxiliary pass still conditions on the real shifted_z; only its output
+        becomes this step's clean_past. Same one-step flow-matching estimate rollout's own
+        integration uses: z_1 ~= z_t + (1 - tau) * predicted_velocity."""
+        with torch.no_grad():
+            tau_aux = self.sample_training_tau(z)
+            z_t_aux = tau_aux * z + (1 - tau_aux) * torch.randn_like(z)
+            pred_v_aux = self.world_model(z_t_aux, a=a, tau=tau_aux, clean_past=shifted_z)
+            z_1_estimate = z_t_aux + (1 - tau_aux) * pred_v_aux
+        return self._shifted_z(z_1_estimate)
+
     def diffusion_loss(self, z: torch.Tensor, a: torch.Tensor) -> dict[str, torch.Tensor]:
         shifted_z = self._shifted_z(z)
+        if self.world_model_config.scheduled_sampling_prob > 0:
+            use_fake_past = torch.rand((), device=z.device) < self.world_model_config.scheduled_sampling_prob
+            if use_fake_past:
+                shifted_z = self._fake_shifted_z(z, a, shifted_z)
 
         z_t, v, tau = self.prepare_training_inputs(z)
         pred_v = self.world_model(z_t, a=a, tau=tau, clean_past=shifted_z)

@@ -1,9 +1,10 @@
 """CPU-friendly mechanism proof that the world model trains, mirroring verify_codec_training.py's
-role for the codec: no real weights, no network, no GPU. Four checks in one script:
+role for the codec: no real weights, no network, no GPU. Five checks in one script:
   1. Overfit a fixed batch; loss_total must drop substantially.
   2. Frozen-vs-trainable gradient isolation after one backward pass.
   3. PSD self-distillation mechanism (both psd_weight and psd_loss_prob variants).
-  4. Checkpoint save/load round-trip.
+  4. Scheduled sampling (self-generated clean_past) mechanism.
+  5. Checkpoint save/load round-trip.
 
 Uses codec_checkpoint=None (random-init frozen bottleneck/decoder, same convention as
 LatentWorldModel's own docstring) and a local _FakeDino stand-in instead of the real DinoModel --
@@ -155,7 +156,27 @@ print(
     f"loss_psd={out_psd_prob['loss_psd'].item():.6e} loss_total={out_psd_prob['loss_total'].item():.6f}"
 )
 
-# --- Check 4: checkpoint save/load round-trip (reuses the trained model from checks 1-2) ---
+# --- Check 4: scheduled sampling (self-generated clean_past) mechanism ---
+sched_config = LatentWorldModelConfig(
+    hidden_dim=32, depth=2, num_heads=2, mlp_dim_multiplier=2, scheduled_sampling_prob=1.0
+)
+model_sched = _build_model(sched_config)
+z_sched, a_sched = model_sched._encode(batch)
+real_shifted = model_sched._shifted_z(z_sched)
+fake_shifted = model_sched._fake_shifted_z(z_sched, a_sched, real_shifted)
+assert fake_shifted.shape == real_shifted.shape, "fake clean_past must match real clean_past's shape"
+assert not torch.allclose(fake_shifted, real_shifted), (
+    "fake clean_past should differ from the real one -- it's built from a noised intermediate, not real data"
+)
+
+out_sched = model_sched(batch)  # scheduled_sampling_prob=1.0 -- always taken, not stochastic here
+assert torch.isfinite(out_sched["loss_total"]), "scheduled_sampling_prob=1.0 produced a non-finite loss"
+print(
+    f"[PASS] scheduled sampling (prob=1.0): loss_total={out_sched['loss_total'].item():.4f}, "
+    f"fake clean_past shape={tuple(fake_shifted.shape)}, confirmed different from real clean_past"
+)
+
+# --- Check 5: checkpoint save/load round-trip (reuses the trained model from checks 1-2) ---
 torch.manual_seed(123)
 with torch.no_grad():
     loss_before = model(batch)["loss_total"].item()
