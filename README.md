@@ -78,11 +78,22 @@ roughly 1.6% of that, which is the most likely explanation for the quality gap.
 **World model**: `scripts/train_world_model.py` fully implements real mira's diagonal
 flow-matching loss (+ optional PSD self-distillation), real action conditioning from real streamed
 key-press data, checkpointing, and a full eval suite (drift metrics, Frechet DINO/Inception
-Distance, PSNR, LPIPS, SSIM, rendered rollout videos). **Confirmed working end-to-end on real GPU
-hardware**, including multi-session `--resume` — RNG state, dataloader position, and
-codec/latent-stats provenance all persist and were verified in a real two-phase smoke test (fresh
-run → resume). Two real bugs were found and fixed this way (a list-vs-tensor crash in drift-metric
-eval, a device-mismatch crash in rollout video rendering) — the kind reading-only verification
+Distance, PSNR, LPIPS, SSIM, rendered rollout videos). **First real, multi-hour training run
+completed**: ~2,900 steps over ~11 hours on real data, real measured improvement (SSIM 0.48→0.65,
+LPIPS 0.59→0.40, Frechet DINO/Inception Distance both dropped by more than half). Also surfaced a
+real, concrete finding: quality degrades the deeper into a self-generated rollout it goes (e.g.
+Frechet DINO Distance 2.6 right after context vs. 26.6 by 28 frames deep — confirmed visually too,
+not just numerically) — the expected consequence of `clean_past` only ever being real during
+training but partly self-generated during rollout. Two things added in response: a `timeout`-safe
+`SIGTERM` handler (graceful checkpoint save + wandb sign-off instead of an abrupt kill), and
+opt-in **scheduled sampling** (`--scheduled-sampling-prob`, default off) — occasionally trains on
+a self-generated `clean_past` instead of always-real, directly targeting that gap. Not yet run on
+real hardware, verified so far only via `verify_world_model_training.py`'s CPU mechanism check.
+Confirmed working end-to-end on real GPU hardware before that, including multi-session `--resume`
+— RNG state, dataloader position, and codec/latent-stats provenance all persist and were verified
+in a real two-phase smoke test (fresh run → resume). Two real bugs were found and fixed this way
+(a list-vs-tensor crash in drift-metric eval, a device-mismatch crash in rollout video rendering)
+— the kind reading-only verification
 can't catch. Real (full-scale) training config is now confirmed — `--batch-size 4
 --grad-accum-steps 4` (effective batch 16), full resolution, `--precision bf16` — and the first
 real training run is launching, time-boxed rather than left running indefinitely given the shared,
@@ -140,14 +151,16 @@ contract; RoPE (temporal + axial spatial); QK-norm and mira-matching weight init
 conditioning on `tau`, clean-past, and actions; flow-matching sampling; the real, frozen DINOv3
 backbone with real pretrained weights; **real codec training** on real data with the real loss,
 adaptive loss balancing, and checkpoint save/resume; **real world-model training mechanism** with
-real flow-matching + PSD loss, real action-conditioned data, and a full eval suite.
+real flow-matching + PSD loss, real action-conditioned data, a full eval suite, and opt-in
+scheduled sampling for rollout-depth robustness.
 
 **Deliberately simplified / not yet implemented** (disclosed decisions, not gaps found later):
 - Actions are keyboard keys only, no mouse — matches the real released data, which has no real
   mouse signal either. Also simplified vs. mira's `ActionEncoder`: no dropout, mean-pooling instead
   of a learned temporal pool, plain `Linear` instead of mira's per-key dimension split.
-- No true autoregressive rollout during training — `clean_past` always comes from real encoded
-  input (teacher forcing), never the model's own previous output.
+- `clean_past` is real encoded input by default (never the model's own previous output) — matches
+  mira's own default too. `--scheduled-sampling-prob` opts into training on a self-generated
+  estimate instead, some fraction of the time; off unless explicitly set.
 - No streaming inference / KV-cache — every diffusion step recomputes the whole sequence.
 - No grouped-query attention — always as many KV heads as query heads.
 - One shared implementation where the real repo has two separate ones (codec vs. world model) for
