@@ -32,6 +32,7 @@ handful of times across a run.
 
 import argparse
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -57,6 +58,20 @@ from mini_mira.world_model.rollout_visualization import log_rollout_videos, rend
 def _autocast(precision: str) -> torch.autocast:
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
+
+
+# Set by _request_shutdown, checked once per completed optimizer step. `timeout` (used to
+# time-box long unattended runs, see README) sends SIGTERM with no warning -- without this, the
+# process just dies wherever it happens to be, losing up to --checkpoint-every steps of progress
+# and leaving wandb with no clean sign-off (shows "Crashed" even when nothing actually broke).
+# A signal handler must stay minimal (no CUDA/file I/O directly inside it), so this only sets a
+# flag; the actual save happens in the main loop once it's safe to do so.
+_shutdown_requested = False
+
+
+def _request_shutdown(signum, frame) -> None:
+    global _shutdown_requested
+    _shutdown_requested = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,6 +113,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--psd-weight", type=float, default=0.0, help="Deterministic PSD (mira default: 0.0)")
     parser.add_argument("--psd-loss-prob", type=float, default=0.0, help="Stochastic PSD (mira default: 0.0)")
+    parser.add_argument(
+        "--scheduled-sampling-prob", type=float, default=0.0,
+        help="Probability of training on a self-generated (not real) clean_past -- not a mira "
+        "flag, added here to address the rollout-depth quality drift found in real training. "
+        "Off by default. See LatentWorldModel._fake_shifted_z.",
+    )
 
     parser.add_argument("--eval-batch-size", type=int, default=None, help="Default: --batch-size")
     parser.add_argument("--val-every", type=int, default=None, help="Default: steps // 50")
@@ -234,6 +255,9 @@ def run_full_eval(
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
     args = parse_args()
     config = load_pipeline_config(args.config)
     # CLI is authoritative over the YAML preset's own psd_weight/psd_loss_prob (both default 0.0
@@ -241,6 +265,7 @@ def main() -> None:
     # loaded config" convention train_codec.py uses for --loss-mae-weight.
     config.world_model.psd_weight = args.psd_weight
     config.world_model.psd_loss_prob = args.psd_loss_prob
+    config.world_model.scheduled_sampling_prob = args.scheduled_sampling_prob
 
     temporal_stride = config.bottleneck.temporal_stride
     assert args.frames % temporal_stride == 0, (
@@ -377,6 +402,22 @@ def main() -> None:
     # matches real mira's own WorldModelMetrics lazy-construction pattern.
     full_eval_metrics: FullEvalMetrics | None = None
 
+    def _save_checkpoint_now(step: int) -> None:
+        save_checkpoint(
+            ckpt_path, step, model.world_model, model.action_encoder, model.bos, optimizer, lr_scheduler,
+            grad_scaler, wandb_run_id,
+            codec_checkpoint=args.codec_checkpoint,
+            latent_mean=latent_stats["latent_mean"], latent_std=latent_stats["latent_std"],
+            dataloader_batches_consumed=batches_consumed,
+        )
+        if args.hf_backup_repo:
+            from huggingface_hub import HfApi  # noqa: PLC0415 -- optional dep, only used here
+
+            HfApi().upload_file(
+                path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint.pth",
+                repo_id=args.hf_backup_repo, repo_type="model",
+            )
+
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
         accumulated: dict[str, float] = {}
@@ -393,6 +434,20 @@ def main() -> None:
         grad_scaler.update()
         lr_scheduler.step()
 
+        # Checked here, right after a step fully lands and before any of this step's own
+        # (potentially slow) eval work -- prioritizes actually getting the save done inside
+        # `timeout`'s kill-after grace period over finishing this step's logging/eval first. Not
+        # airtight: a signal arriving mid-eval (the slowest single thing this loop does) could
+        # still race the grace period, but that's a narrow window against 11 hours of runtime.
+        if _shutdown_requested:
+            print(f"Shutdown signal received at step {step} -- saving and exiting cleanly.")
+            _save_checkpoint_now(step)
+            if wandb_enabled:
+                import wandb  # noqa: PLC0415
+
+                wandb.finish()
+            return
+
         current_lr = optimizer.param_groups[0]["lr"]
         if (step + 1) % console_log_every == 0 or step == start_step:
             term_str = ", ".join(f"{k}={v:.4f}" for k, v in accumulated.items() if k != "loss_total")
@@ -405,20 +460,7 @@ def main() -> None:
 
         is_last = step == args.steps - 1
         if (step + 1) % checkpoint_every == 0 or is_last:
-            save_checkpoint(
-                ckpt_path, step, model.world_model, model.action_encoder, model.bos, optimizer, lr_scheduler,
-                grad_scaler, wandb_run_id,
-                codec_checkpoint=args.codec_checkpoint,
-                latent_mean=latent_stats["latent_mean"], latent_std=latent_stats["latent_std"],
-                dataloader_batches_consumed=batches_consumed,
-            )
-            if args.hf_backup_repo:
-                from huggingface_hub import HfApi  # noqa: PLC0415 -- optional dep, only used here
-
-                HfApi().upload_file(
-                    path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint.pth",
-                    repo_id=args.hf_backup_repo, repo_type="model",
-                )
+            _save_checkpoint_now(step)
 
         if (step + 1) % val_every == 0 or is_last:
             run_validation(
