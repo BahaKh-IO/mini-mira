@@ -35,6 +35,10 @@ VJEPA_REPO_URL = "https://github.com/facebookresearch/vjepa2.git"
 VJEPA_BASE_URL_FIX = "https://dl.fbaipublicfiles.com/vjepa2"
 VJEPA_DIM_EXPECTED = 768  # sanity check only -- source of truth is encoder.embed_dim
 
+# ViT-B's own hierarchical_layers (app/vjepa_2_1/models/vision_transformer.py) -- the only valid
+# out_layers indices for this model. Same indices as DinoModel's own DEFAULT_DINO_LAYERS["dinov3_vitb16"].
+DEFAULT_VJEPA_LAYERS = (2, 5, 8, 11)
+
 
 def _vjepa_repo_dir() -> Path:
     repo_dir = Path(torch.hub.get_dir()) / "facebookresearch_vjepa2_main"
@@ -68,15 +72,27 @@ def _load_vjepa_encoder_fn():
 
 
 class VjepaModel(nn.Module):
-    """Frozen V-JEPA 2.1 ViT-B feature extractor, encoder only. No dino_model/last_layer_only/
-    layer_indices params -- one variant, single-layer only (multi-layer aggregation deferred).
-    V-JEPA 2.1 isn't gated, so require_pretrained just toggles the real download.
+    """Frozen V-JEPA 2.1 ViT-B feature extractor, encoder only. One variant, so no dino_model
+    param. last_layer_only/layer_indices mirror DinoModel's own interface -- unlike DINO, V-JEPA
+    picks layers at construction time (out_layers=...), not per forward call. V-JEPA 2.1 isn't
+    gated, so require_pretrained just toggles the real download.
     """
 
-    def __init__(self, require_pretrained: bool = True):
+    def __init__(
+        self,
+        require_pretrained: bool = True,
+        last_layer_only: bool = True,
+        layer_indices: tuple[int, ...] | None = None,
+    ):
         super().__init__()
+        if last_layer_only and layer_indices is not None:
+            raise ValueError("VjepaModel: pass either last_layer_only=True OR layer_indices=(...), not both.")
+        self.layers = layer_indices if layer_indices is not None else (
+            None if last_layer_only else DEFAULT_VJEPA_LAYERS
+        )
+
         encoder_fn = _load_vjepa_encoder_fn()
-        self.encoder, _predictor = encoder_fn(pretrained=require_pretrained)
+        self.encoder, _predictor = encoder_fn(pretrained=require_pretrained, out_layers=self.layers)
         del _predictor
 
         self.dino_dim = self.encoder.embed_dim
@@ -99,8 +115,11 @@ class VjepaModel(nn.Module):
     def image_normalization(self, x: Tensor) -> Tensor:
         return (x - self.mean) / self.std
 
-    def dino_forward(self, x: Tensor) -> Tensor:
-        """x: (b, t, 3, h, w) in [0, 1]. Returns (b, t // tubelet_size, dino_dim, h', w')."""
+    def dino_forward(self, x: Tensor) -> Tensor | list[Tensor]:
+        """x: (b, t, 3, h, w) in [0, 1]. Returns (b, t // tubelet_size, dino_dim, h', w') for the
+        default single-layer case, or a list of that shape (one per entry in self.layers) when
+        built with last_layer_only=False.
+        """
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
             b, t, _, h, w = x.shape
             assert t >= self.tubelet_size, f"t={t} < tubelet_size={self.tubelet_size}"
@@ -111,11 +130,18 @@ class VjepaModel(nn.Module):
             x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
             x = rearrange(x, "(b t) c h w -> b c t h w", b=b, t=t)
 
-            tokens = self.encoder(x)  # (b, t' * h' * w', dino_dim), T-major flat order (confirmed
+            tokens = self.encoder(x)  # Tensor if self.layers is None, else list[Tensor] -- one
+            # per requested layer, each (b, t' * h' * w', dino_dim), T-major flat order (confirmed
             # via PatchEmbed3D.forward: proj(x).flatten(2).transpose(1, 2) on a (B,C,T',H',W') tensor)
 
             t_prime = t // self.tubelet_size
             h_prime = new_h // self.patch_size
             w_prime = new_w // self.patch_size
-            features = tokens.reshape(b, t_prime, h_prime, w_prime, self.dino_dim)
-            return rearrange(features, "b t h w c -> b t c h w")
+
+            def _to_dino_shape(tok: Tensor) -> Tensor:
+                features = tok.reshape(b, t_prime, h_prime, w_prime, self.dino_dim)
+                return rearrange(features, "b t h w c -> b t c h w")
+
+            if isinstance(tokens, list):
+                return [_to_dino_shape(tok) for tok in tokens]
+            return _to_dino_shape(tokens)

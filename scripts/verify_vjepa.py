@@ -47,4 +47,13 @@ with torch.no_grad():
     assert out.std().item() > 0.0, f"V-JEPA features look degenerate (std={out.std().item():.6f})"
     print(f"[PASS] output is finite and non-degenerate: mean={out.mean().item():.4f}, std={out.std().item():.4f}")
 
+    # --- multi-layer mode (last_layer_only=False) ---
+    vjepa_multi = VjepaModel(require_pretrained=False, last_layer_only=False)
+    multi_out = vjepa_multi.dino_forward(video)
+    assert isinstance(multi_out, list), f"expected list, got {type(multi_out)}"
+    assert len(multi_out) == 4, f"expected 4 layers (2,5,8,11), got {len(multi_out)}"
+    for f in multi_out:
+        assert f.shape == expected, f"layer got {f.shape}, expected {expected}"
+    print(f"[PASS] multi-layer mode: {len(multi_out)} layers, each {tuple(multi_out[0].shape)}")
+
 print("\nAll V-JEPA 2.1 checks passed.")
