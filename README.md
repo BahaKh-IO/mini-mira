@@ -87,8 +87,10 @@ not just numerically) — the expected consequence of `clean_past` only ever bei
 training but partly self-generated during rollout. Two things added in response: a `timeout`-safe
 `SIGTERM` handler (graceful checkpoint save + wandb sign-off instead of an abrupt kill), and
 opt-in **scheduled sampling** (`--scheduled-sampling-prob`, default off) — occasionally trains on
-a self-generated `clean_past` instead of always-real, directly targeting that gap. Not yet run on
-real hardware, verified so far only via `verify_world_model_training.py`'s CPU mechanism check.
+a self-generated `clean_past` instead of always-real, directly targeting that gap. Verified via
+`verify_world_model_training.py`'s CPU mechanism check; a second real run (resuming the first
+run's checkpoint, `--scheduled-sampling-prob 0.3`) is prepared to test whether it narrows the
+rollout-depth-degradation curve, launch not yet confirmed.
 Confirmed working end-to-end on real GPU hardware before that, including multi-session `--resume`
 — RNG state, dataloader position, and codec/latent-stats provenance all persist and were verified
 in a real two-phase smoke test (fresh run → resume). Two real bugs were found and fixed this way
