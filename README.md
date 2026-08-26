@@ -176,6 +176,22 @@ bar `verify_codec_training.py` itself uses. `loss_dino_latent_consistency` itsel
 gradient 4-8x; the auto-balancing mechanism visibly compensating, its weight climbing 36.2→47.0, is
 this working as designed, not a new problem).
 
+**Supervisor directive: train V-JEPA at native resolution (720×1280), not the 288×512 downscale —
+V-JEPA track only, DINO untouched.** No code change needed: `resize_to_canonical` (shared with
+DINO, in `video_prep.py`) already no-ops once `--height`/`--width` match a clip's real shape, so
+passing `--height 720 --width 1280` on the V-JEPA launch is the entire change. `MyBottleneck`
+(strided-conv, no absolute-position assumption) and the decoder (RoPE) are both already
+resolution-agnostic, confirmed by reading the code, and V-JEPA 2.1's own sincos position
+embeddings interpolate to arbitrary input shapes internally. Real, unresolved cost: native is
+6.25x the pixel count of 288×512 (18×32=576 patches/frame vs. 45×80=3600, at V-JEPA's real
+`patch_size=16`) — attention memory shouldn't blow up quadratically (V-JEPA uses
+`F.scaled_dot_product_attention`'s flash/memory-efficient backend) but attention **compute**
+still scales ~quadratically with token count, and every pixel-domain module (decoder, LPIPS/VGG16,
+raw MAE/L1) scales directly with the 6.25x pixel count regardless. Expect a real jump past
+V-JEPA's already-measured ~32.5GB at 288×512 — not yet measured for real at native resolution;
+a short probe run is the next step before committing the full 4,000-step budget to it (see
+`notes/vjepa_next_session.md`).
+
 `train_codec_vjepa.py` now has the same `SIGTERM`/`SIGINT` handling `train_world_model.py` already
 had (graceful checkpoint save + forced HF upload + wandb sign-off instead of an abrupt kill) —
 `train_codec.py`, its un-forked DINO-track sibling, still lacks this, a pre-existing gap left as-is.
