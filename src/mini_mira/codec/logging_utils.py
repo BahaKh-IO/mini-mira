@@ -79,7 +79,16 @@ def log_preview(
             preview_dir = Path(output_dir)
             preview_dir.mkdir(parents=True, exist_ok=True)
             video_path = preview_dir / f"step_{step:06d}.mp4"
-            iio.imwrite(video_path, video, fps=fps, codec="libx264", pixelformat="yuv420p")
+            # crf=18 explicitly -- without it this silently fell back to ffmpeg's own default
+            # (~23), visibly compressed (confirmed for real: a raw frame logged separately looked
+            # clean, the same frame through this encoder looked bad -- an encoding artifact, not a
+            # data bug). 18 is the standard "visually excellent" x264 choice; these are short
+            # diagnostic clips, not archival footage, so the larger file size costs nothing that
+            # matters here, and misleading compression artifacts on a quality judgment call do.
+            iio.imwrite(
+                video_path, video, fps=fps, codec="libx264", pixelformat="yuv420p",
+                output_params=["-crf", "18"],
+            )
             print(f"Saved preview to {video_path}")
         except Exception as exc:  # media encoding must never discard a completed optimizer step
             video_path = None
