@@ -228,6 +228,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/train_codec.py` | Real GPU codec training |
 | `scripts/train_codec_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` in place of `DinoModel` |
 | `scripts/verify_codec_training_vjepa.py` | Mechanism proof the V-JEPA-track codec trains (synthetic data, no GPU needed) |
+| `scripts/overfit_one_clip_vjepa.py` | Real-data, real-GPU diagnostic: overfit one real clip, wandb only, no checkpoints |
 | `scripts/reconstruct.py` | Mechanism smoke test: runs a video through the codec (random-init weights) |
 | `scripts/evaluate_codec.py` | Real quantitative eval of a trained codec checkpoint on held-out data |
 | `scripts/compute_latent_stats.py` | One-shot latent mean/std computation, feeds `train_world_model.py` |
