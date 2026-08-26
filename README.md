@@ -146,7 +146,7 @@ the same HF repo. One flag pair has no V-JEPA equivalent and was dropped rather 
 `--perceptual-dino-model`/`--perceptual-dino-multilayer` swap in a second, differently-sized DINO
 variant for the consistency-loss term, and V-JEPA 2.1 only has the one variant.
 
-**Two real bugs found and fixed**, only surfaced by actually running the training mechanism
+**Three real bugs found and fixed**, only surfaced by actually running the training mechanism
 end to end (`scripts/verify_codec_training_vjepa.py`, new — same overfit-one-video proof
 `verify_codec_training.py` uses for the DINO track), not by reading the code:
 - `VjepaModel.dino_forward` crashed on fewer than `tubelet_size` (2) frames — `CodecLoss`'s
@@ -157,15 +157,23 @@ end to end (`scripts/verify_codec_training_vjepa.py`, new — same overfit-one-v
 - `CodecLoss` assumed a pixel-space frame index always equals a feature-space frame index — true
   for `DinoModel` (frame count in = frame count out) but not V-JEPA (halves it). Fixed in `loss.py`:
   target-feature lookup now remaps indices by the encoder's own reduction ratio (inferred from
-  tensor shapes, not a hardcoded per-backbone constant — a no-op for DinoModel, ratio 1 always),
-  and predicted/target features are trimmed to matching lengths before comparison when a random,
-  not-necessarily-adjacent frame subset folds to different lengths on each side.
+  tensor shapes, not a hardcoded per-backbone constant — a no-op for DinoModel, ratio 1 always).
+- The same term flattened batch and selected-frame together before chunking, so a chunk could
+  straddle two *different videos* in the batch — invisible for `DinoModel` (no cross-frame
+  interaction at all) but silently wrong for V-JEPA, which would pair the last selected frame of
+  one video with the first frame of a completely different one and treat it as real motion. Silent,
+  no crash — dormant at today's real 40-frame default settings by coincidence (the random selection
+  size happens to be even), live the moment `--frames` or `--perceptual-chunk-size` changes to
+  almost any other value. Fixed in `loss.py` by chunking within each video's own selected frames
+  only, never across videos — confirmed directly: instrumented the real encoder call and proved,
+  under the exact conditions that reproduced the bug (odd selection size, small chunk size), zero
+  calls mix two videos, across 6 real calls.
 
-Verified for real: a 100-step overfit run (batch=2, 16 frames — large enough to exercise both bugs'
-trigger conditions, unlike a smaller test) drops `loss_total` 56.4%, matching the same >50% bar
-`verify_codec_training.py` itself uses. `loss_dino_latent_consistency` itself barely moves
+Verified for real: a 100-step overfit run (batch=2, 16 frames — large enough to exercise all three
+bugs' trigger conditions, unlike a smaller test) drops `loss_total` 57.7%, matching the same >50%
+bar `verify_codec_training.py` itself uses. `loss_dino_latent_consistency` itself barely moves
 (expected — matches the DINO track's own already-documented finding that MAE dominates this term's
-gradient 4-8x; the auto-balancing mechanism visibly compensating, its weight climbing 36.5→45.5, is
+gradient 4-8x; the auto-balancing mechanism visibly compensating, its weight climbing 36.2→47.0, is
 this working as designed, not a new problem).
 
 What's still ahead: `compute_latent_stats.py` and `evaluate_codec.py` each need the same fork once
