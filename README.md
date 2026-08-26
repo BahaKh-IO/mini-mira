@@ -158,9 +158,11 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/verify_dino.py` | Behavioral checks for the real DINOv3 backbone (needs gated weights) |
 | `scripts/verify_vjepa.py` | Behavioral checks for the real V-JEPA 2.1 backbone (ungated, no weights needed to set up first) |
 | `scripts/test_dino.py` | Raw DINOv3 sanity check, bypassing `DinoModel` |
-| `src/mini_mira/ml/config_loading.py` | Builds a `PipelineConfig` from a YAML preset |
+| `src/mini_mira/ml/config_loading.py` | Builds a `PipelineConfig` (architecture) or a run-config (hyperparameters) from YAML |
+| `src/mini_mira/ml/run_config.py` | `WorldModelRunConfig`/`CodecRunConfig` — the hyperparameter axis, loaded via `--run-config` |
 | `configs/small.yaml` | Fast-test preset, mirrors class defaults |
 | `configs/scaled_300m.yaml` | ~300M-param target preset |
+| `configs/runs/` | Real `--run-config` examples (hyperparameters — batch size, steps, eval cadence, ...) |
 | `scripts/verify_codec_training.py` | Mechanism proof the codec trains (synthetic data, no GPU needed) |
 | `scripts/download_shards.py` | Downloads real Rocket League shards from `kyutai/rocket-science` |
 | `scripts/train_codec.py` | Real GPU codec training |
@@ -170,6 +172,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/train_world_model.py` | Real GPU world-model training |
 | `scripts/verify_world_model_training.py` | CPU mechanism proof for `train_world_model.py` |
 | `scripts/verify_full_eval_metrics.py` | CPU mechanism proof for the full eval suite |
+| `scripts/verify_run_config.py` | CPU mechanism proof for the `--run-config` system |
 
 ## Scope
 
@@ -247,7 +250,9 @@ python scripts/train_world_model.py --config configs/scaled_300m.yaml \
 ```
 
 `--help` on either script lists the full flag set (LR schedule, precision, PSD weights, eval
-cadence, checkpoint/resume, wandb/HF Hub backup).
+cadence, checkpoint/resume, wandb/HF Hub backup) — or skip retyping it every launch with
+`--run-config <path>` (see `configs/runs/` for real examples): any flag passed explicitly still
+overrides the file, and omitting `--run-config` entirely reproduces the exact defaults above.
 
 **Resume gotchas** (each has bitten this project for real at least once — see
 `notes/session_handoff.md` for the full writeup of each):
