@@ -122,6 +122,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
+        "--compile", action=argparse.BooleanOptionalAction, default=None,
+        help="torch.compile the trainable bottleneck+decoder (not the frozen V-JEPA encoder, "
+        "external repo code, real risk of graph breaks). Untested combined with "
+        "--activation-checkpointing -- verify separately before assuming both together work.",
+    )
+    parser.add_argument(
         "--perceptual-chunk-size", type=int, default=None,
         help="Frames per LPIPS/DINO loss forward (0 processes the selected frames together). Default 0",
     )
@@ -262,6 +268,21 @@ def main() -> None:
     if args.precision == "fp16-hybrid":
         for module in (bottleneck, decoder, loss_fn):
             _keep_convolutions_in_bf16(module)
+
+    # Trainable modules only -- vjepa is deliberately excluded (external, git-cloned
+    # facebookresearch/vjepa2 code, real risk of graph breaks on unfamiliar ops, not worth the
+    # risk for a frozen encoder that's already wrapped in its own bf16 autocast). Wrapping happens
+    # AFTER the fp16-hybrid monkey-patch above, not before -- torch.compile needs to see each
+    # module's real final forward, not have it swapped out from under it afterward.
+    # UNVERIFIED RISK, not yet tested on real GPU: torch.compile's OptimizedModule wrapper has a
+    # known history (version/config-dependent) of changing state_dict() key names (the
+    # "_orig_mod." prefix issue) -- before trusting --compile on a real --resume-able run, verify
+    # a save/load round-trip actually works (save a checkpoint compiled, confirm it loads clean
+    # both compiled and not). Not an issue for a short --compile-only throwaway probe that never
+    # saves/resumes a checkpoint.
+    if args.compile:
+        bottleneck = torch.compile(bottleneck)
+        decoder = torch.compile(decoder)
 
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)

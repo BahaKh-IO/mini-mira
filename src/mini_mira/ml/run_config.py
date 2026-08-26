@@ -59,6 +59,7 @@ class CodecRunConfig:
     grad_accum_steps: int = 1
 
     activation_checkpointing: bool = False
+    compile: bool = False  # V-JEPA-track only so far (train_codec_vjepa.py) -- see its own docstring
     perceptual_chunk_size: int = 0
     perceptual_dino_model: str | None = None
     perceptual_dino_multilayer: bool = False
