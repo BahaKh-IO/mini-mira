@@ -176,6 +176,13 @@ bar `verify_codec_training.py` itself uses. `loss_dino_latent_consistency` itsel
 gradient 4-8x; the auto-balancing mechanism visibly compensating, its weight climbing 36.2→47.0, is
 this working as designed, not a new problem).
 
+`train_codec_vjepa.py` now has the same `SIGTERM`/`SIGINT` handling `train_world_model.py` already
+had (graceful checkpoint save + forced HF upload + wandb sign-off instead of an abrupt kill) —
+`train_codec.py`, its un-forked DINO-track sibling, still lacks this, a pre-existing gap left as-is.
+Added ahead of the real training run on the newly rented GPU box, where an unattended `timeout`
+kill was judged worth guarding against rather than accepting the same risk DINO's own codec run
+already ran with successfully.
+
 What's still ahead: `compute_latent_stats.py` and `evaluate_codec.py` each need the same fork once
 there's a real V-JEPA codec checkpoint to point them at (not before — nothing to evaluate yet);
 then `train_world_model_vjepa.py`, forked the same way once that checkpoint exists; then a full
