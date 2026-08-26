@@ -5,9 +5,10 @@ latent world model for Rocket League, built on a representation-autoencoder (RAE
 flow-matching diffusion transformer. Reimplements [`mira-wm/mira`](https://github.com/mira-wm/mira)
 (Apache 2.0) end to end at a smaller scale, verified against the real source rather than assumed.
 
-**Current status**: the codec is in real training on real Rocket League data (step 3,999); the
-world model has a complete, real training script confirmed working end-to-end on real GPU
-hardware, but hasn't started its own real training run yet. See [Status](#status) below.
+**Current status**: the codec is frozen at step 3,999; the world model has completed two real
+training runs, through step 5,500, on top of it. A second, parallel track has also started —
+swapping the frozen DINOv3 backbone for V-JEPA 2.1, as a controlled benchmark against the DINO
+track rather than a replacement for it. See [Status](#status) below.
 
 ## What this is
 
@@ -88,19 +89,41 @@ training but partly self-generated during rollout. Two things added in response:
 `SIGTERM` handler (graceful checkpoint save + wandb sign-off instead of an abrupt kill), and
 opt-in **scheduled sampling** (`--scheduled-sampling-prob`, default off) — occasionally trains on
 a self-generated `clean_past` instead of always-real, directly targeting that gap. Verified via
-`verify_world_model_training.py`'s CPU mechanism check; a second real run (resuming the first
-run's checkpoint, `--scheduled-sampling-prob 0.3`) is prepared to test whether it narrows the
-rollout-depth-degradation curve, launch not yet confirmed.
+`verify_world_model_training.py`'s CPU mechanism check, then run for real: a second training run,
+resuming the first run's checkpoint with `--scheduled-sampling-prob 0.3`, reached **step 5,500**.
+Real improvement across every headline metric versus the first run's own final numbers (SSIM
+0.65→0.80, LPIPS 0.40→0.30, Frechet DINO Distance 10.3→3.86, Frechet Inception Distance
+112.9→92.66, PSNR broke its earlier flat/noisy pattern to reach 20.17dB), and the rollout-depth
+degradation itself narrowed from a roughly 10x shallow-to-deep blowup to roughly 2.6x, now
+plateauing instead of continuing to climb — encouraging, though not an isolated before/after (more
+training steps and a changed eval window happened in the same run). A real, separate obstacle
+surfaced getting that run started: `--resume` replays every already-consumed training batch before
+continuing (by design, so a resumed run doesn't silently re-see old data) — at ~2,900 steps' worth,
+that meant ~11,600 batches to replay, a real measured 9-46 hour wait for zero new training. Fixed
+by patching the one relevant checkpoint field (`dataloader_batches_consumed`) directly, nothing
+else touched.
 Confirmed working end-to-end on real GPU hardware before that, including multi-session `--resume`
 — RNG state, dataloader position, and codec/latent-stats provenance all persist and were verified
 in a real two-phase smoke test (fresh run → resume). Two real bugs were found and fixed this way
 (a list-vs-tensor crash in drift-metric eval, a device-mismatch crash in rollout video rendering)
 — the kind reading-only verification
-can't catch. Real (full-scale) training config is now confirmed — `--batch-size 4
---grad-accum-steps 4` (effective batch 16), full resolution, `--precision bf16` — and the first
-real training run is launching, time-boxed rather than left running indefinitely given the shared,
-rotating GPU access this project runs on. One open architectural divergence from real mira remains
-(an extra, unconditioned final `LayerNorm`) — low-risk, not urgent to fix.
+can't catch. Real (full-scale) training config is confirmed and proven across two real runs —
+`--batch-size 4 --grad-accum-steps 4` (effective batch 16), full resolution, `--precision bf16` —
+each time-boxed rather than left running indefinitely, given the shared, rotating GPU access this
+project runs on. One open architectural divergence from real mira remains (an extra, unconditioned
+final `LayerNorm`) — low-risk, not urgent to fix.
+
+**V-JEPA track**: a second, parallel pipeline, benchmarking V-JEPA 2.1 against the DINOv3 backbone
+above — not a replacement, and the DINO-track checkpoints stay untouched as the control. So far:
+`VjepaModel` (`src/mini_mira/codec/vjepa.py`), a frozen V-JEPA 2.1 ViT-B encoder shaped as a
+drop-in sibling to `DinoModel` (same `dino_forward`/`.dino_dim` contract), verified via
+`scripts/verify_vjepa.py`. Real facts confirmed live before writing it: V-JEPA 2.1 is ungated
+(unlike DINOv3), `embed_dim=768` (matches DINOv3-B exactly), and it halves the frame count
+internally (`tubelet_size=2` — `dino_forward` here returns `t // 2` frames, a genuine, documented
+deviation from `DinoModel`'s own contract). Multi-layer feature aggregation is supported too,
+matching `DinoModel`'s own interface and layer indices. Not yet wired into the bottleneck, loss,
+pipeline, or any training script — that's deliberately still ahead, along with retraining a codec
+and world model under it from scratch to actually run the benchmark.
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
@@ -124,6 +147,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `src/mini_mira/world_model/full_eval_metrics.py` | Frechet DINO/Inception Distance, PSNR, LPIPS, SSIM |
 | `src/mini_mira/world_model/rollout_visualization.py` | Renders rollout videos with an action HUD overlay |
 | `src/mini_mira/codec/dino.py` | Real, frozen DINOv3 backbone |
+| `src/mini_mira/codec/vjepa.py` | Real, frozen V-JEPA 2.1 backbone — `DinoModel`-shaped sibling |
 | `src/mini_mira/codec/loss.py` | Codec training loss: L1 + LPIPS + DINO latent-consistency |
 | `src/mini_mira/codec/video_prep.py` | Resizes/pads real clips to canonical shape |
 | `src/mini_mira/codec/checkpoint.py` | Save/resume for codec training |
@@ -132,6 +156,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/verify_rope.py` | Behavioral checks for RoPE |
 | `scripts/verify_conditioning.py` | Behavioral checks for AdaLN/clean-past/actions |
 | `scripts/verify_dino.py` | Behavioral checks for the real DINOv3 backbone (needs gated weights) |
+| `scripts/verify_vjepa.py` | Behavioral checks for the real V-JEPA 2.1 backbone (ungated, no weights needed to set up first) |
 | `scripts/test_dino.py` | Raw DINOv3 sanity check, bypassing `DinoModel` |
 | `src/mini_mira/ml/config_loading.py` | Builds a `PipelineConfig` from a YAML preset |
 | `configs/small.yaml` | Fast-test preset, mirrors class defaults |
