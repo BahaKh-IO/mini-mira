@@ -47,20 +47,47 @@ def _layer_averaged_mse(pred_features: Tensor | list[Tensor], target_features: T
 
 
 def _select_target_features(
-    features: Tensor | list[Tensor], t_idx: Tensor, start: int, stop: int
+    features: Tensor | list[Tensor], t_idx: Tensor, t_pixel_total: int, start: int, stop: int
 ) -> Tensor | list[Tensor]:
     """Select/reshape/chunk/detach the encoder's own DINO features for the self-consistency
     target, per layer -- matches mira's `real_lc = tuple(f[:, t_lc].detach() for f in
     model_outputs.dino_features)`. `features` is a single Tensor in the old single-layer case.
+
+    t_idx indexes pixel-space frames (0..t_pixel_total-1); `features`' own time dim can be
+    shorter (VjepaModel halves frame count via its tubelet, DinoModel doesn't) -- remapped to
+    feature-space via the ratio between the two, inferred from shapes rather than a
+    per-backbone constant. A no-op for DinoModel (ratio 1, same indices either way).
     """
 
     def _one(f: Tensor) -> Tensor:
-        selected = rearrange(f[:, t_idx], "b t c h w -> (b t) c h w")
+        reduction = max(1, t_pixel_total // f.shape[1])
+        feature_idx = (t_idx // reduction).clamp(max=f.shape[1] - 1) if reduction > 1 else t_idx
+        selected = rearrange(f[:, feature_idx], "b t c h w -> (b t) c h w")
         return selected[start:stop].unsqueeze(0).detach()
 
     if isinstance(features, list):
         return [_one(f) for f in features]
     return _one(features)
+
+
+def _align_time_dim(
+    pred_features: Tensor | list[Tensor], target_features: Tensor | list[Tensor]
+) -> tuple[Tensor | list[Tensor], Tensor | list[Tensor]]:
+    """Trim the longer side's time dim down to the shorter, when they don't already match.
+    A random, not-necessarily-adjacent frame subset can fold into different lengths on each side
+    once a tubelet-pairing encoder (VjepaModel) is involved -- a no-op for DinoModel (already
+    always equal).
+    """
+    pred_list = pred_features if isinstance(pred_features, list) else [pred_features]
+    target_list = target_features if isinstance(target_features, list) else [target_features]
+    n = min(pred_list[0].shape[1], target_list[0].shape[1])
+    if pred_list[0].shape[1] == n and target_list[0].shape[1] == n:
+        return pred_features, target_features
+    trimmed_pred = [f[:, :n] for f in pred_list]
+    trimmed_target = [f[:, :n] for f in target_list]
+    if not isinstance(pred_features, list):
+        return trimmed_pred[0], trimmed_target[0]
+    return trimmed_pred, trimmed_target
 
 
 def calculate_adaptive_weight(
@@ -274,8 +301,11 @@ class CodecLoss(nn.Module):
                     with torch.no_grad():
                         target_features = consistency_dino.dino_forward(target_input)
                 else:
-                    target_features = _select_target_features(outputs.dino_features, t_idx, start, stop)
+                    target_features = _select_target_features(
+                        outputs.dino_features, t_idx, t_total, start, stop
+                    )
 
+                pred_features, target_features = _align_time_dim(pred_features, target_features)
                 weight = (stop - start) / pred_frames.shape[0]
                 dino_terms.append(weight * _layer_averaged_mse(pred_features, target_features))
             loss["loss_dino_latent_consistency"] = torch.stack(dino_terms).sum()
