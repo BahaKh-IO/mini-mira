@@ -123,10 +123,22 @@ internally (`tubelet_size=2` — `dino_forward` here returns `t // 2` frames, a 
 deviation from `DinoModel`'s own contract). Multi-layer feature aggregation is supported too,
 matching `DinoModel`'s own interface and layer indices.
 
-**Next goal**: mirror the DINO track's own path, stage by stage — a real backbone-selection
-mechanism (none exists yet; DINO is still hardcoded), wire `VjepaModel` into the bottleneck
-(`temporal_stride` moves to 1 for this track — V-JEPA's own tubelet already halves time, confirmed
-safe since that config value flows through from one place, not duplicated), a new config preset,
+**Next goal**: two design decisions for this track are now made, deliberately kept simple rather
+than general — this is a benchmark run by two interns, not infrastructure meant to outlive it.
+**Scripts**: no runtime backbone-selection flag; V-JEPA gets its own full copies of the training
+scripts (`train_codec_vjepa.py`, `train_world_model_vjepa.py`, mirroring `train_codec.py`/
+`train_world_model.py`) rather than a shared core loop — the DINO scripts stay untouched, and each
+track's logic is fully readable on its own, at the accepted cost that a future bug fix has to be
+applied to both copies by hand. **Checkpoints**: separate directories (`checkpoints_vjepa/`,
+`checkpoints_wm_vjepa/`) and a `_vjepa`-tagged filename, no embedded backbone-metadata field —
+DINO's own checkpoint dirs and defaults are untouched. **Config preset**: done —
+`configs/scaled_300m_vjepa.yaml`, identical to `scaled_300m.yaml` except `bottleneck.temporal_stride`
+2→1 (V-JEPA's own tubelet already halves frame count before the bottleneck sees it). Turned out no
+library code needs to change for any of this: `MyBottleneck` is already backbone-agnostic (works
+from `dino_dim`/`temporal_stride` alone, holds no reference to which encoder produced its input),
+and `LatentWorldModel` already accepts an injected `dino` module — both confirmed by reading the
+code, not assumed. What's still ahead: writing the two new training scripts themselves (instantiate
+`VjepaModel` where the DINO ones instantiate `DinoModel`, point at the new checkpoint dirs/config),
 then a full codec retrain from scratch under V-JEPA's feature space (the existing checkpoint can't
 be reused — the whole representation changes), then a world-model retrain on top. Three real
 methodology questions still need a decision before any final numbers count as comparable: whether
@@ -283,6 +295,7 @@ one YAML file mirrors `PipelineConfig`'s whole nested shape, no Hydra/config-gro
 | File | Purpose |
 |---|---|
 | `configs/scaled_300m.yaml` | The intended architecture scale (~300M params) |
+| `configs/scaled_300m_vjepa.yaml` | Same, `temporal_stride` 2→1 for the V-JEPA track |
 | `configs/small.yaml` | Mirrors class defaults — what fast verification scripts use |
 
 ```python
