@@ -79,3 +79,9 @@ lpips
 # Already present transitively (1.15.3 on this dev machine, via the torch/torchmetrics chain) but
 # listed directly now since new code imports it by name, same reasoning as numpy above.
 scipy>=1.11
+# Real, transitive dependency of VjepaModel's loader -- the actual facebookresearch/vjepa2 code
+# (app/vjepa_2_1/models/utils/modules.py) imports drop_path from it. mini_mira never imports timm
+# directly itself. Found missing via a real ModuleNotFoundError on the GPU box's own venv, not
+# assumed -- it only worked on this dev machine because something else already pulled it in
+# transitively. 1.0.28 is the version verified working here.
+timm>=1.0
