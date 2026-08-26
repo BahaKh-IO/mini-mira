@@ -137,13 +137,25 @@ DINO's own checkpoint dirs and defaults are untouched. **Config preset**: done �
 library code needs to change for any of this: `MyBottleneck` is already backbone-agnostic (works
 from `dino_dim`/`temporal_stride` alone, holds no reference to which encoder produced its input),
 and `LatentWorldModel` already accepts an injected `dino` module — both confirmed by reading the
-code, not assumed. What's still ahead: writing the two new training scripts themselves (instantiate
-`VjepaModel` where the DINO ones instantiate `DinoModel`, point at the new checkpoint dirs/config),
-then a full codec retrain from scratch under V-JEPA's feature space (the existing checkpoint can't
-be reused — the whole representation changes), then a world-model retrain on top. Three real
-methodology questions still need a decision before any final numbers count as comparable: whether
-both tracks get scored by the same fixed judge rather than each by its own backbone, what step
-budget each track gets, and whether hyperparameters stay identical across both.
+code, not assumed.
+
+`scripts/train_codec_vjepa.py` is done — a full fork of `train_codec.py`, `VjepaModel` in place of
+`DinoModel` throughout, `--checkpoint-dir` defaulting to `checkpoints_vjepa/` and its local/HF
+checkpoint filename tagged `checkpoint_vjepa.pth` so it can never collide with DINO's own upload to
+the same HF repo. One flag pair has no V-JEPA equivalent and was dropped rather than faked:
+`--perceptual-dino-model`/`--perceptual-dino-multilayer` swap in a second, differently-sized DINO
+variant for the consistency-loss term, and V-JEPA 2.1 only has the one variant. Confirmed working
+by construction (`VjepaModel(require_pretrained=False, ...)` builds cleanly, `--help` lists the
+expected flag set) — not yet run on the GPU box.
+
+What's still ahead: `compute_latent_stats.py` and `evaluate_codec.py` each need the same fork once
+there's a real V-JEPA codec checkpoint to point them at (not before — nothing to evaluate yet);
+then `train_world_model_vjepa.py`, forked the same way once that checkpoint exists; then a full
+codec retrain from scratch under V-JEPA's feature space (the existing checkpoint can't be reused —
+the whole representation changes), then a world-model retrain on top. Three real methodology
+questions still need a decision before any final numbers count as comparable: whether both tracks
+get scored by the same fixed judge rather than each by its own backbone, what step budget each
+track gets, and whether hyperparameters stay identical across both.
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
@@ -186,6 +198,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/verify_codec_training.py` | Mechanism proof the codec trains (synthetic data, no GPU needed) |
 | `scripts/download_shards.py` | Downloads real Rocket League shards from `kyutai/rocket-science` |
 | `scripts/train_codec.py` | Real GPU codec training |
+| `scripts/train_codec_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` in place of `DinoModel` |
 | `scripts/reconstruct.py` | Mechanism smoke test: runs a video through the codec (random-init weights) |
 | `scripts/evaluate_codec.py` | Real quantitative eval of a trained codec checkpoint on held-out data |
 | `scripts/compute_latent_stats.py` | One-shot latent mean/std computation, feeds `train_world_model.py` |
