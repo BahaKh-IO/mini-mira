@@ -89,6 +89,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--require-pretrained-vjepa", action="store_true")
     parser.add_argument("--index-path", default=None, help="Real dataset dir from download_shards.py")
+    parser.add_argument(
+        "--num-workers", type=int, default=6,
+        help="Parallel dataloader processes. Default 6 (this box has 8 real CPU cores -- nproc -- "
+        "leaves 2 free for the main process/OS; matches real mira's own choice). Safe to raise for "
+        "the codec here specifically: unlike train_world_model.py, --resume never tries to skip "
+        "exactly the batches already consumed, so there's no determinism requirement this could "
+        "silently break. Re-check against nproc if this ever runs on different hardware.",
+    )
     parser.add_argument("--target-fps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None, help="Per-forward micro-batch size. Default 4")
     parser.add_argument(
@@ -180,6 +188,7 @@ def build_next_video(args: argparse.Namespace):
             target_fps=args.target_fps,
             n_players=1,  # codec training
             batch_size=args.batch_size,
+            num_workers=args.num_workers,
             frame_size=None,  # native decode -- resize_to_canonical below does the pad+resize
         )
         data_iter = iter(loader)
