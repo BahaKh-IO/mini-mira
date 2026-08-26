@@ -121,9 +121,17 @@ drop-in sibling to `DinoModel` (same `dino_forward`/`.dino_dim` contract), verif
 (unlike DINOv3), `embed_dim=768` (matches DINOv3-B exactly), and it halves the frame count
 internally (`tubelet_size=2` — `dino_forward` here returns `t // 2` frames, a genuine, documented
 deviation from `DinoModel`'s own contract). Multi-layer feature aggregation is supported too,
-matching `DinoModel`'s own interface and layer indices. Not yet wired into the bottleneck, loss,
-pipeline, or any training script — that's deliberately still ahead, along with retraining a codec
-and world model under it from scratch to actually run the benchmark.
+matching `DinoModel`'s own interface and layer indices.
+
+**Next goal**: mirror the DINO track's own path, stage by stage — a real backbone-selection
+mechanism (none exists yet; DINO is still hardcoded), wire `VjepaModel` into the bottleneck
+(`temporal_stride` moves to 1 for this track — V-JEPA's own tubelet already halves time, confirmed
+safe since that config value flows through from one place, not duplicated), a new config preset,
+then a full codec retrain from scratch under V-JEPA's feature space (the existing checkpoint can't
+be reused — the whole representation changes), then a world-model retrain on top. Three real
+methodology questions still need a decision before any final numbers count as comparable: whether
+both tracks get scored by the same fixed judge rather than each by its own backbone, what step
+budget each track gets, and whether hyperparameters stay identical across both.
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
