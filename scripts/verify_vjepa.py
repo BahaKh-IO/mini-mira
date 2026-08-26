@@ -47,6 +47,16 @@ with torch.no_grad():
     assert out.std().item() > 0.0, f"V-JEPA features look degenerate (std={out.std().item():.6f})"
     print(f"[PASS] output is finite and non-degenerate: mean={out.mean().item():.4f}, std={out.std().item():.4f}")
 
+    # --- t < tubelet_size gets padded, not rejected ---
+    # CodecLoss's random frame-subset sampling can hand this a single-frame chunk (fine for
+    # DinoModel, not for a model that always needs frame pairs) -- must pad, not crash.
+    single_frame = torch.rand(1, 1, 3, 288, 512)
+    single_out = vjepa.dino_forward(single_frame)
+    single_expected = (1, 1, vjepa.dino_dim, 18, 32)
+    assert single_out.shape == single_expected, f"got {single_out.shape}, expected {single_expected}"
+    assert torch.isfinite(single_out).all(), "padded single-frame output contains NaN/Inf"
+    print(f"[PASS] t=1 input (< tubelet_size=2) padded, not rejected: {tuple(single_out.shape)}")
+
     # --- multi-layer mode (last_layer_only=False) ---
     vjepa_multi = VjepaModel(require_pretrained=False, last_layer_only=False)
     multi_out = vjepa_multi.dino_forward(video)

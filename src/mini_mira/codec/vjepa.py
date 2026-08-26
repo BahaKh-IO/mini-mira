@@ -15,7 +15,10 @@ Known upstream bug (Meta's, not ours): src/hub/backbones.py ships VJEPA_BASE_URL
 localhost:8300 ("for testing"), with the real CDN URL commented out above it. Patched below.
 
 V-JEPA halves the frame count internally (tubelet_size=2) -- unlike DinoModel, dino_forward here
-returns t // 2 frames, not t. Matters once this gets wired into a real bottleneck later.
+returns t // 2 frames, not t. Matters once this gets wired into a real bottleneck later. A t < 2
+input (e.g. CodecLoss's random frame-subset sampling can hand this a single-frame chunk, fine for
+DinoModel, not for a model that always needs frame pairs) is padded up to 2 by repeating the last
+frame, not rejected -- see dino_forward.
 """
 
 import subprocess
@@ -118,11 +121,16 @@ class VjepaModel(nn.Module):
     def dino_forward(self, x: Tensor) -> Tensor | list[Tensor]:
         """x: (b, t, 3, h, w) in [0, 1]. Returns (b, t // tubelet_size, dino_dim, h', w') for the
         default single-layer case, or a list of that shape (one per entry in self.layers) when
-        built with last_layer_only=False.
+        built with last_layer_only=False. t < tubelet_size is padded up to tubelet_size by
+        repeating the last frame (so it returns exactly one output frame) instead of raising --
+        see module docstring for why this matters.
         """
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
             b, t, _, h, w = x.shape
-            assert t >= self.tubelet_size, f"t={t} < tubelet_size={self.tubelet_size}"
+            assert t >= 1, f"t={t} must be at least 1"
+            if t < self.tubelet_size:
+                x = torch.cat([x, x[:, -1:].repeat(1, self.tubelet_size - t, 1, 1, 1)], dim=1)
+                t = self.tubelet_size
             x = rearrange(x, "b t c h w -> (b t) c h w")
             x = self.image_normalization(x)
             new_h = self.patch_size * (h // self.patch_size)
