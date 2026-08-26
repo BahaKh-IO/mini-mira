@@ -2,9 +2,6 @@
 # to test whether it narrows the rollout-depth quality degradation the first run found. Real
 # config, not synthetic -- see notes/session_handoff.md section 5.
 #
-# steps is a placeholder: the real launch's exact --steps isn't recorded, only the outcome
-# (reached step 5,500) -- set this to whatever the actual target for a given window is.
-#
 #   python scripts/train_world_model.py --config configs/scaled_300m.yaml \
 #     --run-config configs/runs/wm_second_run_scheduled_sampling.yaml \
 #     --index-path <train data dir> --test-index-path <held-out dir> \
@@ -15,7 +12,7 @@
 precision: bf16
 batch_size: 4
 grad_accum_steps: 4
-steps: 8000
+steps: 5500
 
 scheduled_sampling_prob: 0.3
 
