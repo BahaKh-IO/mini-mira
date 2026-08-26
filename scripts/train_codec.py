@@ -40,7 +40,8 @@ from mini_mira.codec.dino import DEFAULT_ENCODER_AGGREGATION_LAYERS, DinoModel
 from mini_mira.codec.logging_utils import get_wandb_run_id, init_wandb, log_preview, log_step
 from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
 from mini_mira.codec.video_prep import resize_to_canonical
-from mini_mira.ml.config_loading import load_pipeline_config
+from mini_mira.ml.config_loading import apply_run_config, load_pipeline_config, load_run_config
+from mini_mira.ml.run_config import CodecRunConfig
 
 
 def _autocast(precision: str) -> torch.autocast:
@@ -72,23 +73,30 @@ def _keep_convolutions_in_bf16(module: torch.nn.Module) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default="configs/small.yaml")
-    parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-4)  # matches mira's train_codec.yaml
-    parser.add_argument("--height", type=int, default=64)
-    parser.add_argument("--width", type=int, default=64)
-    parser.add_argument("--frames", type=int, default=4, help="Clip length in frames (both data modes)")
+    parser.add_argument(
+        "--run-config", default=None,
+        help="Optional YAML of hyperparameters (CodecRunConfig, see configs/runs/). Any flag "
+        "below, explicitly passed, always overrides it. Omit for today's hardcoded defaults.",
+    )
+    parser.add_argument("--steps", type=int, default=None, help="Default 30")
+    parser.add_argument("--lr", type=float, default=None)  # matches mira's train_codec.yaml, default 1e-4
+    parser.add_argument("--height", type=int, default=None, help="Default 64")
+    parser.add_argument("--width", type=int, default=None, help="Default 64")
+    parser.add_argument(
+        "--frames", type=int, default=None, help="Clip length in frames (both data modes). Default 4"
+    )
     parser.add_argument("--require-pretrained-dino", action="store_true")
     parser.add_argument("--index-path", default=None, help="Real dataset dir from download_shards.py")
-    parser.add_argument("--target-fps", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=4, help="Per-forward micro-batch size")
+    parser.add_argument("--target-fps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None, help="Per-forward micro-batch size. Default 4")
     parser.add_argument(
-        "--grad-accum-steps", type=int, default=1,
-        help="Micro-batches accumulated per optimizer step (effective batch = batch-size * this)",
+        "--grad-accum-steps", type=int, default=None,
+        help="Micro-batches accumulated per optimizer step (effective batch = batch-size * this). Default 1",
     )
-    parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
-        "--perceptual-chunk-size", type=int, default=0,
-        help="Frames per LPIPS/DINO loss forward (0 processes the selected frames together)",
+        "--perceptual-chunk-size", type=int, default=None,
+        help="Frames per LPIPS/DINO loss forward (0 processes the selected frames together). Default 0",
     )
     parser.add_argument(
         "--perceptual-dino-model", default=None,
@@ -96,16 +104,18 @@ def parse_args() -> argparse.Namespace:
         "variant's feature space instead of the encoder's own, e.g. dinov3_vits16",
     )
     parser.add_argument(
-        "--perceptual-dino-multilayer", action="store_true",
+        "--perceptual-dino-multilayer", action=argparse.BooleanOptionalAction, default=None,
         help="Aggregate multiple DINO layers for the consistency loss (matches mira's "
         "DinoPerceptualLoss) instead of just the last one. Requires --perceptual-dino-model.",
     )
     parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 20")
     parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps - warmup_steps")
     parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
-    parser.add_argument("--loss-mae-weight", type=float, default=1.0, help="CodecLossWeights.loss_mae")
     parser.add_argument(
-        "--log-activation-grad-norms", action="store_true",
+        "--loss-mae-weight", type=float, default=None, help="CodecLossWeights.loss_mae. Default 1.0"
+    )
+    parser.add_argument(
+        "--log-activation-grad-norms", action=argparse.BooleanOptionalAction, default=None,
         help="Log grad_norm_loss_mae/lpips_perceptual/dino_latent_consistency/total_video (the "
         "ORIGINAL per-term activation-gradient hooks, CodecLoss._hook_clone) -- off by default. "
         "notes/grad_norm_investigation.md found these GradScaler-scale-confounded under "
@@ -114,7 +124,7 @@ def parse_args() -> argparse.Namespace:
         "gradients. Costs a real extra tensor clone per term per micro-step -- opt-in.",
     )
     parser.add_argument("--checkpoint-dir", default="checkpoints")
-    parser.add_argument("--checkpoint-every", type=int, default=100)
+    parser.add_argument("--checkpoint-every", type=int, default=None, help="Default 100")
     parser.add_argument(
         "--hf-backup-every", type=int, default=None,
         help="How often (in steps) to upload to --hf-backup-repo, independent of --checkpoint-"
@@ -126,8 +136,8 @@ def parse_args() -> argparse.Namespace:
         "upload itself is slow -- frequent cheap local safety saves without paying the upload cost "
         "every time.",
     )
-    parser.add_argument("--preview-every", type=int, default=100, help="W&B image/video preview interval")
-    parser.add_argument("--console-log-every", type=int, default=10, help="Loss/GPU-memory print interval")
+    parser.add_argument("--preview-every", type=int, default=None, help="W&B image/video preview interval. Default 100")
+    parser.add_argument("--console-log-every", type=int, default=None, help="Loss/GPU-memory print interval. Default 10")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--reset-lr-schedule", action="store_true",
@@ -136,7 +146,7 @@ def parse_args() -> argparse.Namespace:
         "(different --lr/--lr-min/--steps) rather than continuing an interrupted run.",
     )
     parser.add_argument(
-        "--log-per-term-grad-norm", action="store_true",
+        "--log-per-term-grad-norm", action=argparse.BooleanOptionalAction, default=None,
         help="Log each loss term's OWN real parameter-gradient norm separately (grad_norm_params_"
         "loss_mae/loss_lpips_perceptual/loss_dino_latent_consistency), not just their combined "
         "total (grad_norm_params_total) -- shows which term is actually driving the weight update "
@@ -158,8 +168,8 @@ def parse_args() -> argparse.Namespace:
         help="With --resume, start a fresh W&B run instead of continuing the checkpoint's saved one.",
     )
     parser.add_argument(
-        "--precision", choices=["fp16-hybrid", "bf16"], default="fp16-hybrid",
-        help="fp16-hybrid (default, unchanged): float16 autocast + GradScaler, convolutions "
+        "--precision", choices=["fp16-hybrid", "bf16"], default=None,
+        help="Default fp16-hybrid (unchanged): float16 autocast + GradScaler, convolutions "
         "force-patched to bf16 -- the proven V100 setup (notes/gpu_amp_investigation.md). bf16: "
         "plain bfloat16 autocast everywhere, GradScaler disabled (a documented no-op), no conv "
         "patch needed. Opt-in only -- test against fp16-hybrid before switching a run over.",
@@ -197,6 +207,9 @@ def build_next_video(args: argparse.Namespace):
 
 def main() -> None:
     args = parse_args()
+    run_config = load_run_config(args.run_config, CodecRunConfig) if args.run_config else CodecRunConfig()
+    apply_run_config(args, run_config)
+
     config = load_pipeline_config(args.config)
 
     torch.manual_seed(0)
