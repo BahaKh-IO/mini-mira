@@ -144,9 +144,29 @@ code, not assumed.
 checkpoint filename tagged `checkpoint_vjepa.pth` so it can never collide with DINO's own upload to
 the same HF repo. One flag pair has no V-JEPA equivalent and was dropped rather than faked:
 `--perceptual-dino-model`/`--perceptual-dino-multilayer` swap in a second, differently-sized DINO
-variant for the consistency-loss term, and V-JEPA 2.1 only has the one variant. Confirmed working
-by construction (`VjepaModel(require_pretrained=False, ...)` builds cleanly, `--help` lists the
-expected flag set) — not yet run on the GPU box.
+variant for the consistency-loss term, and V-JEPA 2.1 only has the one variant.
+
+**Two real bugs found and fixed**, only surfaced by actually running the training mechanism
+end to end (`scripts/verify_codec_training_vjepa.py`, new — same overfit-one-video proof
+`verify_codec_training.py` uses for the DINO track), not by reading the code:
+- `VjepaModel.dino_forward` crashed on fewer than `tubelet_size` (2) frames — `CodecLoss`'s
+  consistency term scores a random frame subset, sometimes chunked down to a single frame, which
+  `DinoModel` always tolerated (no minimum) but V-JEPA's frame-pairing can't. Fixed by padding a
+  too-short input up to 2 frames (repeating the last one) instead of rejecting it — contained
+  entirely inside `vjepa.py`, no shared code touched.
+- `CodecLoss` assumed a pixel-space frame index always equals a feature-space frame index — true
+  for `DinoModel` (frame count in = frame count out) but not V-JEPA (halves it). Fixed in `loss.py`:
+  target-feature lookup now remaps indices by the encoder's own reduction ratio (inferred from
+  tensor shapes, not a hardcoded per-backbone constant — a no-op for DinoModel, ratio 1 always),
+  and predicted/target features are trimmed to matching lengths before comparison when a random,
+  not-necessarily-adjacent frame subset folds to different lengths on each side.
+
+Verified for real: a 100-step overfit run (batch=2, 16 frames — large enough to exercise both bugs'
+trigger conditions, unlike a smaller test) drops `loss_total` 56.4%, matching the same >50% bar
+`verify_codec_training.py` itself uses. `loss_dino_latent_consistency` itself barely moves
+(expected — matches the DINO track's own already-documented finding that MAE dominates this term's
+gradient 4-8x; the auto-balancing mechanism visibly compensating, its weight climbing 36.5→45.5, is
+this working as designed, not a new problem).
 
 What's still ahead: `compute_latent_stats.py` and `evaluate_codec.py` each need the same fork once
 there's a real V-JEPA codec checkpoint to point them at (not before — nothing to evaluate yet);
@@ -199,6 +219,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/download_shards.py` | Downloads real Rocket League shards from `kyutai/rocket-science` |
 | `scripts/train_codec.py` | Real GPU codec training |
 | `scripts/train_codec_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` in place of `DinoModel` |
+| `scripts/verify_codec_training_vjepa.py` | Mechanism proof the V-JEPA-track codec trains (synthetic data, no GPU needed) |
 | `scripts/reconstruct.py` | Mechanism smoke test: runs a video through the codec (random-init weights) |
 | `scripts/evaluate_codec.py` | Real quantitative eval of a trained codec checkpoint on held-out data |
 | `scripts/compute_latent_stats.py` | One-shot latent mean/std computation, feeds `train_world_model.py` |
