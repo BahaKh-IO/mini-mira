@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=300, help="One real example to memorize -- should show real progress well before this")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--precision", choices=["fp16-hybrid", "bf16"], default="bf16")
+    parser.add_argument("--activation-checkpointing", action="store_true", help="Trade compute for memory -- needed at larger --height/--width")
     parser.add_argument("--preview-every", type=int, default=25)
     parser.add_argument("--console-log-every", type=int, default=10)
     parser.add_argument("--wandb-project", default=None)
@@ -61,9 +62,9 @@ def main() -> None:
         require_pretrained=True, last_layer_only=False, layer_indices=DEFAULT_VJEPA_LAYERS,
     ).cuda()
     vjepa.eval()
-    bottleneck = MyBottleneck(config.bottleneck).cuda()
-    decoder = ViTVideoDecoder(config.decoder).cuda()
-    loss_fn = CodecLoss(CodecLossWeights(auto_weight=True)).cuda()
+    bottleneck = MyBottleneck(config.bottleneck, use_checkpointing=args.activation_checkpointing).cuda()
+    decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
+    loss_fn = CodecLoss(CodecLossWeights(auto_weight=True), use_checkpointing=args.activation_checkpointing).cuda()
     loss_fn.bind_encoder_dino(vjepa)
     loss_fn.bind_last_layer(decoder.last_layer_weight)
 
