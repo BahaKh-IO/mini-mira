@@ -211,7 +211,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `src/mini_mira/codec/loss.py` | Codec training loss: L1 + LPIPS + DINO latent-consistency |
 | `src/mini_mira/codec/video_prep.py` | Resizes/pads real clips to canonical shape |
 | `src/mini_mira/codec/checkpoint.py` | Save/resume for codec training |
-| `src/mini_mira/codec/logging_utils.py` | Optional wandb logging for `train_codec.py` |
+| `src/mini_mira/codec/logging_utils.py` | Optional wandb logging, shared by both codec tracks — preview videos encode at `crf=18` explicitly (found and fixed for real: no explicit value meant falling back to ffmpeg's own default, visibly compressed — confirmed by comparing a lossless raw frame against the same frame through this encoder) |
 | `scripts/test_shapes.py` | Shape-correctness checks |
 | `scripts/verify_rope.py` | Behavioral checks for RoPE |
 | `scripts/verify_conditioning.py` | Behavioral checks for AdaLN/clean-past/actions |
