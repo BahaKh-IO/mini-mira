@@ -328,6 +328,13 @@ overrides the file, and omitting `--run-config` entirely reproduces the exact de
   curve instead of erroring.
 - `train_codec.py`: resuming under a *different* `--precision` than the checkpoint was saved with
   crashes (a known, unfixed gap) — keep `--precision` consistent across a checkpoint's resumes.
+- `train_world_model.py`'s `--resume` fast-forwards past already-consumed batches by calling
+  `next()` on a freshly-built loader — only correct because that loader is single-process,
+  unseeded (deterministic by default). The codec scripts (`train_codec.py`/`train_codec_vjepa.py`)
+  have no such mechanism, so raising `--num-workers` there is safe (`--num-workers 6` is now the
+  default, matching this project's real GPU box's 8 real CPU cores — recheck against `nproc` on
+  different hardware); doing the same for `train_world_model.py` would need that resume mechanism
+  addressed first, not done unprompted.
 
 ## Configs
 
