@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "mira" / "src"))
 
 import torch
+from torch import Tensor
 from mira.data.training_loader import create_loader
 from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 
@@ -426,7 +427,14 @@ def main() -> None:
 
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
-        accumulated: dict[str, float] = {}
+        # Held as GPU tensors through the micro-step loop, not Python floats -- v.item() forces a
+        # full CUDA sync (blocks the CPU until every queued kernel finishes), and doing that once
+        # per loss term per micro-step (found for real: nvidia-smi dmon showed the GPU alternating
+        # 0%/100% every second, ~60% average, matching a real-world 57% finding from an earlier
+        # session) serializes what should be an async pipeline. Converted to floats once, after
+        # the loop, instead -- same final numbers, far fewer sync points (was
+        # num_loss_terms * grad_accum_steps per step, now num_loss_terms once).
+        accumulated: dict[str, Tensor] = {}
         per_term_grad_norms: dict[str, float] = {}
         for micro_step in range(args.grad_accum_steps):
             video = next_video().cuda()
@@ -460,7 +468,11 @@ def main() -> None:
                     per_term_grad_norms[f"grad_norm_params_{term_name}"] = norm
             grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
             for k, v in losses.items():
-                accumulated[k] = accumulated.get(k, 0.0) + v.item() / args.grad_accum_steps
+                term = v.detach() / args.grad_accum_steps
+                accumulated[k] = term if k not in accumulated else accumulated[k] + term
+        # Single sync point per loss term for the whole step, not one per term per micro-step --
+        # see the comment on `accumulated`'s declaration above for why that matters.
+        accumulated_floats: dict[str, float] = {k: v.item() for k, v in accumulated.items()}
         # Real total gradient norm across every trainable parameter (bottleneck + decoder) --
         # unlike grad_norm_loss_* below, this is an actual parameter gradient, the quantity
         # "is AdamW's update small" genuinely depends on (notes/grad_norm_investigation.md).
@@ -496,10 +508,10 @@ def main() -> None:
 
         current_lr = optimizer.param_groups[0]["lr"]
         term_str = ", ".join(
-            f"{k}={v:.4f}" for k, v in accumulated.items() if k != "loss_total" and not k.endswith("_auto_w")
+            f"{k}={v:.4f}" for k, v in accumulated_floats.items() if k != "loss_total" and not k.endswith("_auto_w")
         )
         if (step + 1) % args.console_log_every == 0 or step == start_step:
-            print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated['loss_total']:.4f} ({term_str})")
+            print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated_floats['loss_total']:.4f} ({term_str})")
             print(
                 f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
                 f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
@@ -508,7 +520,7 @@ def main() -> None:
             # training, on an already-converged checkpoint) rounds to a misleading "0.0000" at 4
             # decimal places, same illusion this project already hit once with the PSD loss print.
             print(", ".join(f"{k}={v:.6e}" for k, v in grad_norms.items()))
-        log_step(wandb_enabled, step, {**accumulated, **grad_norms}, current_lr)
+        log_step(wandb_enabled, step, {**accumulated_floats, **grad_norms}, current_lr)
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
