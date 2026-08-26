@@ -47,7 +47,8 @@ from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 
 from mini_mira.codec.logging_utils import get_wandb_run_id, init_wandb, log_step
 from mini_mira.codec.video_prep import resize_to_canonical
-from mini_mira.ml.config_loading import load_pipeline_config
+from mini_mira.ml.config_loading import apply_run_config, load_pipeline_config, load_run_config
+from mini_mira.ml.run_config import WorldModelRunConfig
 from mini_mira.world_model.checkpoint import load_checkpoint, save_checkpoint
 from mini_mira.world_model.eval_metrics import RunningMean, compute_drift_metrics, decode_and_dino
 from mini_mira.world_model.full_eval_metrics import FullEvalMetrics, compute_full_eval_metrics
@@ -77,68 +78,81 @@ def _request_shutdown(signum, frame) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default="configs/small.yaml")
+    parser.add_argument(
+        "--run-config", default=None,
+        help="Optional YAML of hyperparameters (WorldModelRunConfig, see configs/runs/). Any "
+        "flag below, explicitly passed, always overrides it. Omit for today's hardcoded defaults.",
+    )
     parser.add_argument("--index-path", required=True, help="Real training dataset dir from download_shards.py")
     parser.add_argument("--test-index-path", required=True, help="Held-out dir for validation + drift eval")
     parser.add_argument("--codec-checkpoint", required=True, help="Frozen codec checkpoint (bottleneck+decoder)")
     parser.add_argument("--latent-stats", required=True, help="scripts/compute_latent_stats.py JSON output")
     parser.add_argument("--require-pretrained-dino", action="store_true")
     parser.add_argument(
-        "--precision", choices=["fp16-hybrid", "bf16"], default="bf16",
-        help="bf16 (default): plain bfloat16 autocast, GradScaler disabled (a documented no-op) "
+        "--precision", choices=["fp16-hybrid", "bf16"], default=None,
+        help="Default bf16: plain bfloat16 autocast, GradScaler disabled (a documented no-op) "
         "-- the actual setup real training uses on this project's current GPU. fp16-hybrid: "
         "float16 autocast + GradScaler, kept only for parity with train_codec.py's own V100-era "
         "fallback -- see this script's module docstring before picking it.",
     )
 
-    parser.add_argument("--height", type=int, default=288)
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--frames", type=int, default=40, help="Raw clip length in frames")
-    parser.add_argument("--target-fps", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=4, help="Per-forward micro-batch size")
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--frames", type=int, default=None, help="Raw clip length in frames. Default 40")
+    parser.add_argument("--target-fps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None, help="Per-forward micro-batch size. Default 4")
     parser.add_argument(
-        "--grad-accum-steps", type=int, default=2,
-        help="Micro-batches accumulated per optimizer step (effective batch = batch-size * this)",
+        "--grad-accum-steps", type=int, default=None,
+        help="Micro-batches accumulated per optimizer step (effective batch = batch-size * this). Default 2",
     )
 
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--lr", type=float, default=1e-4)  # matches mira's world-model optimizer
+    parser.add_argument("--steps", type=int, default=None, help="Default 2000")
+    parser.add_argument("--lr", type=float, default=None)  # matches mira's world-model optimizer, default 1e-4
     parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 20")
     parser.add_argument(
-        "--lr-decay-steps", type=int, default=0,
+        "--lr-decay-steps", type=int, default=None,
         help="Default 0 -- matches mira's own shipped single-player config (warmup then constant, "
         "no cosine decay). NOT proportional to --steps like train_codec.py's default -- see this "
         "script's module docstring / notes/deviations.md before changing this.",
     )
-    parser.add_argument("--lr-min", type=float, default=1e-6, help="Matches mira; inert while --lr-decay-steps=0")
-
-    parser.add_argument("--psd-weight", type=float, default=0.0, help="Deterministic PSD (mira default: 0.0)")
-    parser.add_argument("--psd-loss-prob", type=float, default=0.0, help="Stochastic PSD (mira default: 0.0)")
     parser.add_argument(
-        "--scheduled-sampling-prob", type=float, default=0.0,
+        "--lr-min", type=float, default=None, help="Default 1e-6. Matches mira; inert while --lr-decay-steps=0"
+    )
+
+    parser.add_argument(
+        "--psd-weight", type=float, default=None, help="Deterministic PSD. Default 0.0 (mira default)"
+    )
+    parser.add_argument(
+        "--psd-loss-prob", type=float, default=None, help="Stochastic PSD. Default 0.0 (mira default)"
+    )
+    parser.add_argument(
+        "--scheduled-sampling-prob", type=float, default=None,
         help="Probability of training on a self-generated (not real) clean_past -- not a mira "
         "flag, added here to address the rollout-depth quality drift found in real training. "
-        "Off by default. See LatentWorldModel._fake_shifted_z.",
+        "Default 0.0 (off). See LatentWorldModel._fake_shifted_z.",
     )
 
     parser.add_argument("--eval-batch-size", type=int, default=None, help="Default: --batch-size")
     parser.add_argument("--val-every", type=int, default=None, help="Default: steps // 50")
-    parser.add_argument("--val-n-samples", type=int, default=64)
+    parser.add_argument("--val-n-samples", type=int, default=None, help="Default 64")
     parser.add_argument("--drift-eval-every", type=int, default=None, help="Default: steps // 10")
-    parser.add_argument("--drift-eval-n-samples", type=int, default=8)
-    parser.add_argument("--drift-eval-context-latents", type=int, default=6)
-    parser.add_argument("--drift-eval-diffusion-steps", type=int, default=4)
-    parser.add_argument("--drift-eval-schedule", default="linear", choices=["linear", "linear_quadratic"])
+    parser.add_argument("--drift-eval-n-samples", type=int, default=None, help="Default 8")
+    parser.add_argument("--drift-eval-context-latents", type=int, default=None, help="Default 6")
+    parser.add_argument("--drift-eval-diffusion-steps", type=int, default=None, help="Default 4")
     parser.add_argument(
-        "--fdd-slice-frames", type=int, default=7,
+        "--drift-eval-schedule", default=None, choices=["linear", "linear_quadratic"], help="Default linear"
+    )
+    parser.add_argument(
+        "--fdd-slice-frames", type=int, default=None,
         help="Frechet-distance slice window, in GENERATED video frames -- must evenly divide "
         "(--frames - drift_eval_context_latents*temporal_stride). Default 7 gives 4 slices at "
         "this script's own defaults (28 generated video frames). Real mira's own default is 20 "
         "(6 slices over 120 unrolled frames) -- scaled down proportionally.",
     )
     parser.add_argument(
-        "--viz-n-samples", type=int, default=2,
+        "--viz-n-samples", type=int, default=None,
         help="Rollout videos rendered for visual inspection per full eval run -- fixed and small, "
-        "logged as separate wandb.Video entries, not a gridded batch.",
+        "logged as separate wandb.Video entries, not a gridded batch. Default 2",
     )
 
     parser.add_argument("--checkpoint-dir", default="checkpoints_wm")
@@ -148,13 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-backup-repo", default=None, help="Optional HF Hub repo to back up checkpoints to")
     parser.add_argument("--wandb-project", default=None)
 
-    args = parser.parse_args()
-    if args.psd_weight > 0 and args.psd_loss_prob > 0:
-        parser.error(
-            "Set at most one of --psd-weight and --psd-loss-prob (matches mira's own "
-            "LatentWorldModelConfig constraint: both being positive at once is undefined)"
-        )
-    return args
+    return parser.parse_args()
 
 
 def resize_batch(batch: VideoActionBatch, height: int, width: int) -> VideoActionBatch:
@@ -259,10 +267,18 @@ def main() -> None:
     signal.signal(signal.SIGINT, _request_shutdown)
 
     args = parse_args()
+    run_config = load_run_config(args.run_config, WorldModelRunConfig) if args.run_config else WorldModelRunConfig()
+    apply_run_config(args, run_config)
+    if args.psd_weight > 0 and args.psd_loss_prob > 0:
+        raise SystemExit(
+            "Set at most one of --psd-weight and --psd-loss-prob (matches mira's own "
+            "LatentWorldModelConfig constraint: both being positive at once is undefined)"
+        )
+
     config = load_pipeline_config(args.config)
-    # CLI is authoritative over the YAML preset's own psd_weight/psd_loss_prob (both default 0.0
-    # there too, matching mira's own shipped single-player config) -- same "CLI overrides the
-    # loaded config" convention train_codec.py uses for --loss-mae-weight.
+    # CLI/--run-config (resolved above) is authoritative over the YAML preset's own
+    # psd_weight/psd_loss_prob (both default 0.0 there too, matching mira's own shipped
+    # single-player config).
     config.world_model.psd_weight = args.psd_weight
     config.world_model.psd_loss_prob = args.psd_loss_prob
     config.world_model.scheduled_sampling_prob = args.scheduled_sampling_prob
