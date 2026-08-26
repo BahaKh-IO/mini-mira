@@ -23,6 +23,7 @@ micro-batch would need.
 """
 
 import argparse
+import signal
 import sys
 import types
 from pathlib import Path
@@ -49,6 +50,21 @@ from mini_mira.ml.run_config import CodecRunConfig
 def _autocast(precision: str) -> torch.autocast:
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
+
+
+# Set by _request_shutdown, checked once per completed optimizer step. `timeout` (used to
+# time-box long unattended runs) sends SIGTERM with no warning -- without this, the process just
+# dies wherever it happens to be, losing up to --checkpoint-every steps of progress and leaving
+# wandb with no clean sign-off (shows "Crashed" even when nothing actually broke). Ports
+# train_world_model.py's own handling, which train_codec.py (this script's un-forked sibling)
+# still lacks. A signal handler must stay minimal (no CUDA/file I/O directly inside it), so this
+# only sets a flag; the actual save happens in the main loop once it's safe to do so.
+_shutdown_requested = False
+
+
+def _request_shutdown(signum, frame) -> None:
+    global _shutdown_requested
+    _shutdown_requested = True
 
 
 _CONVOLUTION_TYPES = (
@@ -207,6 +223,9 @@ def build_next_video(args: argparse.Namespace):
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
     args = parse_args()
     run_config = load_run_config(args.run_config, CodecRunConfig) if args.run_config else CodecRunConfig()
     apply_run_config(args, run_config)
@@ -377,6 +396,34 @@ def main() -> None:
     # the weights actually moving" on their own -- this does, directly.
     initial_params = torch.cat([p.detach().flatten() for p in params]).cpu()
 
+    def _save_checkpoint_now(step: int, *, force_hf_upload: bool = False) -> None:
+        # L2 distance from this run's own starting weights (initial_params above) -- an
+        # unambiguous "did the model change at all" signal, independent of any
+        # gradient-interpretation question. Only at checkpoint cadence, not every step: needs
+        # a full param-vector CPU round-trip, not cheap enough for the hot loop.
+        current_params = torch.cat([p.detach().flatten() for p in params]).cpu()
+        weight_drift_l2 = (current_params - initial_params).norm().item()
+        print(f"step {step}: weight_drift_l2_from_run_start={weight_drift_l2:.6e}")
+        log_step(
+            wandb_enabled, step, {"weight_drift_l2_from_run_start": weight_drift_l2},
+            optimizer.param_groups[0]["lr"],
+        )
+        del current_params
+        save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler, wandb_run_id)
+        # Decoupled from the local save above: local saves are cheap and want to be frequent
+        # for crash safety, but the HF upload itself can be slow (network-bound), so it runs on
+        # its own, sparser cadence -- always still fires on the last step or force_hf_upload
+        # (set only by the SIGTERM/SIGINT shutdown path below, this run's last chance to upload)
+        # so the final state is never skipped regardless of where hf_backup_every's modulo lands.
+        is_last_step = step == args.steps - 1
+        if args.hf_backup_repo and (force_hf_upload or (step + 1) % hf_backup_every == 0 or is_last_step):
+            from huggingface_hub import HfApi  # optional dep, only used here
+
+            HfApi().upload_file(
+                path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint_vjepa.pth",
+                repo_id=args.hf_backup_repo, repo_type="model",
+            )
+
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
         accumulated: dict[str, float] = {}
@@ -429,6 +476,18 @@ def main() -> None:
         grad_scaler.update()
         lr_scheduler.step()
 
+        # Checked here, right after a step fully lands and before any of this step's own
+        # (potentially slow) logging/eval work -- prioritizes actually getting the save done
+        # inside `timeout`'s kill-after grace period over finishing this step's own work first.
+        if _shutdown_requested:
+            print(f"Shutdown signal received at step {step} -- saving and exiting cleanly.")
+            _save_checkpoint_now(step, force_hf_upload=True)
+            if wandb_enabled:
+                import wandb  # noqa: PLC0415
+
+                wandb.finish()
+            return
+
         # Last micro-step's real per-term gradient norms (see CodecLoss._hook_clone) -- same
         # "last micro-step only" convention already used for the preview video below.
         grad_norms = {f"grad_norm_{k}": v.item() for k, v in loss_fn.backward_metrics.items()}
@@ -453,27 +512,7 @@ def main() -> None:
 
         is_last = step == args.steps - 1
         if (step + 1) % args.checkpoint_every == 0 or is_last:
-            # L2 distance from this run's own starting weights (initial_params above) -- an
-            # unambiguous "did the model change at all" signal, independent of any
-            # gradient-interpretation question. Only at checkpoint cadence, not every step: needs
-            # a full param-vector CPU round-trip, not cheap enough for the hot loop.
-            current_params = torch.cat([p.detach().flatten() for p in params]).cpu()
-            weight_drift_l2 = (current_params - initial_params).norm().item()
-            print(f"step {step}: weight_drift_l2_from_run_start={weight_drift_l2:.6e}")
-            log_step(wandb_enabled, step, {"weight_drift_l2_from_run_start": weight_drift_l2}, current_lr)
-            del current_params
-            save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler, wandb_run_id)
-            # Decoupled from the local save above: local saves are cheap and want to be frequent
-            # for crash safety, but the HF upload itself can be slow (network-bound), so it runs on
-            # its own, sparser cadence -- always still fires on is_last so the FINAL state is never
-            # skipped regardless of where hf_backup_every's modulo lands.
-            if args.hf_backup_repo and ((step + 1) % hf_backup_every == 0 or is_last):
-                from huggingface_hub import HfApi  # optional dep, only used here
-
-                HfApi().upload_file(
-                    path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint_vjepa.pth",
-                    repo_id=args.hf_backup_repo, repo_type="model",
-                )
+            _save_checkpoint_now(step)
         # Always persist the first completed step so a new run proves its output path before
         # committing hours of compute. Subsequent samples follow the configured interval.
         if step == start_step or (step + 1) % args.preview_every == 0 or is_last:
