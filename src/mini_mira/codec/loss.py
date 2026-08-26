@@ -70,6 +70,14 @@ def _select_target_features(
     return _one(features)
 
 
+def _item_slice(features: Tensor | list[Tensor], item: int) -> Tensor | list[Tensor]:
+    """features sliced to one batch item, batch dim kept (size 1) -- same Tensor | list[Tensor]
+    convention as _select_target_features/_align_time_dim."""
+    if isinstance(features, list):
+        return [f[item : item + 1] for f in features]
+    return features[item : item + 1]
+
+
 def _align_time_dim(
     pred_features: Tensor | list[Tensor], target_features: Tensor | list[Tensor]
 ) -> tuple[Tensor | list[Tensor], Tensor | list[Tensor]]:
@@ -279,35 +287,45 @@ class CodecLoss(nn.Module):
         if self.weights.loss_dino_latent_consistency > 0:
             assert self.dino is not None, "call bind_encoder_dino before forward"
             consistency_dino = self.perceptual_dino if self.perceptual_dino is not None else self.dino
+            b = predicted.shape[0]
             k = max(1, round(t_total * self.weights.dino_latent_consistency_frame_frac))
             t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
             # No no_grad here: needs to backprop from DINO's features on the reconstruction,
             # through the decoder and bottleneck. Target side is already detached.
             predicted_dino = self._hook_clone(predicted, "loss_dino_latent_consistency")
-            pred_frames = rearrange(predicted_dino[:, t_idx], "b t c h w -> (b t) c h w")
-            target_frames = rearrange(target[:, t_idx], "b t c h w -> (b t) c h w")
-            chunk_size = self.perceptual_chunk_size or pred_frames.shape[0]
+            pred_selected = predicted_dino[:, t_idx]  # (b, k, c, h, w)
+            target_selected = target[:, t_idx]  # (b, k, c, h, w)
+            # Chunk WITHIN each video's own k selected frames, never across videos -- flattening
+            # batch+frame together and chunking blindly (the old approach) let a chunk straddle
+            # two different videos, so a tubelet-pairing encoder (VjepaModel) would pair the last
+            # selected frame of one video with the first of a totally different one. DinoModel
+            # never cared about frame adjacency, so this was invisible until V-JEPA existed;
+            # confirmed live with two distinguishable synthetic videos before this fix.
+            chunk_size = min(self.perceptual_chunk_size or k, k)
+            total_selected = b * k
             dino_terms = []
-            for start in range(0, pred_frames.shape[0], chunk_size):
-                stop = min(start + chunk_size, pred_frames.shape[0])
-                dino_input = denormalize_for_dino(pred_frames[start:stop]).unsqueeze(0)
-                if self.use_checkpointing:
-                    pred_features = checkpoint(consistency_dino.dino_forward, dino_input, use_reentrant=False)
-                else:
-                    pred_features = consistency_dino.dino_forward(dino_input)
+            for item in range(b):
+                item_target_features = _item_slice(outputs.dino_features, item)
+                for start in range(0, k, chunk_size):
+                    stop = min(start + chunk_size, k)
+                    dino_input = denormalize_for_dino(pred_selected[item, start:stop]).unsqueeze(0)
+                    if self.use_checkpointing:
+                        pred_features = checkpoint(consistency_dino.dino_forward, dino_input, use_reentrant=False)
+                    else:
+                        pred_features = consistency_dino.dino_forward(dino_input)
 
-                if self.perceptual_dino is not None:
-                    target_input = denormalize_for_dino(target_frames[start:stop]).unsqueeze(0)
-                    with torch.no_grad():
-                        target_features = consistency_dino.dino_forward(target_input)
-                else:
-                    target_features = _select_target_features(
-                        outputs.dino_features, t_idx, t_total, start, stop
-                    )
+                    if self.perceptual_dino is not None:
+                        target_input = denormalize_for_dino(target_selected[item, start:stop]).unsqueeze(0)
+                        with torch.no_grad():
+                            target_features = consistency_dino.dino_forward(target_input)
+                    else:
+                        target_features = _select_target_features(
+                            item_target_features, t_idx, t_total, start, stop
+                        )
 
-                pred_features, target_features = _align_time_dim(pred_features, target_features)
-                weight = (stop - start) / pred_frames.shape[0]
-                dino_terms.append(weight * _layer_averaged_mse(pred_features, target_features))
+                    pred_features, target_features = _align_time_dim(pred_features, target_features)
+                    weight = (stop - start) / total_selected
+                    dino_terms.append(weight * _layer_averaged_mse(pred_features, target_features))
             loss["loss_dino_latent_consistency"] = torch.stack(dino_terms).sum()
 
         if (
