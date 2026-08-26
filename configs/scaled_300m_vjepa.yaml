@@ -1,0 +1,40 @@
+# scaled_300m_vjepa.yaml -- same architecture as scaled_300m.yaml, for the V-JEPA track.
+# Only difference: bottleneck.temporal_stride 2->1, since V-JEPA's own tubelet_size=2 already
+# halves the frame count before the bottleneck sees it (DINO doesn't touch T at all). This keeps
+# both tracks landing on the same final latent frame count (T'=20 from a 40-frame clip).
+
+bottleneck:
+  dino_dim: 768
+  latent_dim: 32
+  stride: 2
+  temporal_stride: 1
+
+world_model:
+  latent_dim: 32
+  hidden_dim: 1024
+  depth: 8
+  num_heads: 16
+  mlp_dim_multiplier: 4
+  eps: 1.0e-6
+  layerscale_init: 1.0e-4
+  rope_theta_spatial: 100.0
+  rope_theta_temporal: 64.0
+
+decoder:
+  latent_dim: 32
+  stride: 2
+  width: 1024
+  depth: 6
+  num_heads: 16
+  mlp_dim_multiplier: 4
+  causal: true
+  out_channels: 3
+  patch_size: 16
+  patch_size_t: 2
+  eps: 1.0e-6
+  layerscale_init: 1.0e-4
+  rope_theta_spatial: 100.0
+  rope_theta_temporal: 64.0
+
+n_diffusion_steps: 4
+num_keys: 9
