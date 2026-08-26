@@ -5,12 +5,18 @@ on why overfitting one example is the right mechanism check.
 
 batch=2, 16 frames (not verify_codec_training.py's 1x4): large enough to exercise k>1 in
 CodecLoss's random frame-subset sampling for the DINO-consistency term, which is exactly where
-two real bugs were found and fixed -- VjepaModel.dino_forward couldn't accept fewer than
-tubelet_size(=2) frames (a chunk can legitimately be handed just 1), and CodecLoss's target-
-feature lookup assumed pixel-frame index == feature-frame index, true for DinoModel (no temporal
-reduction) but not V-JEPA (halves frame count via its tubelet). A 1x4 video never exercises either
-path (k=1 always, chunk_size=1 always) -- this size is chosen specifically so a regression here
-doesn't silently pass again.
+three real bugs were found and fixed -- VjepaModel.dino_forward couldn't accept fewer than
+tubelet_size(=2) frames (a chunk can legitimately be handed just 1); CodecLoss's target-feature
+lookup assumed pixel-frame index == feature-frame index, true for DinoModel (no temporal
+reduction) but not V-JEPA (halves frame count via its tubelet); and CodecLoss's frame-selection
+flattened batch+frame together before chunking, so a chunk could straddle two different videos in
+the batch -- harmless for DinoModel (no cross-frame interaction at all) but silently wrong for a
+tubelet-pairing encoder, which would then pair the last selected frame of one video with the
+first of a completely different one. A 1x4 video never exercises any of these (k=1 always,
+chunk_size=1 always, batch=1 so no second video to ever mix with) -- this size is chosen
+specifically so a regression here doesn't silently pass again. The third bug also needed its own
+dedicated check below (batch>=2 with an odd k), since the main overfit run's own even k=4 doesn't
+trigger it either.
 
 temporal_stride=1 on the bottleneck (not StridedConvBottleneckConfig's default of 2): V-JEPA
 already halves frame count internally, matching configs/scaled_300m_vjepa.yaml's real setting.
@@ -77,3 +83,45 @@ assert totalN < total0 * 0.5, (
     f"loss did not drop enough to trust the training mechanism: {total0:.4f} -> {totalN:.4f}"
 )
 print(f"[PASS] V-JEPA codec training mechanism works: loss dropped by {(1 - totalN / total0) * 100:.1f}%")
+
+# --- no cross-video frame mixing in the DINO-consistency term ---
+# Deliberately: batch=2 (a second video to possibly mix with), 36 frames (k=9, ODD -- the exact
+# repro condition), --perceptual-chunk-size=3 (doesn't divide 9 evenly either). predicted ==
+# target == a hand-crafted video (bypasses the decoder entirely -- it's untrained at this point in
+# the script and its output doesn't preserve input distinctness, which would make this check
+# meaningless): item 0 constant 0.05, item 1 constant 0.95, so any dino_forward call mixing frames
+# from both is immediately visible in that call's own input values.
+mix_check_loss_fn = CodecLoss(CodecLossWeights(auto_weight=False), perceptual_chunk_size=3)
+mix_check_loss_fn.bind_encoder_dino(vjepa)
+
+mix_video = torch.empty(2, 36, 3, 32, 32)
+mix_video[0], mix_video[1] = 0.05, 0.95
+with torch.no_grad():
+    mix_dino_features = vjepa.dino_forward(mix_video)
+
+calls = []
+original_forward = vjepa.dino_forward
+
+
+def spying_forward(x):
+    calls.append(x.detach().clone())
+    return original_forward(x)
+
+
+vjepa.dino_forward = spying_forward
+
+mix_outputs = CodecOutputs(
+    input_video=normalize_video(mix_video),
+    output_video=normalize_video(mix_video).clone().requires_grad_(True),
+    dino_features=mix_dino_features,
+)
+mix_check_loss_fn(mix_outputs)["loss_dino_latent_consistency"].backward()
+vjepa.dino_forward = original_forward
+
+assert len(calls) > 0, "no calls recorded -- this check isn't exercising the code path it means to"
+mixed_calls = [
+    i for i, c in enumerate(calls)
+    if (c.mean(dim=(0, 2, 3, 4)) < 0.5).any() and (c.mean(dim=(0, 2, 3, 4)) >= 0.5).any()
+]
+assert not mixed_calls, f"call(s) {mixed_calls} mixed frames from two different videos"
+print(f"[PASS] no cross-video frame mixing across {len(calls)} dino_forward calls (odd k=9, chunk_size=3)")
