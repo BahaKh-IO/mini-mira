@@ -1,0 +1,18 @@
+# Codec restart arc -- confirmed working config, see notes/session_handoff.md section 4.
+# lr_warmup_steps/lr_decay_steps are the documented gotcha: sized to the original 500-step arc
+# (3440->3940), must stay identical on every future --resume of this arc or the LR schedule
+# silently corrupts. That's exactly the problem this file exists to solve.
+#
+#   python scripts/train_codec.py --config configs/scaled_300m.yaml \
+#     --run-config configs/runs/codec_restart_arc.yaml \
+#     --index-path <train data dir> --require-pretrained-dino --resume
+
+height: 288
+width: 512
+frames: 40
+batch_size: 2
+grad_accum_steps: 16
+precision: bf16
+checkpoint_every: 100
+lr_warmup_steps: 25
+lr_decay_steps: 475

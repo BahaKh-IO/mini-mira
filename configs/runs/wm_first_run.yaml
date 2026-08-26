@@ -1,0 +1,8 @@
+# First real world-model run: no scheduled sampling, default eval settings. Paired with
+# wm_second_run_scheduled_sampling.yaml -- the diff between the two files is the record of what
+# changed between the two runs being compared. See notes/session_handoff.md section 5.
+
+precision: bf16
+batch_size: 4
+grad_accum_steps: 4
+steps: 3000
