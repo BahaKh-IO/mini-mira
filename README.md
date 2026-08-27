@@ -264,14 +264,33 @@ axis with no tradeoff. Decision handed to the supervisor; not yet acted on.
 
 What's still ahead: a deferred overfit-one-clip convergence check at 448×768 specifically (the
 existing ~83%-loss-drop proof was at 288×512, a different resolution) — queued for just before
-the real launch, not done yet. Then, once a GPU is chosen and the real 4,000-step run produces a
-checkpoint: `compute_latent_stats.py` needs the same V-JEPA fork (not before — nothing to compute
-stats from yet); then `train_world_model_vjepa.py`, forked the same way; then a full codec retrain
-from scratch under V-JEPA's feature space (the existing checkpoint can't be reused — the whole
-representation changes), then a world-model retrain on top. Three real methodology questions still
-need a decision before any final numbers count as comparable: whether both tracks get scored by
-the same fixed judge rather than each by its own backbone, what step budget each track gets, and
-whether hyperparameters stay identical across both.
+the real launch, not done yet. A GPU still needs to be chosen and the real 4,000-step run needs to
+produce a real checkpoint before any of the world-model scripts below can run for real. Three real
+methodology questions still need a decision before any final numbers count as comparable: whether
+both tracks get scored by the same fixed judge rather than each by its own backbone, what step
+budget each track gets, and whether hyperparameters stay identical across both.
+
+**World-model scaffolding, built ahead of the codec checkpoint existing**:
+`scripts/compute_latent_stats_vjepa.py` and `scripts/train_world_model_vjepa.py` are done — full
+forks of `compute_latent_stats.py`/`train_world_model.py`, `VjepaModel` injected via
+`LatentWorldModel`'s existing `dino:` seam. Same "build and verify now, can't run for real yet"
+shape as `evaluate_codec_vjepa.py` — CPU-only checks (syntax, real module import, `--help`) all
+pass, plus a real end-to-end run of `compute_latent_stats_vjepa.py` on synthetic data (random-init
+`VjepaModel`, loaded from the already-cached `facebookresearch/vjepa2` clone, no network needed).
+
+Along the way, found and fixed a real bug in shared code (`latent_world_model.py`, used by both
+tracks): `self.temporal_downsampling` was computed from `bottleneck_config.temporal_stride` alone,
+blind to an injected encoder's own temporal reduction. Correct for DINO (`dino_forward` never
+touches time); silently wrong for V-JEPA, whose `dino_forward` halves time internally
+(`tubelet_size=2`) before the bottleneck ever sees it — every latent frame's action-conditioning
+window would have covered half the raw frames it actually represents. This is exactly the risk
+already flagged, unresolved, in `notes/deviations.md` 1.21. Fixed:
+`bottleneck_config.temporal_stride * getattr(self.dino, "tubelet_size", 1)`, computed once
+`self.dino` is known — a provable no-op for DINO (no such attribute, falls back to `1`), confirmed
+empirically by re-running `verify_world_model_training.py` (DINO's own 5-check suite, unchanged
+results). New `scripts/verify_world_model_training_vjepa.py` mechanically proves the fix itself,
+with a time-halving stand-in encoder — confirms `temporal_downsampling` comes out as `stride * 2`,
+not `stride`, plus a real forward/backward/overfit/checkpoint round-trip.
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
@@ -321,8 +340,11 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/evaluate_codec.py` | Real quantitative eval of a trained codec checkpoint on held-out data |
 | `scripts/evaluate_codec_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` in place of `DinoModel` |
 | `scripts/compute_latent_stats.py` | One-shot latent mean/std computation, feeds `train_world_model.py` |
+| `scripts/compute_latent_stats_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` in place of `DinoModel` |
 | `scripts/train_world_model.py` | Real GPU world-model training |
+| `scripts/train_world_model_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` injected via `LatentWorldModel`'s `dino:` seam |
 | `scripts/verify_world_model_training.py` | CPU mechanism proof for `train_world_model.py` |
+| `scripts/verify_world_model_training_vjepa.py` | CPU mechanism proof that `temporal_downsampling` correctly accounts for a time-halving encoder (V-JEPA-specific, not a fork of the above) |
 | `scripts/verify_full_eval_metrics.py` | CPU mechanism proof for the full eval suite |
 | `scripts/verify_run_config.py` | CPU mechanism proof for the `--run-config` system |
 
