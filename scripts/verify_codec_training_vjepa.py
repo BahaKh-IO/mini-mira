@@ -125,3 +125,75 @@ mixed_calls = [
 ]
 assert not mixed_calls, f"call(s) {mixed_calls} mixed frames from two different videos"
 print(f"[PASS] no cross-video frame mixing across {len(calls)} dino_forward calls (odd k=9, chunk_size=3)")
+
+# --- real temporal adjacency preserved in every dino_forward call (Finding 1's fix) ---
+# Deliberately: 40 frames (the real launch's actual --frames), frac=0.25 -> k=10, unset
+# --perceptual-chunk-size -> chunk_size=k=10 (all 10 selected frames in ONE call) -- the exact
+# real-launch settings that made the pre-fix cross-frame-pairing bug active by default. video[:,
+# i] is a per-frame CONSTANT proportional to i -- a frame-identity-revealing signal -- so any
+# dino_forward call's own input directly reveals which raw frames it received, in what order.
+# Old (pre-fix) behavior would pick k arbitrary scattered frames and feed them as one fake clip;
+# this check would have failed against that, since scattered frames aren't 1-raw-frame apart.
+adjacency_video = torch.empty(1, 40, 3, 32, 32)
+for i in range(40):
+    adjacency_video[0, i] = i / 40
+
+adjacency_loss_fn = CodecLoss(CodecLossWeights(auto_weight=False))
+adjacency_loss_fn.bind_encoder_dino(vjepa)
+
+with torch.no_grad():
+    adjacency_dino_features = vjepa.dino_forward(adjacency_video)
+
+adjacency_calls = []
+original_forward2 = vjepa.dino_forward
+
+
+def spying_forward2(x):
+    adjacency_calls.append(x.detach().clone())
+    return original_forward2(x)
+
+
+vjepa.dino_forward = spying_forward2
+
+adjacency_outputs = CodecOutputs(
+    input_video=normalize_video(adjacency_video),
+    output_video=normalize_video(adjacency_video).clone().requires_grad_(True),
+    dino_features=adjacency_dino_features,
+)
+adjacency_loss_fn(adjacency_outputs)["loss_dino_latent_consistency"].backward()
+vjepa.dino_forward = original_forward2
+
+assert len(adjacency_calls) > 0, "no calls recorded -- this check isn't exercising the code path it means to"
+for call_idx, call in enumerate(adjacency_calls):
+    frame_values = call.mean(dim=(0, 2, 3, 4))  # (t,) -- one value per frame position in this call
+    n = frame_values.shape[0]
+    assert n % 2 == 0, f"call {call_idx} got an odd frame count ({n}) -- should always be tubelet-aligned"
+    for pair_start in range(0, n, 2):
+        gap = (frame_values[pair_start + 1] - frame_values[pair_start]).abs().item()
+        assert abs(gap - 1 / 40) < 1e-4, (
+            f"call {call_idx}, pair at position {pair_start}: frame-value gap {gap:.4f} != "
+            f"expected {1 / 40:.4f} (1 raw frame apart) -- these two positions are NOT real "
+            f"temporal neighbors, exactly the bug this check exists to catch"
+        )
+print(f"[PASS] every dino_forward call ({len(adjacency_calls)} total) pairs genuinely adjacent real frames")
+
+# --- _select_target_features deduplicates to one representative feature per real group ---
+from mini_mira.codec.loss import _select_target_features  # noqa: PLC0415 -- direct unit check
+
+# A fake "features" tensor tagged by its own group index (the dim=1 position IS the group id) --
+# t_pixel_total=40, features.shape[1]=20 (real V-JEPA reduction=2, matching the real launch).
+# crafted_t_idx is exactly what _sample_frame_indices would produce for 5 groups: sorted,
+# reduction-sized (2) consecutive runs of real adjacent pixel-frame indices.
+fake_features = torch.arange(20, dtype=torch.float32).view(1, 20, 1, 1, 1)
+group_starts = [0, 7, 12, 15, 19]
+crafted_t_idx = torch.tensor(sorted(g * 2 + i for g in group_starts for i in range(2)))
+
+dedup_result = _select_target_features(fake_features, crafted_t_idx, t_pixel_total=40, start=0, stop=10)
+dedup_expected = torch.tensor(group_starts, dtype=torch.float32).view(1, 5, 1, 1, 1)
+assert dedup_result.shape == dedup_expected.shape, (
+    f"expected shape {tuple(dedup_expected.shape)}, got {tuple(dedup_result.shape)}"
+)
+assert torch.equal(dedup_result, dedup_expected), (
+    f"expected {dedup_expected.flatten().tolist()}, got {dedup_result.flatten().tolist()}"
+)
+print(f"[PASS] _select_target_features deduplicates to one representative per group: {dedup_result.flatten().tolist()}")
