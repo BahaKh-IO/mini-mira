@@ -344,6 +344,70 @@ more, all fixed:
   field plus one more warn-don't-block check in `train_world_model_vjepa.py`'s resume block,
   mirroring the `codec_checkpoint`/`latent_mean` checks already there.
 
+**Real GPU validation of the V-JEPA world-model mechanism-only path**, done on an A40 window
+explicitly reserved for world-model debugging (not the codec) while a new box is awaited for the
+real codec run. Ran `compute_latent_stats_vjepa.py` + `train_world_model_vjepa.py` for real —
+real pretrained V-JEPA encoder, random-init bottleneck/decoder (no `--codec-checkpoint`, per its
+now-optional mechanism-only mode) — and confirmed the entire pipeline works end to end: real
+training loop, validation, the full eval suite (drift metrics, Frechet DINO/Inception distance,
+PSNR/LPIPS/SSIM, rendered rollout preview videos), and checkpointing. Real numbers from that run:
+~18.5–19.2GiB peak memory and roughly 50–60 sec/step at `448×768×40`/batch=2/accum=16 — notably
+lighter than the codec's own measured 94.6 sec/step at the same resolution, as expected (no
+decoder backward pass, no LPIPS/DINO-consistency compute in the world model's own loss).
+
+Two more real bugs were found and fixed live during this validation, same class as the pre-launch
+audit above:
+- **The `.item()`-per-micro-step sync-stall pattern** — identical root cause to the one already
+  found and fixed for `train_codec_vjepa.py` (calling `.item()` on every loss term inside the
+  grad-accum micro-step loop forces a full CUDA sync each time), but never ported to the
+  world-model scripts. Confirmed live via `nvidia-smi dmon` showing the same alternating 0%/100%
+  pattern on a real run. Fixed in **both** `train_world_model.py` and `train_world_model_vjepa.py`
+  this time (backbone-agnostic bug — leaving it only in the V-JEPA script would have made V-JEPA
+  look artificially faster than DINO for reasons unrelated to real architectural cost, a real
+  confound for the eventual benchmark).
+- **`full_eval_metrics.py` crashed on the real full eval** (`AssertionError: Need at least 2
+  samples to compute statistics.`) — a gap in the earlier `dino_temporal_scale` fix: it corrected
+  *where* the generated region starts in DINO-feature space, but not that its *total length* is
+  also proportionally shorter than video-frame space for a time-halving encoder. The same
+  `fdd_slice_frames`-wide windows, sized for the longer video tensor, ran past the end of the
+  shorter DINO-feature one for later slices, leaving them with zero samples. Fixed with a new
+  `dino_fdd_slice_frames` parameter, scaled proportionally
+  (`fdd_slice_frames * dino_temporal_scale // temporal_downsampling`) — reproduced the exact real
+  crash in a CPU regression test first, confirmed the fix resolves it, confirmed the un-fixed
+  formula still crashes the same way, then confirmed on the real GPU run itself.
+
+**V-JEPA world-model real training recipe — settled**, matching DINO's own second real run's
+effective recipe where it makes sense to:
+- `--steps 5500`
+- `--scheduled-sampling-prob 0.3` **from step 0** — a deliberate divergence from DINO's own
+  procedure (DINO trained ~2,900 steps *without* it first, then `--resume`d with it added for the
+  remaining ~2,600 steps); starting with it from the beginning is intentional since the benefit is
+  already proven, not something V-JEPA needs to rediscover independently.
+- `--height 448 --width 768 --frames 40` — **not** matching DINO's own world-model resolution
+  (DINO used `288×512`, its script's own defaults). This is determined by whichever resolution the
+  real V-JEPA *codec* ends up trained at (already settled at `448×768`), since the frozen
+  bottleneck/decoder only make sense at the resolution they were actually trained on — DINO's
+  `288×512` simply reflects DINO's own codec's resolution, a separate number.
+- `--batch-size 4 --grad-accum-steps 4` (effective batch 16, matching DINO's) — **not yet verified
+  to fit V-JEPA's real memory footprint at 448×768.** The mechanism-only validation above only
+  confirmed `--batch-size 2 --grad-accum-steps 16` fits comfortably (~19GiB of 46GiB); doubling the
+  micro-batch size roughly doubles per-batch activation memory, unconfirmed whether it still fits.
+  Worth a real OOM probe before committing the full 5,500-step budget to it, same discipline
+  already used for the codec's own resolution/batch tuning.
+- `bf16`, no PSD (`--psd-weight`/`--psd-loss-prob` left at 0.0) — matching DINO, which never used
+  PSD in either real run.
+
+**Two of the four original benchmark-fairness questions are eval/comparison-time decisions, not
+training-launch blockers** — corrected framing from an earlier pass: whether both tracks get
+scored by the same fixed judge, and which DINO checkpoint counts as the control, only matter once
+someone is actually writing up the DINO-vs-V-JEPA comparison. The code has no way to do "same
+fixed judge" *during* training anyway — `decode_and_dino` always reuses `model.dino` (whichever
+backbone that model trained under) for its own periodic eval, to avoid loading a second backbone;
+a shared-judge comparison would need a separate script built later. Still genuinely open: full
+hyperparameter parity beyond what's settled above, and formally which DINO checkpoint is the
+control (the settled recipe above already implies DINO's second/5,500-step run, but that's an
+implication, not yet an explicit statement for a real write-up).
+
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
 
