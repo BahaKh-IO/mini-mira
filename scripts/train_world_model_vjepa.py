@@ -61,7 +61,7 @@ from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 
 from mini_mira.codec.logging_utils import get_wandb_run_id, init_wandb, log_step
 from mini_mira.codec.video_prep import resize_to_canonical
-from mini_mira.codec.vjepa import DEFAULT_VJEPA_LAYERS, VjepaModel
+from mini_mira.codec.vjepa import DEFAULT_VJEPA_LAYERS, VJEPA_TUBELET_SIZE_EXPECTED, VjepaModel
 from mini_mira.ml.config_loading import apply_run_config, load_pipeline_config, load_run_config
 from mini_mira.ml.run_config import WorldModelRunConfig
 from mini_mira.world_model.checkpoint import load_checkpoint, save_checkpoint
@@ -246,12 +246,20 @@ def run_full_eval(
                 # reads model.dino internally -- works unchanged with VjepaModel injected there,
                 # same .dino_forward contract as DinoModel.
                 real_video, pred_video, real_dino, pred_dino = decode_and_dino(model, z, z_t)
+                # decode_and_dino re-encodes the DECODED video through model.dino -- for VjepaModel
+                # that halves time again (its own tubelet reduction), so real_dino/pred_dino land
+                # back in latent-frame units, not the video-frame units model.temporal_downsampling
+                # alone would assume (true only for DinoModel, which never touches time). See
+                # compute_drift_metrics/compute_full_eval_metrics's own docstrings.
+                dino_temporal_scale = model.temporal_downsampling // getattr(model.dino, "tubelet_size", 1)
                 drift = compute_drift_metrics(
-                    z, z_t, context_latents, real_dino, pred_dino, model.temporal_downsampling
+                    z, z_t, context_latents, real_dino, pred_dino, model.temporal_downsampling,
+                    dino_temporal_scale=dino_temporal_scale,
                 )
                 compute_full_eval_metrics(
                     real_video, pred_video, real_dino, pred_dino,
                     context_latents, model.temporal_downsampling, full_eval_metrics,
+                    dino_temporal_scale=dino_temporal_scale,
                 )
 
                 # Render a few samples for visual inspection, drawn from whichever batches come
@@ -301,6 +309,18 @@ def main() -> None:
         )
 
     config = load_pipeline_config(args.config)
+    # Real, previously-hit-for-real requirement (notes/vjepa_next_session.md): the decoder's own
+    # temporal/spatial upsample only exactly reconstructs --height/--width if both are divisible
+    # by decoder.patch_size * bottleneck.stride -- otherwise it silently reconstructs a slightly
+    # different size (e.g. 720 -> 704), surfacing later as a confusing loss.py shape-mismatch
+    # crash instead of a clear error here. Purely additive: every already-proven-valid real
+    # launch already satisfies this, so this never fires for a config that already works.
+    required_divisor = config.decoder.patch_size * config.bottleneck.stride
+    assert args.height % required_divisor == 0 and args.width % required_divisor == 0, (
+        f"--height {args.height} / --width {args.width} must both be divisible by "
+        f"{required_divisor} (decoder.patch_size {config.decoder.patch_size} * bottleneck.stride "
+        f"{config.bottleneck.stride})"
+    )
     # CLI/--run-config (resolved above) is authoritative over the YAML preset's own
     # psd_weight/psd_loss_prob (both default 0.0 there too, matching mira's own shipped
     # single-player config).
@@ -308,9 +328,23 @@ def main() -> None:
     config.world_model.psd_loss_prob = args.psd_loss_prob
     config.world_model.scheduled_sampling_prob = args.scheduled_sampling_prob
 
-    temporal_stride = config.bottleneck.temporal_stride
+    # NOT just config.bottleneck.temporal_stride -- that alone was the actual raw-frames-per-
+    # latent-frame ratio for train_world_model.py's own DINO track (DinoModel never touches time),
+    # but VjepaModel halves time internally BEFORE the bottleneck ever sees it, so the real ratio
+    # here is the product of both. Computed from the sanity-checked VJEPA_TUBELET_SIZE_EXPECTED
+    # constant (VjepaModel.__init__ asserts the real encoder actually matches it) rather than
+    # constructing the model early just to read model.temporal_downsampling off it -- this keeps
+    # these pre-flight checks fast/cheap and failing before any real model construction, same as
+    # before. Left uncorrected, this whole block silently validated against the wrong ratio (e.g.
+    # generated_video_frames landing on 34, not the real 28, at this script's own defaults) --
+    # confirmed real: --frames 40, --drift-eval-context-latents 6, --fdd-slice-frames 7 crashed
+    # the assert two lines below with the old formula, despite being exactly the values the
+    # script's own help text claims should work.
+    temporal_stride = config.bottleneck.temporal_stride * VJEPA_TUBELET_SIZE_EXPECTED
     assert args.frames % temporal_stride == 0, (
-        f"--frames ({args.frames}) must be a multiple of bottleneck.temporal_stride ({temporal_stride})"
+        f"--frames ({args.frames}) must be a multiple of the real total temporal downsampling "
+        f"({temporal_stride} = bottleneck.temporal_stride {config.bottleneck.temporal_stride} * "
+        f"V-JEPA tubelet_size {VJEPA_TUBELET_SIZE_EXPECTED})"
     )
     n_latent_frames = args.frames // temporal_stride
     assert 0 < args.drift_eval_context_latents < n_latent_frames, (
@@ -423,6 +457,17 @@ def main() -> None:
                 f"{latent_stats['latent_mean']}/{latent_stats['latent_std']} -- mismatched "
                 f"normalization, training will silently corrupt."
             )
+        # Same warn-don't-block pattern as the two checks above: this value never affects any
+        # nn.Parameter's shape (only the runtime action/latent alignment math), so a mismatched
+        # --config/codec pairing that happens to keep every shape identical would otherwise load
+        # with zero error and train on stale alignment.
+        prev_temporal_downsampling = provenance["temporal_downsampling"]
+        if prev_temporal_downsampling is not None and prev_temporal_downsampling != model.temporal_downsampling:
+            print(
+                f"WARNING: this checkpoint was trained with temporal_downsampling="
+                f"{prev_temporal_downsampling}, but this run computes {model.temporal_downsampling} "
+                f"-- if these differ, action/latent alignment will silently corrupt."
+            )
         batches_consumed = provenance["dataloader_batches_consumed"]
         if batches_consumed > 0:
             print(f"Fast-forwarding dataloader past {batches_consumed} already-consumed batches...")
@@ -470,6 +515,7 @@ def main() -> None:
             codec_checkpoint=args.codec_checkpoint,
             latent_mean=latent_stats["latent_mean"], latent_std=latent_stats["latent_std"],
             dataloader_batches_consumed=batches_consumed,
+            temporal_downsampling=model.temporal_downsampling,
         )
         if args.hf_backup_repo:
             from huggingface_hub import HfApi  # noqa: PLC0415 -- optional dep, only used here
