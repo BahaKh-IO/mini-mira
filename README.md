@@ -182,15 +182,41 @@ DINO, in `video_prep.py`) already no-ops once `--height`/`--width` match a clip'
 passing `--height 720 --width 1280` on the V-JEPA launch is the entire change. `MyBottleneck`
 (strided-conv, no absolute-position assumption) and the decoder (RoPE) are both already
 resolution-agnostic, confirmed by reading the code, and V-JEPA 2.1's own sincos position
-embeddings interpolate to arbitrary input shapes internally. Real, unresolved cost: native is
-6.25x the pixel count of 288×512 (18×32=576 patches/frame vs. 45×80=3600, at V-JEPA's real
-`patch_size=16`) — attention memory shouldn't blow up quadratically (V-JEPA uses
-`F.scaled_dot_product_attention`'s flash/memory-efficient backend) but attention **compute**
-still scales ~quadratically with token count, and every pixel-domain module (decoder, LPIPS/VGG16,
-raw MAE/L1) scales directly with the 6.25x pixel count regardless. Expect a real jump past
-V-JEPA's already-measured ~32.5GB at 288×512 — not yet measured for real at native resolution;
-a short probe run is the next step before committing the full 4,000-step budget to it (see
-`notes/vjepa_next_session.md`).
+embeddings interpolate to arbitrary input shapes internally.
+
+**Native resolution was tried for real on the rented box and abandoned.** `--batch-size 2` OOM'd
+outright; `--batch-size 1` OOM'd too and barely moved the memory number (44.21GB → 44.10GB,
+proving the cost is per-frame token count, not batch size); 720 also turns out to violate a real
+architectural requirement (height/width must divide evenly by `patch_size(16) ×
+bottleneck_stride(2) = 32` — `720/32=22.5`, so the decoder silently reconstructed the wrong shape
+and crashed downstream instead of failing at startup). Cropping to 704 (`22×32`) plus
+`--activation-checkpointing` got it to fit — but at only ~1.4GB of headroom, judged too risky for
+an unattended multi-day run. **Supervisor pivoted the target resolution twice more**: 512×896
+(architecturally clean, but OOM'd even with checkpointing) then **settled at 448×768** (the
+supervisor's requested 448×784 also violates the same 32-divisibility rule — `784/32=24.5` — 768
+was chosen as the nearest valid crop). Confirmed working with real margin: `cuda_peak_reserved`
+= 34.11GB (35.44GB with `--compile`, see below), out of a ~44.42GB usable pool.
+
+**Real, unrelated performance bug found and fixed while investigating why the GPU was reportedly
+only ~57% utilized**: `nvidia-smi dmon` confirmed the pattern directly (`sm%` alternating 0/100
+almost every second, ~62% average) and ruled out the dataloader first, with real evidence, before
+touching any training code — `top` showed the CPU ~60% idle and individual dataloader workers
+lightly loaded even at `--num-workers 8` (all of `ubuntu-gpu`'s real cores). Root cause:
+`train_codec_vjepa.py`'s per-micro-step loss accumulation called `.item()` on every loss term,
+every micro-step — each call forces a full CUDA sync, serializing what should be an async
+pipeline. Fixed by accumulating losses as GPU tensors through the micro-step loop and converting
+to Python floats once per step instead of once per term per micro-step (same final numbers, far
+fewer sync points). Confirmed via `nvidia-smi dmon` again after the fix: **`sm%` sustained at
+100% across every sample.** V-JEPA-track only, by decision — `train_codec.py` (DINO) has the
+identical pattern but was left untouched.
+
+**Supervisor separately asked to compile the model before the real training run** — `--compile`
+added to `train_codec_vjepa.py`, wrapping just the trainable `bottleneck`/`decoder` in
+`torch.compile()` (the frozen V-JEPA encoder is deliberately excluded — external, git-cloned
+`facebookresearch/vjepa2` code, real risk of graph breaks on unfamiliar ops). Confirmed working
+combined with `--activation-checkpointing` (a real, version-sensitive PyTorch interaction that
+had never been tested together before) — no crash, no `torch._dynamo` errors, across several real
+steps on GPU.
 
 `train_codec_vjepa.py` now has the same `SIGTERM`/`SIGINT` handling `train_world_model.py` already
 had (graceful checkpoint save + forced HF upload + wandb sign-off instead of an abrupt kill) —
@@ -215,15 +241,35 @@ pre-fix V-JEPA-track checkpoint.
 place of `DinoModel` throughout, `--config` defaulting to `configs/scaled_300m_vjepa.yaml`. Built
 ahead of there being a real trained V-JEPA codec checkpoint to point it at (the real 4,000-step run
 hasn't launched yet) — syntax/import-checked, not yet run against real output, since there's
-nothing real to evaluate until that checkpoint exists.
+nothing real to evaluate until that checkpoint exists. Also served as the real, independent proof
+that the `checkpoint.py` fix above actually works: saved a checkpoint under `--compile` on GPU,
+loaded it through this (non-compiled) script, got real eval numbers back instead of the
+`Missing/Unexpected key(s)` crash.
 
-What's still ahead: `compute_latent_stats.py` needs the same fork once there's a real V-JEPA codec
-checkpoint to point it at (not before — nothing to compute stats from yet); then
-`train_world_model_vjepa.py`, forked the same way once that checkpoint exists; then a full codec
-retrain from scratch under V-JEPA's feature space (the existing checkpoint can't be reused — the
-whole representation changes), then a world-model retrain on top. Three real methodology questions
-still need a decision before any final numbers count as comparable: whether both tracks get scored
-by the same fixed judge rather than each by its own backbone, what step budget each track gets, and
+**Real per-step timing measured** at the settled config (448×768, `--compile
+--activation-checkpointing`, batch=2/accum=16): a clean, post-compile-warmup read via the real
+filesystem timestamps of two saved preview videos, 4 steps apart — **≈94.6 sec/step, so ≈105
+hours (≈4.4 days) for the full 4,000-step run.** This is the number the GPU rental decision below
+is built on.
+
+**GPU rental decision in progress**: real requirements (≥40GB VRAM with margin, bf16/Ampere-or-
+newer, CUDA-only — rules out non-NVIDIA accelerators regardless of specs) plus the timing number
+above were used to evaluate a real cloud GPU price list against the current A40 rental. vCPU
+count and system RAM both turned out not to be differentiators (confirmed: `--num-workers 8` left
+the CPU ~60% idle once the sync-stall bug above was fixed; every viable VRAM-qualifying option
+already ships far more RAM than the ~18GB actually observed in use). Recommendation: A100 80GB —
+cheaper per hour *and* faster *and* more VRAM than the A40 already tested, beating it on every
+axis with no tradeoff. Decision handed to the supervisor; not yet acted on.
+
+What's still ahead: a deferred overfit-one-clip convergence check at 448×768 specifically (the
+existing ~83%-loss-drop proof was at 288×512, a different resolution) — queued for just before
+the real launch, not done yet. Then, once a GPU is chosen and the real 4,000-step run produces a
+checkpoint: `compute_latent_stats.py` needs the same V-JEPA fork (not before — nothing to compute
+stats from yet); then `train_world_model_vjepa.py`, forked the same way; then a full codec retrain
+from scratch under V-JEPA's feature space (the existing checkpoint can't be reused — the whole
+representation changes), then a world-model retrain on top. Three real methodology questions still
+need a decision before any final numbers count as comparable: whether both tracks get scored by
+the same fixed judge rather than each by its own backbone, what step budget each track gets, and
 whether hyperparameters stay identical across both.
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
