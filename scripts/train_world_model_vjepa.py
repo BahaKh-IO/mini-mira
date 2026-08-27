@@ -105,7 +105,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--index-path", required=True, help="Real training dataset dir from download_shards.py")
     parser.add_argument("--test-index-path", required=True, help="Held-out dir for validation + drift eval")
-    parser.add_argument("--codec-checkpoint", required=True, help="Frozen V-JEPA-track codec checkpoint (bottleneck+decoder)")
+    parser.add_argument(
+        "--codec-checkpoint", default=None,
+        help="Frozen V-JEPA-track codec checkpoint (bottleneck+decoder). Omit for a real-GPU "
+        "mechanism-only run (random-init bottleneck/decoder, matching LatentWorldModel's own "
+        "codec_checkpoint=None mode) -- exercises the real encoder/dataloader/training-loop/eval "
+        "mechanics and timing without needing a trained codec checkpoint yet.",
+    )
     parser.add_argument("--latent-stats", required=True, help="scripts/compute_latent_stats_vjepa.py JSON output")
     parser.add_argument("--require-pretrained-vjepa", action="store_true")
     parser.add_argument(
@@ -443,7 +449,10 @@ def main() -> None:
         # mean something different than what the model already learned. Warn loudly, don't block:
         # a moved/renamed-but-identical checkpoint file would otherwise trip this unnecessarily.
         prev_codec = provenance["codec_checkpoint"]
-        if prev_codec is not None and prev_codec != str(Path(args.codec_checkpoint)):
+        # str(Path(None)) would crash -- --codec-checkpoint can now be omitted (mechanism-only
+        # runs), so this comparison needs its own None guard rather than assuming a real path.
+        current_codec = str(Path(args.codec_checkpoint)) if args.codec_checkpoint is not None else None
+        if prev_codec is not None and prev_codec != current_codec:
             print(
                 f"WARNING: this checkpoint was trained against codec checkpoint {prev_codec!r}, "
                 f"but --codec-checkpoint is {args.codec_checkpoint!r} -- if these aren't the same "
