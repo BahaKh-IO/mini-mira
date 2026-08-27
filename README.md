@@ -59,6 +59,7 @@ model:
 | `bos` | 32 |
 | **Total** | **292,457,344** (−2.51% vs. the 300M target) |
 | `DinoModel` (frozen, real pretrained weights, not in the total) | 85,669,632 |
+| `VjepaModel` (frozen, real pretrained weights, V-JEPA track only, not in the total) | 86,833,152 |
 
 Tuned so the world_model/decoder parameter ratio (1.81) roughly matches real mira's own shipped
 ratio (1.82), not picked by feel. Fast verification scripts instead use `configs/small.yaml`
