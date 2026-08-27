@@ -59,7 +59,8 @@ def decode_and_dino(model, z: Tensor, z_t: Tensor) -> tuple[Tensor, Tensor, Tens
 
 
 def compute_drift_metrics(
-    z: Tensor, z_t: Tensor, n_context_latents: int, real_dino: Tensor, pred_dino: Tensor, temporal_downsampling: int
+    z: Tensor, z_t: Tensor, n_context_latents: int, real_dino: Tensor, pred_dino: Tensor, temporal_downsampling: int,
+    dino_temporal_scale: int | None = None,
 ) -> dict[str, Tensor]:
     """Given one rollout's (z, z_t) and the (real_dino, pred_dino) already produced by
     decode_and_dino -- computed once by the caller and shared with compute_full_eval_metrics and
@@ -71,12 +72,24 @@ def compute_drift_metrics(
       latent_drift   = 1 - cosine_similarity(rolled-out latents, real latents, over the channel dim)
     Only the GENERATED region (from n_context_latents onward) is scored -- the context region is
     real ground truth on both sides by construction and would trivially read as zero drift.
+
+    dino_temporal_scale: how many entries of real_dino/pred_dino one latent frame's worth of
+    context actually spans -- NOT always the same as temporal_downsampling. decode_and_dino
+    re-runs model.dino.dino_forward on the DECODED video, and for an encoder with its own
+    temporal reduction (e.g. VjepaModel, which halves time via its tubelet) that re-encoding
+    undoes some of the round-trip: real_dino/pred_dino land back in latent-frame units (dino_
+    temporal_scale=1), not video-frame units (temporal_downsampling, DinoModel's case, since
+    DinoModel never touches time at all). Defaults to None -> falls back to temporal_downsampling,
+    byte-identical to this function's own original behavior -- a real caller must pass the
+    correct value explicitly for any encoder with its own reduction (see train_world_model_vjepa.
+    py's run_full_eval: temporal_downsampling // getattr(model.dino, "tubelet_size", 1)).
     """
-    # n_context_latents is in LATENT-frame units; decoded video/DINO features are in VIDEO-frame
-    # units, temporal_downsampling times longer (the decoder's own patch_size_t upsample, which
-    # matches bottleneck.temporal_stride by the codec's own encode/decode round-trip design) --
-    # scale the offset before slicing either.
-    n_context_frames = n_context_latents * temporal_downsampling
+    if dino_temporal_scale is None:
+        dino_temporal_scale = temporal_downsampling
+    # n_context_latents is in LATENT-frame units; real_dino/pred_dino are scaled by
+    # dino_temporal_scale relative to that (see this function's own docstring above for why that
+    # can differ from temporal_downsampling) -- scale the offset before slicing either.
+    n_context_frames = n_context_latents * dino_temporal_scale
     real_dino_gen = real_dino[:, n_context_frames:]
     pred_dino_gen = pred_dino[:, n_context_frames:]
 

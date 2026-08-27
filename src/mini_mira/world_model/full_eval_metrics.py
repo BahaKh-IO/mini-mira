@@ -263,16 +263,27 @@ class FullEvalMetrics(nn.Module):
 def compute_full_eval_metrics(
     real_video: Tensor, pred_video: Tensor, real_dino: Tensor, pred_dino: Tensor,
     n_context_latents: int, temporal_downsampling: int, metrics: FullEvalMetrics,
+    dino_temporal_scale: int | None = None,
 ) -> None:
     """Given the (real_video, pred_video, real_dino, pred_dino) already produced by
     eval_metrics.decode_and_dino -- computed once by the caller and shared with
     compute_drift_metrics and rollout-video rendering, not redone here -- slices to the generated
     region and updates `metrics`'s running accumulators in place.
+
+    dino_temporal_scale: same meaning as compute_drift_metrics's own parameter of the same name --
+    see that function's docstring. Only applies to the real_dino/pred_dino slice: real_video/
+    pred_video genuinely are in video-frame units for every encoder (the decoder's own upsample
+    always reconstructs the real raw frame count), so temporal_downsampling stays correct for
+    those regardless. Defaults to None -> falls back to temporal_downsampling, byte-identical to
+    this function's own original behavior.
     """
+    if dino_temporal_scale is None:
+        dino_temporal_scale = temporal_downsampling
     n_context_frames = n_context_latents * temporal_downsampling
+    n_context_dino_frames = n_context_latents * dino_temporal_scale
     metrics.update(
         real_video[:, n_context_frames:],
         pred_video[:, n_context_frames:],
-        real_dino[:, n_context_frames:],
-        pred_dino[:, n_context_frames:],
+        real_dino[:, n_context_dino_frames:],
+        pred_dino[:, n_context_dino_frames:],
     )
