@@ -86,7 +86,6 @@ class LatentWorldModel(nn.Module):
     ):
         super().__init__()
         self.world_model_config = world_model_config
-        self.temporal_downsampling = bottleneck_config.temporal_stride
 
         # --- Frozen codec: DINO + bottleneck + decoder ---
         # Multi-layer aggregation, matching train_codec.py's own encoder-side DinoModel
@@ -104,6 +103,20 @@ class LatentWorldModel(nn.Module):
             last_layer_only=False,
             layer_indices=DEFAULT_ENCODER_AGGREGATION_LAYERS[encoder_dino_model],
         )
+        # True raw-video-frames-per-latent-frame ratio -- NOT just the bottleneck's own stride.
+        # DinoModel.dino_forward never touches time, so bottleneck_config.temporal_stride alone is
+        # already the full ratio for it (getattr below falls back to 1, byte-identical to the old
+        # formula). VjepaModel.dino_forward halves time internally BEFORE the bottleneck ever sees
+        # it (tubelet_size=2, vjepa.py) -- configs/scaled_300m_vjepa.yaml's temporal_stride=1 only
+        # fixes the LATENT TENSOR's shape (so both tracks land on T'=20 from 40 raw frames), it
+        # doesn't account for this separately-tracked ratio. Left uncorrected, every latent frame's
+        # action window (_encode below, ActionEncoder's own reshape) would silently be computed as
+        # covering 1 raw frame instead of the 2 it actually represents -- a real, silent
+        # action/latent misalignment specific to any encoder with its own temporal reduction.
+        # Exactly the risk notes/deviations.md 1.21 already flagged as open, unresolved by the
+        # config alone. Must be computed here, after self.dino is known, not by the caller after
+        # construction -- ActionEncoder below is built from this value and keeps its own copy.
+        self.temporal_downsampling = bottleneck_config.temporal_stride * getattr(self.dino, "tubelet_size", 1)
         self.bottleneck = MyBottleneck(bottleneck_config)
         self.decoder = ViTVideoDecoder(decoder_config)
         if codec_checkpoint is not None:
