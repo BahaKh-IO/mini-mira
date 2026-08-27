@@ -199,6 +199,18 @@ Added ahead of the real training run on the newly rented GPU box, where an unatt
 kill was judged worth guarding against rather than accepting the same risk DINO's own codec run
 already ran with successfully.
 
+**Real bug found and fixed in `codec/checkpoint.py`** (shared, so it also protects `train_codec.py`
+even though DINO never triggers it): `train_codec_vjepa.py`'s new `--compile` flag wraps
+`bottleneck`/`decoder` in `torch.compile()`, whose `OptimizedModule` wrapper adds a real
+`"_orig_mod."` prefix to every `state_dict()` key (confirmed both locally, with a CPU
+reproduction, and on real GPU: saved a checkpoint under `--compile`, then failed to load it into
+`evaluate_codec_vjepa.py`'s plain, uncompiled modules — `Missing key(s) ... Unexpected key(s):
+"_orig_mod.projection.weight"`). Fixed by unwrapping to the real underlying module (via
+`OptimizedModule`'s own `._orig_mod` attribute) on both save and load, so every checkpoint is
+always stored in one plain, portable format regardless of whether `--compile` produced or is
+loading it — a no-op whenever `--compile` was never used, which is every existing DINO-track and
+pre-fix V-JEPA-track checkpoint.
+
 `scripts/evaluate_codec_vjepa.py` is done — a full fork of `evaluate_codec.py`, `VjepaModel` in
 place of `DinoModel` throughout, `--config` defaulting to `configs/scaled_300m_vjepa.yaml`. Built
 ahead of there being a real trained V-JEPA codec checkpoint to point it at (the real 4,000-step run
