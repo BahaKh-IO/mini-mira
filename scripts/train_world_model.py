@@ -448,7 +448,17 @@ def main() -> None:
 
     for step in range(start_step, args.steps):
         optimizer.zero_grad()
-        accumulated: dict[str, float] = {}
+        # Held as GPU tensors through the micro-step loop, not Python floats -- v.item() forces a
+        # full CUDA sync (blocks the CPU until every queued kernel finishes), and doing that once
+        # per loss term per micro-step (this loop's original behavior) serializes what should be
+        # an async pipeline. Identical root cause, identical fix already proven for real in
+        # train_codec_vjepa.py this project (found via nvidia-smi dmon showing the GPU
+        # alternating 0%/100%), later confirmed live on train_world_model_vjepa.py too -- backbone-
+        # agnostic bug, ported here so a future DINO run isn't artificially slower than V-JEPA's
+        # for reasons unrelated to real architectural cost. Converted to floats once, after the
+        # loop, instead -- same final numbers, far fewer sync points (was num_loss_terms *
+        # grad_accum_steps per step, now num_loss_terms once).
+        accumulated: dict[str, torch.Tensor] = {}
         for _ in range(args.grad_accum_steps):
             batch, _metadata = next(train_iter)
             batches_consumed += 1
@@ -457,7 +467,10 @@ def main() -> None:
                 losses = model(batch)
             grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
             for k, v in losses.items():
-                accumulated[k] = accumulated.get(k, 0.0) + v.item() / args.grad_accum_steps
+                term = v.detach() / args.grad_accum_steps
+                accumulated[k] = term if k not in accumulated else accumulated[k] + term
+        # Single sync point per loss term for the whole step, not one per term per micro-step.
+        accumulated_floats: dict[str, float] = {k: v.item() for k, v in accumulated.items()}
         grad_scaler.step(optimizer)
         grad_scaler.update()
         lr_scheduler.step()
@@ -478,13 +491,13 @@ def main() -> None:
 
         current_lr = optimizer.param_groups[0]["lr"]
         if (step + 1) % console_log_every == 0 or step == start_step:
-            term_str = ", ".join(f"{k}={v:.4f}" for k, v in accumulated.items() if k != "loss_total")
-            print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated['loss_total']:.4f} ({term_str})")
+            term_str = ", ".join(f"{k}={v:.4f}" for k, v in accumulated_floats.items() if k != "loss_total")
+            print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated_floats['loss_total']:.4f} ({term_str})")
             print(
                 f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
                 f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
             )
-        log_step(wandb_enabled, step, accumulated, current_lr)
+        log_step(wandb_enabled, step, accumulated_floats, current_lr)
 
         is_last = step == args.steps - 1
         if (step + 1) % checkpoint_every == 0 or is_last:
