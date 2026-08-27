@@ -57,17 +57,54 @@ def _select_target_features(
     shorter (VjepaModel halves frame count via its tubelet, DinoModel doesn't) -- remapped to
     feature-space via the ratio between the two, inferred from shapes rather than a
     per-backbone constant. A no-op for DinoModel (ratio 1, same indices either way).
+
+    When reduction>1, t_idx is guaranteed (see _sample_frame_indices) to be laid out as sorted,
+    reduction-sized runs of real adjacent pixel frames -- every `reduction` consecutive
+    feature_idx entries are therefore identical (both members of one real tubelet pair map to the
+    same feature). Deduplicated via a strided [::reduction] pick to one representative per group,
+    matching the prediction side's own post-dino_forward group count exactly, rather than keeping
+    raw duplicates and relying on _align_time_dim's blunt tail-truncation to paper over the length
+    mismatch (which would silently misalign which groups survive). start/stop are themselves
+    already reduction-aligned by construction (see the chunk_size computation in forward()), so
+    plain floor division converts them to group-space exactly.
     """
 
     def _one(f: Tensor) -> Tensor:
         reduction = max(1, t_pixel_total // f.shape[1])
         feature_idx = (t_idx // reduction).clamp(max=f.shape[1] - 1) if reduction > 1 else t_idx
+        if reduction > 1:
+            feature_idx = feature_idx[::reduction]
         selected = rearrange(f[:, feature_idx], "b t c h w -> (b t) c h w")
-        return selected[start:stop].unsqueeze(0).detach()
+        group_start, group_stop = start // reduction, stop // reduction
+        return selected[group_start:group_stop].unsqueeze(0).detach()
 
     if isinstance(features, list):
         return [_one(f) for f in features]
     return _one(features)
+
+
+def _sample_frame_indices(t_total: int, k: int, reduction: int, device: torch.device) -> Tensor:
+    """Random frame-subset for the DINO-consistency term's cost-control trick (mira's own "only
+    score a fraction of frames per step"). reduction=1 (DinoModel, no temporal coupling between
+    frames): independent scattered frames, exactly the original behavior --
+    torch.randperm(t_total)[:k].sort().values.
+
+    reduction>1 (a tubelet-pairing encoder like VjepaModel): sampling k independent scattered
+    frames and feeding them to dino_forward as a fake contiguous clip is wrong -- the encoder
+    pairs CONSECUTIVE POSITIONS in whatever it's given, so two arbitrarily-spaced selected frames
+    would get paired as if they were real temporal neighbors, fabricating a cross-frame pair with
+    no correspondence to the real target features (see notes/deviations.md and this module's own
+    forward() comment). Instead samples whole reduction-sized ADJACENT groups: real temporal
+    neighbors every time, so every dino_forward call only ever sees genuine tubelet-sized chunks.
+    Returns up to k indices, rounded down to a whole number of groups, sorted ascending.
+    """
+    if reduction <= 1:
+        return torch.randperm(t_total, device=device)[:k].sort().values
+    num_valid_groups = t_total // reduction
+    num_groups = max(1, min(k // reduction, num_valid_groups))
+    group_starts = torch.randperm(num_valid_groups, device=device)[:num_groups].sort().values * reduction
+    offsets = torch.arange(reduction, device=device)
+    return (group_starts.unsqueeze(1) + offsets.unsqueeze(0)).flatten().sort().values
 
 
 def _item_slice(features: Tensor | list[Tensor], item: int) -> Tensor | list[Tensor]:
@@ -82,9 +119,11 @@ def _align_time_dim(
     pred_features: Tensor | list[Tensor], target_features: Tensor | list[Tensor]
 ) -> tuple[Tensor | list[Tensor], Tensor | list[Tensor]]:
     """Trim the longer side's time dim down to the shorter, when they don't already match.
-    A random, not-necessarily-adjacent frame subset can fold into different lengths on each side
-    once a tubelet-pairing encoder (VjepaModel) is involved -- a no-op for DinoModel (already
-    always equal).
+    Defensive fallback only, not the primary alignment mechanism: _sample_frame_indices +
+    _select_target_features's own deduplication (see both) already make pred_features and
+    target_features come out the same length by construction for a tubelet-pairing encoder
+    (VjepaModel) -- kept as insurance against any remaining edge case, and still a no-op for
+    DinoModel (already always equal).
     """
     pred_list = pred_features if isinstance(pred_features, list) else [pred_features]
     target_list = target_features if isinstance(target_features, list) else [target_features]
@@ -289,25 +328,38 @@ class CodecLoss(nn.Module):
             consistency_dino = self.perceptual_dino if self.perceptual_dino is not None else self.dino
             b = predicted.shape[0]
             k = max(1, round(t_total * self.weights.dino_latent_consistency_frame_frac))
-            t_idx = torch.randperm(t_total, device=predicted.device)[:k].sort().values
+            # Encoders with their own temporal reduction (tubelet-pairing, e.g. VjepaModel) need
+            # every dino_forward call to see REAL temporally-adjacent frames -- see
+            # _sample_frame_indices for why sampling independent scattered frames (the old
+            # behavior) fabricates nonsense cross-frame pairs with no correspondence to the real
+            # target features. getattr(...,1) is a no-op for DinoModel.
+            reduction = getattr(consistency_dino, "tubelet_size", 1)
+            t_idx = _sample_frame_indices(t_total, k, reduction, predicted.device)
+            k_actual = t_idx.shape[0]
             # No no_grad here: needs to backprop from DINO's features on the reconstruction,
             # through the decoder and bottleneck. Target side is already detached.
             predicted_dino = self._hook_clone(predicted, "loss_dino_latent_consistency")
-            pred_selected = predicted_dino[:, t_idx]  # (b, k, c, h, w)
-            target_selected = target[:, t_idx]  # (b, k, c, h, w)
-            # Chunk WITHIN each video's own k selected frames, never across videos -- flattening
-            # batch+frame together and chunking blindly (the old approach) let a chunk straddle
-            # two different videos, so a tubelet-pairing encoder (VjepaModel) would pair the last
-            # selected frame of one video with the first of a totally different one. DinoModel
-            # never cared about frame adjacency, so this was invisible until V-JEPA existed;
-            # confirmed live with two distinguishable synthetic videos before this fix.
-            chunk_size = min(self.perceptual_chunk_size or k, k)
-            total_selected = b * k
+            pred_selected = predicted_dino[:, t_idx]  # (b, k_actual, c, h, w)
+            target_selected = target[:, t_idx]  # (b, k_actual, c, h, w)
+            # Chunk WITHIN each video's own k_actual selected frames, never across videos --
+            # flattening batch+frame together and chunking blindly (the old approach) let a chunk
+            # straddle two different videos, so a tubelet-pairing encoder (VjepaModel) would pair
+            # the last selected frame of one video with the first of a totally different one.
+            # DinoModel never cared about frame adjacency, so this was invisible until V-JEPA
+            # existed; confirmed live with two distinguishable synthetic videos before this fix.
+            # Also rounded down to a reduction-aligned boundary (a no-op for DinoModel,
+            # reduction=1) -- an explicit --perceptual-chunk-size that isn't itself a multiple of
+            # reduction could otherwise split a real tubelet pair across two separate
+            # dino_forward calls, reintroducing the same fabricated-pairing problem at the chunk
+            # boundary that _sample_frame_indices already fixed at the selection stage.
+            raw_chunk_size = min(self.perceptual_chunk_size or k_actual, k_actual)
+            chunk_size = max(reduction, (raw_chunk_size // reduction) * reduction)
+            total_selected = b * k_actual
             dino_terms = []
             for item in range(b):
                 item_target_features = _item_slice(outputs.dino_features, item)
-                for start in range(0, k, chunk_size):
-                    stop = min(start + chunk_size, k)
+                for start in range(0, k_actual, chunk_size):
+                    stop = min(start + chunk_size, k_actual)
                     dino_input = denormalize_for_dino(pred_selected[item, start:stop]).unsqueeze(0)
                     if self.use_checkpointing:
                         pred_features = checkpoint(consistency_dino.dino_forward, dino_input, use_reentrant=False)
