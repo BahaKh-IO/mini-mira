@@ -602,9 +602,19 @@ def main() -> None:
 
         if (step + 1) % drift_eval_every == 0 or is_last:
             if full_eval_metrics is None:
+                # Real per-slice window width for the DINO-Frechet tensor specifically -- see
+                # FullEvalMetrics's own dino_fdd_slice_frames docstring for why this differs from
+                # fdd_slice_frames for a time-halving encoder. max(1, ...) guards against flooring
+                # to a zero-width slice for an extreme config; a no-op (== fdd_slice_frames) for
+                # DinoModel, where dino_temporal_scale == model.temporal_downsampling always.
+                dino_temporal_scale = model.temporal_downsampling // getattr(model.dino, "tubelet_size", 1)
+                dino_fdd_slice_frames = max(
+                    1, args.fdd_slice_frames * dino_temporal_scale // model.temporal_downsampling
+                )
                 full_eval_metrics = FullEvalMetrics(
                     dino_dim=model.dino.dino_dim, fdd_slice_frames=args.fdd_slice_frames,
                     num_slices=fdd_num_slices, device="cuda",
+                    dino_fdd_slice_frames=dino_fdd_slice_frames,
                 )
             run_full_eval(
                 model, test_loader, step, wandb_enabled, args.drift_eval_n_samples, eval_batch_size,

@@ -171,10 +171,23 @@ class FullEvalMetrics(nn.Module):
         device: str | torch.device,
         inception: nn.Module | None = None,
         lpips_fn: nn.Module | None = None,
+        dino_fdd_slice_frames: int | None = None,
     ):
         super().__init__()
         self.fdd_slice_frames = fdd_slice_frames
         self.num_slices = num_slices
+        # real_dino_gen/pred_dino_gen (compute_full_eval_metrics's dino_temporal_scale-corrected
+        # slice) is the SAME total length as real_video_gen/pred_video_gen only when
+        # dino_temporal_scale == temporal_downsampling (true for DinoModel, tubelet_size=1) --
+        # for a time-halving encoder (VjepaModel), it's proportionally SHORTER (e.g. 14 vs 28 at
+        # this project's real V-JEPA config: dino_temporal_scale=1, temporal_downsampling=2). Using
+        # the same fdd_slice_frames-wide window for both tensors runs the later slices past the end
+        # of the shorter one, leaving them with zero samples -- OnlineGaussian.compute()'s own
+        # `assert self.n > 1` then crashes the whole eval (confirmed for real: this exact crash,
+        # on a real V-JEPA run, is what this parameter was added to fix). Defaults to None ->
+        # falls back to fdd_slice_frames, byte-identical to this class's original behavior for any
+        # caller that doesn't pass it (i.e. train_world_model.py needs zero changes).
+        self.dino_fdd_slice_frames = dino_fdd_slice_frames if dino_fdd_slice_frames is not None else fdd_slice_frames
 
         # inception/lpips_fn: injection seam for testing, same precedent as LatentWorldModel's
         # own `dino: nn.Module | None = None` -- default None builds the real frozen nets.
@@ -218,14 +231,14 @@ class FullEvalMetrics(nn.Module):
         self.ssim.update(compute_ssim(pred_video_gen, real_video_gen))
 
         for s in range(self.num_slices):
-            fs = slice(s * self.fdd_slice_frames, (s + 1) * self.fdd_slice_frames)
-
+            dino_fs = slice(s * self.dino_fdd_slice_frames, (s + 1) * self.dino_fdd_slice_frames)
             self.dino_frechet.update(
                 s,
-                real_dino_gen[:, fs].mean(dim=(-1, -2)).flatten(0, 1),
-                pred_dino_gen[:, fs].mean(dim=(-1, -2)).flatten(0, 1),
+                real_dino_gen[:, dino_fs].mean(dim=(-1, -2)).flatten(0, 1),
+                pred_dino_gen[:, dino_fs].mean(dim=(-1, -2)).flatten(0, 1),
             )
 
+            fs = slice(s * self.fdd_slice_frames, (s + 1) * self.fdd_slice_frames)
             real_slice, pred_slice = real_video_gen[:, fs], pred_video_gen[:, fs]
             bs, ts = real_slice.shape[:2]
             real_flat = real_slice.reshape(bs * ts, *real_slice.shape[2:])

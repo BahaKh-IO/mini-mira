@@ -41,6 +41,7 @@ from mini_mira.codec.decoder import ViTDecoderConfig
 from mini_mira.world_model.action_encoder import ActionEncoder
 from mini_mira.world_model.checkpoint import load_checkpoint, save_checkpoint
 from mini_mira.world_model.eval_metrics import compute_drift_metrics, decode_and_dino
+from mini_mira.world_model.full_eval_metrics import INCEPTION_FID_DIM, FullEvalMetrics
 from mini_mira.world_model.diffusion_transformer import DiffusionTransformer, LatentWorldModelConfig
 from mini_mira.world_model.latent_world_model import LatentWorldModel
 
@@ -243,6 +244,68 @@ assert old_len != expected_gen_len, (
 print(
     f"[PASS] dino_temporal_scale: correct slice length {expected_gen_len} "
     f"(old formula would silently give {old_len})"
+)
+
+# --- Check 6: dino_fdd_slice_frames prevents FullEvalMetrics from crashing on a real V-JEPA run
+# (found live: a real GPU run hit `AssertionError: Need at least 2 samples to compute statistics.`
+# in OnlineGaussian.compute(), one step after this exact script's own checks all passed -- the
+# dino_temporal_scale fix above corrected WHERE the generated region starts in DINO-feature space,
+# but not that its TOTAL LENGTH is also proportionally shorter than video-frame space for a
+# time-halving encoder. Same fdd_slice_frames-wide windows sized for the longer video tensor run
+# past the end of the shorter DINO-feature one for later slices, leaving them with zero samples.) ---
+
+
+class _FakeInception(torch.nn.Module):
+    """Stand-in for pytorch_fid's InceptionV3 (not installed on this CPU-only dev environment) --
+    matches FullEvalMetrics's own injection-seam contract: forward returns a list, index [0] a
+    (b, INCEPTION_FID_DIM, 1, 1) tensor."""
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return [torch.rand(x.shape[0], INCEPTION_FID_DIM, 1, 1)]
+
+
+class _FakeLPIPS(torch.nn.Module):
+    """Stand-in for lpips.LPIPS -- matches its (b, 1, 1, 1) output contract."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return torch.rand(x.shape[0], 1, 1, 1)
+
+
+# Exactly this session's real crash numbers: fdd_slice_frames=7 (video-space) with 4 slices, but
+# real_dino_gen/pred_dino_gen only T=14 (dino_temporal_scale=1, temporal_downsampling=2 -- the
+# real V-JEPA config's own real values). dino_fdd_slice_frames=3 = max(1, 7*1//2), matching how
+# train_world_model_vjepa.py itself computes it.
+fixed_metrics = FullEvalMetrics(
+    dino_dim=8, fdd_slice_frames=7, num_slices=4, device="cpu",
+    inception=_FakeInception(), lpips_fn=_FakeLPIPS(), dino_fdd_slice_frames=3,
+)
+real_video_gen6, pred_video_gen6 = torch.rand(2, 28, 3, 16, 16), torch.rand(2, 28, 3, 16, 16)
+real_dino_gen6, pred_dino_gen6 = torch.rand(2, 14, 8, 4, 4), torch.rand(2, 14, 8, 4, 4)
+fixed_metrics.update(real_video_gen6, pred_video_gen6, real_dino_gen6, pred_dino_gen6)
+fixed_metrics.update(real_video_gen6, pred_video_gen6, real_dino_gen6, pred_dino_gen6)
+scalars6, _curves6 = fixed_metrics.compute_and_reset()  # must not raise
+assert all(torch.isfinite(torch.tensor(v)) for v in scalars6.values()), f"non-finite scalar in {scalars6}"
+
+# Contrast: the OLD behavior (dino_fdd_slice_frames omitted -> falls back to fdd_slice_frames=7)
+# must still crash here -- proves this check actually distinguishes fixed from broken, not just
+# that some code path happens to succeed.
+broken_metrics = FullEvalMetrics(
+    dino_dim=8, fdd_slice_frames=7, num_slices=4, device="cpu",
+    inception=_FakeInception(), lpips_fn=_FakeLPIPS(),
+)
+broken_metrics.update(real_video_gen6, pred_video_gen6, real_dino_gen6, pred_dino_gen6)
+try:
+    broken_metrics.compute_and_reset()
+    raise AssertionError(
+        "expected the pre-fix formula (no dino_fdd_slice_frames) to crash here -- it didn't, "
+        "meaning this check's own setup no longer reproduces the real bug"
+    )
+except AssertionError as e:
+    assert "Need at least 2 samples" in str(e), f"crashed for a different reason than expected: {e}"
+
+print(
+    "[PASS] dino_fdd_slice_frames: FullEvalMetrics.update/compute_and_reset survive a real "
+    "V-JEPA-shaped T=14 dino tensor with 4 slices (old formula confirmed still crashes the same way)"
 )
 
 print("\nAll V-JEPA-track world-model temporal-alignment checks passed.")
