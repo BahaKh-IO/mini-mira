@@ -40,6 +40,7 @@ from mini_mira.codec.bottleneck import StridedConvBottleneckConfig
 from mini_mira.codec.decoder import ViTDecoderConfig
 from mini_mira.world_model.action_encoder import ActionEncoder
 from mini_mira.world_model.checkpoint import load_checkpoint, save_checkpoint
+from mini_mira.world_model.eval_metrics import compute_drift_metrics, decode_and_dino
 from mini_mira.world_model.diffusion_transformer import DiffusionTransformer, LatentWorldModelConfig
 from mini_mira.world_model.latent_world_model import LatentWorldModel
 
@@ -197,6 +198,51 @@ assert abs(loss_before - loss_after) < 1e-6, f"checkpoint round-trip mismatch: {
 print(
     f"[PASS] checkpoint round-trip: loss identical before/after save+load ({loss_before:.6f}), "
     f"wandb_run_id round-tripped correctly"
+)
+
+# --- Check 5: dino_temporal_scale correctly accounts for the encoder's own reduction when
+# re-encoding the decoded video (Finding 3's fix, world_model/eval_metrics.py) ---
+# Reuses `model` from checks 1-2 -- weights don't matter here, this is a shape/slicing check, not
+# a numerical-correctness one. n_context_latents=1 chosen so the correct vs. old-formula slice
+# lengths are unambiguously different (3 vs 2) at this file's own RAW_FRAMES=8 (z's t=4).
+z5, _a5 = model._encode(batch)
+_real_video5, _pred_video5, real_dino5, pred_dino5 = decode_and_dino(model, z5, z5)
+n_context_latents5 = 1
+expected_gen_len = z5.shape[1] - n_context_latents5  # 4 - 1 = 3
+
+# real_dino5 comes from re-encoding the DECODED video through _FakeVjepaLike, which halves time
+# again -- lands back at T=z5.shape[1] (latent-frame units), not T=z5.shape[1]*temporal_downsampling
+# (video-frame units, what the OLD formula assumed). Confirmed directly, not just asserted below.
+assert real_dino5.shape[1] == z5.shape[1], (
+    f"sanity check on this test's own setup: expected the fake time-halving encoder to land "
+    f"real_dino back at T={z5.shape[1]} (latent-frame units), got T={real_dino5.shape[1]}"
+)
+
+correct_scale = model.temporal_downsampling // getattr(model.dino, "tubelet_size", 1)
+drift5 = compute_drift_metrics(
+    z5, z5, n_context_latents5, real_dino5, pred_dino5, model.temporal_downsampling,
+    dino_temporal_scale=correct_scale,
+)
+assert drift5["dino_cos_drift"].shape[1] == expected_gen_len, (
+    f"correct dino_temporal_scale={correct_scale} produced generated-region length "
+    f"{drift5['dino_cos_drift'].shape[1]}, expected {expected_gen_len}"
+)
+
+# Contrast: the OLD formula (dino_temporal_scale defaulting to temporal_downsampling itself, i.e.
+# not passed at all) produces a DIFFERENT, wrong length here -- proving this test actually
+# distinguishes correct from broken, not just that some slice happens to succeed.
+drift5_old_formula = compute_drift_metrics(
+    z5, z5, n_context_latents5, real_dino5, pred_dino5, model.temporal_downsampling,
+)
+old_len = drift5_old_formula["dino_cos_drift"].shape[1]
+assert old_len != expected_gen_len, (
+    f"expected the old (pre-fix) formula to produce a WRONG length here (this test's whole "
+    f"point) -- got {old_len}, same as the correct {expected_gen_len}, meaning this test's own "
+    f"setup no longer distinguishes the two"
+)
+print(
+    f"[PASS] dino_temporal_scale: correct slice length {expected_gen_len} "
+    f"(old formula would silently give {old_len})"
 )
 
 print("\nAll V-JEPA-track world-model temporal-alignment checks passed.")
