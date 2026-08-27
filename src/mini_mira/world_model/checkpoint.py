@@ -26,6 +26,7 @@ def save_checkpoint(
     latent_mean: float | None = None,
     latent_std: float | None = None,
     dataloader_batches_consumed: int = 0,
+    temporal_downsampling: int | None = None,
 ) -> None:
     """Atomic write: save to a temp file, then rename -- a crash mid-save never leaves `path`
     pointing at a half-written file.
@@ -44,6 +45,15 @@ def save_checkpoint(
     trained against. Recorded for load_checkpoint to compare against a future --resume's own
     --codec-checkpoint/--latent-stats -- neither is restored into the model (the codec is loaded
     fresh every launch, same as always), this is purely a mismatch check.
+
+    temporal_downsampling: same mismatch-check purpose as codec_checkpoint/latent_mean/latent_std,
+    for the raw-frames-per-latent-frame ratio a --resume's action/latent alignment depends on
+    (LatentWorldModel.temporal_downsampling). A checkpoint/config mixup that happens to keep every
+    nn.Parameter shape identical (this value never affects any parameter's shape, only runtime
+    index math) would otherwise load with zero error or warning while training on stale
+    alignment. Optional and purely additive, matching this project's deliberate "no embedded
+    backbone_type field, keep checkpoints simple" decision (notes/session_handoff.md) -- this adds
+    one narrow numeric check, not a general provenance system.
 
     dataloader_batches_consumed: total micro-batches pulled from the train loader across this
     whole run (including any earlier --resume's), so a future --resume can fast-forward the fresh
@@ -69,6 +79,7 @@ def save_checkpoint(
             "latent_mean": latent_mean,
             "latent_std": latent_std,
             "dataloader_batches_consumed": dataloader_batches_consumed,
+            "temporal_downsampling": temporal_downsampling,
             "rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         },
@@ -114,5 +125,6 @@ def load_checkpoint(
         "latent_mean": ckpt.get("latent_mean"),
         "latent_std": ckpt.get("latent_std"),
         "dataloader_batches_consumed": ckpt.get("dataloader_batches_consumed", 0),
+        "temporal_downsampling": ckpt.get("temporal_downsampling"),
     }
     return ckpt["step"] + 1, ckpt.get("wandb_run_id"), provenance
