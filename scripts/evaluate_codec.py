@@ -80,6 +80,18 @@ def _autocast(precision: str) -> torch.autocast:
 def main() -> None:
     args = parse_args()
     config = load_pipeline_config(args.config)
+    # Real, previously-hit-for-real requirement (notes/vjepa_next_session.md): the decoder's own
+    # temporal/spatial upsample only exactly reconstructs --height/--width if both are divisible
+    # by decoder.patch_size * bottleneck.stride -- otherwise it silently reconstructs a slightly
+    # different size (e.g. 720 -> 704), surfacing later as a confusing loss.py shape-mismatch
+    # crash instead of a clear error here. Purely additive: every already-proven-valid real
+    # launch already satisfies this, so this never fires for a config that already works.
+    required_divisor = config.decoder.patch_size * config.bottleneck.stride
+    assert args.height % required_divisor == 0 and args.width % required_divisor == 0, (
+        f"--height {args.height} / --width {args.width} must both be divisible by "
+        f"{required_divisor} (decoder.patch_size {config.decoder.patch_size} * bottleneck.stride "
+        f"{config.bottleneck.stride})"
+    )
 
     encoder_dino_model = "dinov3_vitb16"
     dino = DinoModel(
