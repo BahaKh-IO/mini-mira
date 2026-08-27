@@ -199,14 +199,20 @@ Added ahead of the real training run on the newly rented GPU box, where an unatt
 kill was judged worth guarding against rather than accepting the same risk DINO's own codec run
 already ran with successfully.
 
-What's still ahead: `compute_latent_stats.py` and `evaluate_codec.py` each need the same fork once
-there's a real V-JEPA codec checkpoint to point them at (not before — nothing to evaluate yet);
-then `train_world_model_vjepa.py`, forked the same way once that checkpoint exists; then a full
-codec retrain from scratch under V-JEPA's feature space (the existing checkpoint can't be reused —
-the whole representation changes), then a world-model retrain on top. Three real methodology
-questions still need a decision before any final numbers count as comparable: whether both tracks
-get scored by the same fixed judge rather than each by its own backbone, what step budget each
-track gets, and whether hyperparameters stay identical across both.
+`scripts/evaluate_codec_vjepa.py` is done — a full fork of `evaluate_codec.py`, `VjepaModel` in
+place of `DinoModel` throughout, `--config` defaulting to `configs/scaled_300m_vjepa.yaml`. Built
+ahead of there being a real trained V-JEPA codec checkpoint to point it at (the real 4,000-step run
+hasn't launched yet) — syntax/import-checked, not yet run against real output, since there's
+nothing real to evaluate until that checkpoint exists.
+
+What's still ahead: `compute_latent_stats.py` needs the same fork once there's a real V-JEPA codec
+checkpoint to point it at (not before — nothing to compute stats from yet); then
+`train_world_model_vjepa.py`, forked the same way once that checkpoint exists; then a full codec
+retrain from scratch under V-JEPA's feature space (the existing checkpoint can't be reused — the
+whole representation changes), then a world-model retrain on top. Three real methodology questions
+still need a decision before any final numbers count as comparable: whether both tracks get scored
+by the same fixed judge rather than each by its own backbone, what step budget each track gets, and
+whether hyperparameters stay identical across both.
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
@@ -254,6 +260,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/overfit_one_clip_vjepa.py` | Real-data, real-GPU diagnostic: overfit one real clip, wandb only, no checkpoints |
 | `scripts/reconstruct.py` | Mechanism smoke test: runs a video through the codec (random-init weights) |
 | `scripts/evaluate_codec.py` | Real quantitative eval of a trained codec checkpoint on held-out data |
+| `scripts/evaluate_codec_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` in place of `DinoModel` |
 | `scripts/compute_latent_stats.py` | One-shot latent mean/std computation, feeds `train_world_model.py` |
 | `scripts/train_world_model.py` | Real GPU world-model training |
 | `scripts/verify_world_model_training.py` | CPU mechanism proof for `train_world_model.py` |
