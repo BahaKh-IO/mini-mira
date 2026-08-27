@@ -37,6 +37,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 VJEPA_REPO_URL = "https://github.com/facebookresearch/vjepa2.git"
 VJEPA_BASE_URL_FIX = "https://dl.fbaipublicfiles.com/vjepa2"
 VJEPA_DIM_EXPECTED = 768  # sanity check only -- source of truth is encoder.embed_dim
+VJEPA_TUBELET_SIZE_EXPECTED = 2  # sanity check only -- source of truth is encoder.tubelet_size
 
 # ViT-B's own hierarchical_layers (app/vjepa_2_1/models/vision_transformer.py) -- the only valid
 # out_layers indices for this model. Same indices as DinoModel's own DEFAULT_DINO_LAYERS["dinov3_vitb16"].
@@ -103,6 +104,11 @@ class VjepaModel(nn.Module):
         self.tubelet_size = self.encoder.tubelet_size
         assert self.dino_dim == VJEPA_DIM_EXPECTED, (
             f"vjepa2_1_vit_base_384 embed_dim changed upstream: {self.dino_dim} != {VJEPA_DIM_EXPECTED}"
+        )
+        assert self.tubelet_size == VJEPA_TUBELET_SIZE_EXPECTED, (
+            f"vjepa2_1_vit_base_384 tubelet_size changed upstream: "
+            f"{self.tubelet_size} != {VJEPA_TUBELET_SIZE_EXPECTED} -- code elsewhere (e.g. "
+            f"train_world_model_vjepa.py's pre-flight assertions) hardcodes this expectation."
         )
 
         self.register_buffer(
