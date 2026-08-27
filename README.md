@@ -292,6 +292,58 @@ results). New `scripts/verify_world_model_training_vjepa.py` mechanically proves
 with a time-halving stand-in encoder — confirms `temporal_downsampling` comes out as `stride * 2`,
 not `stride`, plus a real forward/backward/overfit/checkpoint round-trip.
 
+**Pre-launch silent-bug audit, done ahead of the next real GPU window** (an A40, for testing/
+probing, not the box that hosts the eventual real run). Same hypothesis as the
+`temporal_downsampling` fix above — code that implicitly assumes DINO's "never touches time"
+behavior — hunted systematically instead of waiting to hit each instance for real. Found four
+more, all fixed:
+
+- **`loss.py`'s DINO-consistency term** (most serious — active by default at the real codec
+  launch config): sampled `k` independent, arbitrarily-scattered frames and fed them to
+  `dino_forward` as if they were one contiguous clip. V-JEPA's tubelet pairing then paired
+  *consecutive positions in that fake sequence* — real frames 3-5 apart, not temporal neighbors —
+  and MSE'd the resulting fabricated-pair embedding against the real encoder's genuine
+  adjacent-pair target features, with zero frame correspondence between the two sides.
+  `auto_weight` (on by default) rescaled this corrupted term to match `loss_mae`'s gradient
+  magnitude rather than letting it fade into noise. Fixed: a new `_sample_frame_indices` helper
+  samples whole tubelet-sized *adjacent groups* instead of independent frames when the bound
+  encoder has its own temporal reduction (`getattr(dino, "tubelet_size", 1)`), and
+  `_select_target_features` deduplicates to one representative feature per real group — same
+  compute-cost budget as before (~10 frames/step), genuinely correct pairing instead of fabricated
+  pairs. Byte-identical no-op for DINO (`reduction=1`), confirmed by a direct fake-DINO check
+  (this dev machine's real `DinoModel` loader hits a separate, pre-existing `torch.hub` bug,
+  unrelated). Two new regression checks in `verify_codec_training_vjepa.py`, run against the real
+  `VjepaModel`: every `dino_forward` call now provably pairs genuine temporal neighbors, and
+  `_select_target_features`'s dedup output matches a hand-derived expected result exactly.
+- **`train_world_model_vjepa.py`'s pre-flight assertions** used the raw bottleneck stride instead
+  of the true total downsampling, computed before the model (and its V-JEPA tubelet factor) even
+  existed — crashed with an `AssertionError` at the script's own documented defaults, before any
+  GPU work. Fixed via a new sanity-checked constant, `VJEPA_TUBELET_SIZE_EXPECTED` in `vjepa.py`
+  (mirrors the existing `VJEPA_DIM_EXPECTED` pattern, with its own defensive assert in
+  `VjepaModel.__init__`), so the pre-flight math is correct without constructing the model early.
+- **`eval_metrics.py`/`full_eval_metrics.py`** assumed DINO-re-encoded features (from re-running
+  `dino_forward` on the *decoded* video) were in video-frame units — true for DINO, false for
+  V-JEPA, whose re-encoding halves time again and lands back in latent-frame units. Silently
+  dropped the wrong window from drift metrics every eval, and crashed `OnlineGaussian.compute()`
+  on the first full eval by starving later Frechet-distance slices to zero samples. Fixed: a new
+  optional `dino_temporal_scale` parameter (defaults to the old formula — zero changes needed in
+  `train_world_model.py`), correctly computed in the V-JEPA script as `temporal_downsampling //
+  getattr(model.dino, "tubelet_size", 1)`. New regression check in
+  `verify_world_model_training_vjepa.py` proves the correct slice length (3) differs from what the
+  old formula would silently produce (2).
+- **The height/width-divisible-by-32 requirement** (already discovered the hard way once, per the
+  resolution journey above) was never asserted anywhere — a bad `--height`/`--width` produced a
+  confusing shape-mismatch crash elsewhere instead of a clear error. Now asserted right after
+  config loading in all six scripts that exercise the decoder (both codec tracks' train/eval
+  scripts, both world-model scripts) — purely additive, a no-op for every already-proven-valid
+  real launch.
+- **Checkpoint provenance** (both codec and world-model `checkpoint.py`) didn't cover
+  `temporal_downsampling` — a `--resume` against a mismatched config that happens to keep every
+  parameter *shape* identical would load with zero warning. Not reversing the project's earlier
+  deliberate "keep checkpoints simple" decision — added one narrow, optional, backward-compatible
+  field plus one more warn-don't-block check in `train_world_model_vjepa.py`'s resume block,
+  mirroring the `codec_checkpoint`/`latent_mean` checks already there.
+
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
 
