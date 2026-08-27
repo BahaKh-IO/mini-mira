@@ -10,6 +10,18 @@ from typing import Any
 import torch
 
 
+def _unwrap_compiled(module: torch.nn.Module) -> torch.nn.Module:
+    """torch.compile() wraps a module in OptimizedModule, whose state_dict() keys carry a real
+    "_orig_mod." prefix (confirmed empirically: real cross-load test, torch==2.8.0) -- so a
+    checkpoint saved under --compile fails to load into a plain module (evaluate_codec_vjepa.py,
+    or the same script without --compile), and vice versa. Unwrapping to the real underlying
+    module here, on both save and load, keeps every checkpoint in one plain, portable format
+    regardless of whether --compile produced or is loading it. A no-op (returns module unchanged)
+    whenever compile was never used -- covers train_codec.py, which has no --compile at all.
+    """
+    return getattr(module, "_orig_mod", module)
+
+
 def save_checkpoint(
     path: str | Path,
     step: int,
@@ -35,8 +47,8 @@ def save_checkpoint(
     torch.save(
         {
             "step": step,
-            "bottleneck": bottleneck.state_dict(),
-            "decoder": decoder.state_dict(),
+            "bottleneck": _unwrap_compiled(bottleneck).state_dict(),
+            "decoder": _unwrap_compiled(decoder).state_dict(),
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
             "grad_scaler": grad_scaler.state_dict() if grad_scaler is not None else None,
@@ -62,8 +74,8 @@ def load_checkpoint(
     key -- .get(...) treats that the same as grad_scaler=None / wandb_run_id=None was passed at
     save time, so older checkpoints keep loading fine, just without restoring that state."""
     ckpt: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
-    bottleneck.load_state_dict(ckpt["bottleneck"])
-    decoder.load_state_dict(ckpt["decoder"])
+    _unwrap_compiled(bottleneck).load_state_dict(ckpt["bottleneck"])
+    _unwrap_compiled(decoder).load_state_dict(ckpt["decoder"])
     optimizer.load_state_dict(ckpt["optimizer"])
     lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
     if grad_scaler is not None and ckpt.get("grad_scaler") is not None:
