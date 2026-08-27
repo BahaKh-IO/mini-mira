@@ -6,7 +6,10 @@ memorize -- if reconstruction quality still looks bad after enough steps, that's
 fundamental problem, not a "needs more training" question.
 
 No checkpoint saving -- this is a pure diagnostic, not meant to produce a usable checkpoint.
-Progress and preview images go to wandb only (no local preview files either).
+Preview videos (side-by-side original|reconstruction, via log_preview) are saved locally under
+--preview-dir regardless of wandb status, and also logged to wandb if --wandb-project is set --
+the two are fully independent (log_preview's own output_dir and enabled params don't interact),
+so this works the same whether or not wandb is available.
 """
 
 import argparse
@@ -41,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=["fp16-hybrid", "bf16"], default="bf16")
     parser.add_argument("--activation-checkpointing", action="store_true", help="Trade compute for memory -- needed at larger --height/--width")
     parser.add_argument("--preview-every", type=int, default=25)
+    parser.add_argument("--preview-dir", default="overfit_previews_vjepa", help="Local dir for preview videos -- saved here regardless of wandb status")
     parser.add_argument("--console-log-every", type=int, default=10)
     parser.add_argument("--wandb-project", default=None)
     return parser.parse_args()
@@ -107,9 +111,11 @@ def main() -> None:
             print(f"step {step}: loss_total={losses['loss_total'].item():.4f} ({term_str})")
         log_step(wandb_enabled, step, {k: v.item() for k, v in losses.items()}, args.lr)
 
-        # output_dir=None deliberately -- wandb only, no local files left behind on the shared box.
         if step == 0 or (step + 1) % args.preview_every == 0 or step == args.steps - 1:
-            log_preview(wandb_enabled, step, fixed_video, reconstructed, fps=args.target_fps, output_dir=None)
+            log_preview(
+                wandb_enabled, step, fixed_video, reconstructed, fps=args.target_fps,
+                output_dir=args.preview_dir,
+            )
 
     print("Done. Check wandb for the loss curve and preview images -- if reconstruction still")
     print("looks bad by the final preview, that's a real, fundamental problem, not 'needs more steps'.")
