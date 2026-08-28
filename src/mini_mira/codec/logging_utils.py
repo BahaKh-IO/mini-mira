@@ -62,6 +62,15 @@ def log_preview(
     W&B's optional moviepy dependency, and retaining the file also makes early validation easy.
     A W&B/media failure is intentionally non-fatal: observability must not stop training.
 
+    IMPORTANT: the "original" side of this preview is NOT bit-identical to what the loss function
+    actually trains against. The real training target is the raw decoded tensor, used directly in
+    memory -- this function re-encodes it a second time (crf=18 libx264, on top of whatever
+    compression the source clip already has) purely so it's viewable as a video in W&B/locally.
+    That second encoding can visibly matter (confirmed directly: real block/compression artifacts
+    on individual frames), so don't judge source data quality, or debug anything data-related, off
+    this video alone -- check the raw tensor instead (read a batch, save a frame straight to PNG,
+    no video codec involved) if precision matters.
+
     original: (b, t, 3, h, w) in [0, 1]. reconstructed: (b, t, 3, h, w) in [-1, 1] (tanh output).
     """
     from mini_mira.codec.loss import denormalize_for_dino
