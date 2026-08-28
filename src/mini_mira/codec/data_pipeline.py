@@ -31,6 +31,9 @@ from torch import Tensor
 
 from mini_mira.codec.video_prep import resize_to_canonical
 
+# Queue sentinel for "the producer thread died"; see PrefetchingVideoStream._run/__next__.
+_FAILED = object()
+
 
 def to_canonical_on_gpu(video_uint8: Tensor, height: int, width: int) -> Tensor:
     """uint8 (b, t, c, h, w) on GPU -> float32 [0, 1] at (height, width).
@@ -73,15 +76,23 @@ class PrefetchingVideoStream:
                 self._queue.put((on_gpu, ready))
         except BaseException as exc:  # surfaced on the consumer side, see __next__
             self._error = exc
-            self._queue.put(None)
+            self._queue.put(_FAILED)
 
     def __iter__(self) -> Iterator[Tensor]:
         return self
 
     def __next__(self) -> Tensor:
+        # Checked before the get(): once the producer has died, every later call must raise
+        # immediately rather than block forever on a queue nobody is filling any more. Whatever
+        # already made it into the queue is still handed out first -- the failure surfaces after
+        # the batches that did succeed, not instead of them.
+        if self._error is not None and self._queue.empty():
+            raise self._error
         item = self._queue.get()
-        if item is None:
-            raise self._error if self._error is not None else StopIteration
+        if item is _FAILED:
+            # Put it back so a second call raises too instead of blocking on an empty queue.
+            self._queue.put(_FAILED)
+            raise self._error
         on_gpu, ready = item
         torch.cuda.current_stream().wait_event(ready)
         # The producer thread's reference dies at the end of this call; record_stream tells the
