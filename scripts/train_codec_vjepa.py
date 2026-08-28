@@ -42,8 +42,9 @@ from mini_mira.codec.checkpoint import load_checkpoint, save_checkpoint
 from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.logging_utils import get_wandb_run_id, init_wandb, log_preview, log_step
 from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
+from mini_mira.codec.data_pipeline import PrefetchingVideoStream
+from mini_mira.codec.profiling import StepTimer, profile_window
 from mini_mira.codec.vjepa import DEFAULT_VJEPA_LAYERS, VjepaModel
-from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import apply_run_config, load_pipeline_config, load_run_config
 from mini_mira.ml.run_config import CodecRunConfig
 
@@ -123,9 +124,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--compile", action=argparse.BooleanOptionalAction, default=None,
-        help="torch.compile the trainable bottleneck+decoder (not the frozen V-JEPA encoder, "
-        "external repo code, real risk of graph breaks). Untested combined with "
-        "--activation-checkpointing -- verify separately before assuming both together work.",
+        help="torch.compile the trainable bottleneck+decoder. The decoder is where this pays: its "
+        "blocks are dominated by memory-bound elementwise work (RoPE, per-head qk-norm, the "
+        "LayerScale/residual chain) that inductor fuses away -- measured 2.5x on decoder "
+        "forward+backward at 448x768x40. Untested combined with --activation-checkpointing -- "
+        "verify separately before assuming both together work. See --compile-encoder for the "
+        "frozen V-JEPA backbone, which is compiled separately because it is external code.",
+    )
+    parser.add_argument(
+        "--compile-encoder", action=argparse.BooleanOptionalAction, default=None,
+        help="Also torch.compile the frozen V-JEPA encoder (default: follow --compile). Worth "
+        "~1.3x on the encoder pass on top of the cuDNN attention backend, but it is external, "
+        "git-cloned facebookresearch/vjepa2 code, so it gets its own flag to turn off without "
+        "giving up the decoder's compile if a future upstream change starts breaking graphs.",
+    )
+    parser.add_argument(
+        "--auto-weight-every", type=int, default=None,
+        help="Only relevant under --log-activation-grad-norms, which forces CodecLoss onto its "
+        "probing fallback for the adaptive loss weights. There each factor costs a real extra "
+        "backward pass (through all of VGG, and through the whole frozen V-JEPA backbone), "
+        "measured at ~575ms per micro-step at 448x768x40 -- more than the entire rest of the "
+        "micro-step. This re-probes every N micro-steps instead of every one, reusing the last "
+        "factor in between. Default 1 (exact). Without that flag the factors are computed exactly "
+        "and for ~3ms, and this does nothing.",
     )
     parser.add_argument(
         "--perceptual-chunk-size", type=int, default=None,
@@ -197,13 +218,26 @@ def parse_args() -> argparse.Namespace:
         "plain bfloat16 autocast everywhere, GradScaler disabled (a documented no-op), no conv "
         "patch needed. Opt-in only -- test against fp16-hybrid before switching a run over.",
     )
+    parser.add_argument(
+        "--profile-steps", type=int, default=0,
+        help="Run torch.profiler over this many steps (after --profile-wait warmup steps) and "
+        "dump a Chrome trace + kernel table under --checkpoint-dir/profile. 0 (default) leaves "
+        "the profiler off; per-step wall-clock timing is always on either way.",
+    )
+    parser.add_argument("--profile-wait", type=int, default=5, help="Warmup steps before --profile-steps starts")
     parser.add_argument("--hf-backup-repo", default=None, help="Optional HF Hub repo to back up checkpoints to")
     parser.add_argument("--wandb-project", default=None)
     return parser.parse_args()
 
 
 def build_next_video(args: argparse.Namespace):
-    """Real streamed clips if --index-path is set, else one fixed synthetic video every step."""
+    """Real streamed clips if --index-path is set, else one fixed synthetic video every step.
+
+    Either way this returns clips already on the GPU, already at (--height, --width) and in
+    [0, 1] -- the training loop never touches a CPU tensor. For the real-data path the
+    uint8->float conversion and the pad+resize happen on the GPU, and the host->device copy runs
+    a few batches ahead on its own stream; see mini_mira.codec.data_pipeline for why.
+    """
     if args.index_path:
         loader = create_loader(
             index_path=args.index_path,
@@ -212,21 +246,19 @@ def build_next_video(args: argparse.Namespace):
             n_players=1,  # codec training
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            frame_size=None,  # native decode -- resize_to_canonical below does the pad+resize
+            frame_size=None,  # native decode -- resize_to_canonical does the pad+resize on GPU
         )
         data_iter = iter(loader)
 
-        def next_video() -> torch.Tensor:
+        def fetch_uint8() -> torch.Tensor:
             batch, _metadata = next(data_iter)  # codec ignores actions
-            video = batch.video.float() / 255.0  # uint8 (B,T,C,H,W) -> float [0,1]
-            return resize_to_canonical(video, args.height, args.width)
-    else:
-        fixed_video = torch.rand(1, args.frames, 3, args.height, args.width)
+            return batch.video  # uint8 (B,T,C,H,W), native decode resolution
 
-        def next_video() -> torch.Tensor:
-            return fixed_video
+        stream = PrefetchingVideoStream(fetch_uint8, args.height, args.width)
+        return lambda: next(stream)
 
-    return next_video
+    fixed_video = torch.rand(1, args.frames, 3, args.height, args.width, device="cuda")
+    return lambda: fixed_video
 
 
 def main() -> None:
@@ -252,6 +284,14 @@ def main() -> None:
     )
 
     torch.manual_seed(0)
+    # cuDNN autotunes each convolution's algorithm on first sight of a shape. Every shape here is
+    # fixed for the whole run (one clip geometry, one batch size), so the one-off autotune cost is
+    # paid once and the better algorithm is then used for every remaining step.
+    torch.backends.cudnn.benchmark = True
+    # Only affects the few genuinely-fp32 matmuls left under bf16 autocast (the qk-norm path, the
+    # auto_weight probes); everything on the hot path is already bf16.
+    torch.set_float32_matmul_precision("high")
+
     # V-JEPA 2.1 has only one real variant (ViT-B), so no per-variant model-name/layer-dict lookup
     # like DinoModel's -- DEFAULT_VJEPA_LAYERS is already the right constant, no subscript needed.
     vjepa = VjepaModel(
@@ -263,13 +303,18 @@ def main() -> None:
     decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
 
     loss_fn = CodecLoss(
-        CodecLossWeights(auto_weight=True, loss_mae=args.loss_mae_weight),
+        CodecLossWeights(auto_weight=True, loss_mae=args.loss_mae_weight,
+                         auto_weight_every=args.auto_weight_every),
         use_checkpointing=args.activation_checkpointing,
         perceptual_chunk_size=args.perceptual_chunk_size,
         log_activation_grad_norms=args.log_activation_grad_norms,
     ).cuda()
     loss_fn.bind_encoder_dino(vjepa)
     loss_fn.bind_last_layer(decoder.last_layer_weight)
+    loss_fn.use_channels_last_perceptual()
+    # This flag differentiates individual loss terms again, after CodecLoss has already taken
+    # their gradients once, so their graphs have to survive the call.
+    loss_fn.retain_term_graphs = bool(args.log_per_term_grad_norm)
 
     # vjepa isn't included here: VjepaModel.dino_forward already wraps its whole body in its own
     # bf16 autocast (vjepa.py), so every conv inside it is already covered -- same reasoning as
@@ -281,20 +326,48 @@ def main() -> None:
         for module in (bottleneck, decoder, loss_fn):
             _keep_convolutions_in_bf16(module)
 
-    # Trainable modules only -- vjepa is deliberately excluded (external, git-cloned
-    # facebookresearch/vjepa2 code, real risk of graph breaks on unfamiliar ops, not worth the
-    # risk for a frozen encoder that's already wrapped in its own bf16 autocast). Wrapping happens
-    # AFTER the fp16-hybrid monkey-patch above, not before -- torch.compile needs to see each
-    # module's real final forward, not have it swapped out from under it afterward.
-    # UNVERIFIED RISK, not yet tested on real GPU: torch.compile's OptimizedModule wrapper has a
-    # known history (version/config-dependent) of changing state_dict() key names (the
-    # "_orig_mod." prefix issue) -- before trusting --compile on a real --resume-able run, verify
-    # a save/load round-trip actually works (save a checkpoint compiled, confirm it loads clean
-    # both compiled and not). Not an issue for a short --compile-only throwaway probe that never
-    # saves/resumes a checkpoint.
+    # Compilation happens AFTER the fp16-hybrid monkey-patch above, not before -- torch.compile
+    # needs to see each module's real final forward, not have it swapped out from under it
+    # afterward.
+    #
+    # Everything here uses Module.compile() (in-place) rather than the module = torch.compile(...)
+    # rebinding form, for two reasons:
+    #
+    #   - torch.compile() returns an OptimizedModule WRAPPER, which prefixes every state_dict key
+    #     with "_orig_mod." -- the long-standing checkpoint-compatibility hazard this script's
+    #     comments used to flag as an unverified risk of --compile. Compiling in place sidesteps
+    #     it entirely: the module keeps its identity and its key names, so a checkpoint saved
+    #     under --compile loads without it and vice versa.
+    #   - it lets compilation be applied at the granularity that is actually wanted (below).
     if args.compile:
-        bottleneck = torch.compile(bottleneck)
-        decoder = torch.compile(decoder)
+        # Inductor's "donated buffer" optimization assumes a compiled backward is entered exactly
+        # once, and hard-errors on the second entry ("compiled with non-empty donated buffers
+        # which requires ... retain_graph=False"). Two opt-in paths here do differentiate the same
+        # graph more than once -- CodecLoss's probing fallback under --log-activation-grad-norms,
+        # and --log-per-term-grad-norm -- so it stays off. Leaving it on is what made --compile a
+        # net LOSS before this: the probes crashed out of, or fell off, the compiled path.
+        torch._functorch.config.donated_buffer = False
+
+        # Compile the decoder's transformer BLOCKS, not the decoder as a whole. An
+        # inductor-compiled module is one opaque autograd node, and CodecLoss's adaptive weights
+        # need the gradient of each loss term at the decoder's LAST LAYER -- so with the whole
+        # decoder as a single graph, reading a weight that sits at its very end means running the
+        # entire decoder backward, three times per micro-step, for a quantity that depends only on
+        # the output head. Compiling per block leaves the head (norm_out + patch_unembed + tanh)
+        # in eager autograd, where that gradient is one matmul, and gives up essentially none of
+        # the speedup: what inductor wins here is the fusion of each block's own memory-bound
+        # elementwise chain (RoPE, per-head qk-norm, LayerScale, the residual adds), all of which
+        # is within-block. Measured at 448x768x40: compiling the whole decoder made the step 1.6x
+        # SLOWER than compiling the blocks.
+        bottleneck.compile()
+        for block in decoder.blocks:
+            block.compile()
+    compile_encoder = bool(args.compile) if args.compile_encoder is None else args.compile_encoder
+    if compile_encoder:
+        # Only the transformer body, not VjepaModel.dino_forward itself: dino_forward's own
+        # normalize/interpolate/rearrange wrapper is cheap, and leaving it out of the graph keeps
+        # the compiled region to the one shape-stable piece that actually benefits.
+        vjepa.encoder.compile()
 
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
@@ -458,113 +531,123 @@ def main() -> None:
                 repo_id=args.hf_backup_repo, repo_type="model",
             )
 
-    for step in range(start_step, args.steps):
-        optimizer.zero_grad()
-        # Held as GPU tensors through the micro-step loop, not Python floats -- v.item() forces a
-        # full CUDA sync (blocks the CPU until every queued kernel finishes), and doing that once
-        # per loss term per micro-step (found for real: nvidia-smi dmon showed the GPU alternating
-        # 0%/100% every second, ~60% average, matching a real-world 57% finding from an earlier
-        # session) serializes what should be an async pipeline. Converted to floats once, after
-        # the loop, instead -- same final numbers, far fewer sync points (was
-        # num_loss_terms * grad_accum_steps per step, now num_loss_terms once).
-        accumulated: dict[str, Tensor] = {}
-        per_term_grad_norms: dict[str, float] = {}
-        for micro_step in range(args.grad_accum_steps):
-            video = next_video().cuda()
-            with _autocast(args.precision):
-                with torch.no_grad():  # encoder side: no grad needed here
-                    dino_features = vjepa.dino_forward(video)
-                z = bottleneck(dino_features)
-                reconstructed = decoder(z)
-                outputs = CodecOutputs(
-                    input_video=normalize_video(video), output_video=reconstructed, dino_features=dino_features
+    timer = StepTimer()
+    profile_dir = checkpoint_dir / "profile"
+    with profile_window(profile_dir, args.profile_steps, args.profile_wait) as profiler_step:
+        for step in range(start_step, args.steps):
+            optimizer.zero_grad()
+            # Held as GPU tensors through the micro-step loop, not Python floats -- v.item() forces a
+            # full CUDA sync (blocks the CPU until every queued kernel finishes), and doing that once
+            # per loss term per micro-step (found for real: nvidia-smi dmon showed the GPU alternating
+            # 0%/100% every second, ~60% average, matching a real-world 57% finding from an earlier
+            # session) serializes what should be an async pipeline. Converted to floats once, after
+            # the loop, instead -- same final numbers, far fewer sync points (was
+            # num_loss_terms * grad_accum_steps per step, now num_loss_terms once).
+            accumulated: dict[str, Tensor] = {}
+            per_term_grad_norms: dict[str, float] = {}
+            for micro_step in range(args.grad_accum_steps):
+                with timer.phase("data"):
+                    video = next_video()
+                with timer.phase("forward"), _autocast(args.precision):
+                    with torch.no_grad():  # encoder side: no grad needed here
+                        dino_features = vjepa.dino_forward(video)
+                    z = bottleneck(dino_features)
+                    reconstructed = decoder(z)
+                    outputs = CodecOutputs(
+                        input_video=normalize_video(video), output_video=reconstructed, dino_features=dino_features
+                    )
+                    losses = loss_fn(outputs)
+                if args.log_per_term_grad_norm and micro_step == args.grad_accum_steps - 1:
+                    # Each term's OWN real parameter-gradient norm, computed independently via
+                    # autograd.grad (doesn't touch .grad, doesn't affect the real training step below).
+                    # Must run BEFORE the real .backward() call: that call frees the graph by default,
+                    # and every one of these needs it still intact -- retain_graph=True on each so the
+                    # next one (and the real backward() after) can still use it. allow_unused=True
+                    # since a term with a zero weight (loss_mae/lpips/dino_latent_consistency can each
+                    # be individually disabled via config) has no graph to differentiate through at
+                    # all. Unlike grad_norm_params_total, these need no unscale_() step: they operate
+                    # directly on the raw, not-yet-GradScaler-multiplied loss values (scaling only
+                    # happens at the .backward() call below), so they're precision-comparable by
+                    # construction -- see notes/grad_norm_investigation.md for why that matters here.
+                    for term_name in ("loss_mae", "loss_lpips_perceptual", "loss_dino_latent_consistency"):
+                        if term_name not in losses:
+                            continue
+                        term_grads = torch.autograd.grad(losses[term_name], params, retain_graph=True, allow_unused=True)
+                        term_grads = [g for g in term_grads if g is not None]
+                        norm = torch.norm(torch.stack([g.norm() for g in term_grads])).item() if term_grads else 0.0
+                        per_term_grad_norms[f"grad_norm_params_{term_name}"] = norm
+                with timer.phase("backward"):
+                    grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
+                for k, v in losses.items():
+                    term = v.detach() / args.grad_accum_steps
+                    accumulated[k] = term if k not in accumulated else accumulated[k] + term
+            # Single sync point per loss term for the whole step, not one per term per micro-step --
+            # see the comment on `accumulated`'s declaration above for why that matters.
+            accumulated_floats: dict[str, float] = {k: v.item() for k, v in accumulated.items()}
+            # Real total gradient norm across every trainable parameter (bottleneck + decoder) --
+            # unlike grad_norm_loss_* below, this is an actual parameter gradient, the quantity
+            # "is AdamW's update small" genuinely depends on (notes/grad_norm_investigation.md).
+            # unscale_ first: under --precision fp16-hybrid, .grad is still GradScaler-scaled at this
+            # point (unscaling normally only happens inside grad_scaler.step()) -- without this the
+            # logged norm would repeat the exact scale-factor confusion already found and corrected for
+            # the activation-gradient probes. A documented no-op under bf16 (scaler disabled). clip
+            # with max_norm=inf so this only ever measures the norm, never actually clips gradients --
+            # clipping isn't something this project has decided to do.
+            with timer.phase("optimizer"):
+                grad_scaler.unscale_(optimizer)
+                grad_norm_params_total = torch.nn.utils.clip_grad_norm_(params, float("inf")).item()
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+                lr_scheduler.step()
+
+            # Checked here, right after a step fully lands and before any of this step's own
+            # (potentially slow) logging/eval work -- prioritizes actually getting the save done
+            # inside `timeout`'s kill-after grace period over finishing this step's own work first.
+            if _shutdown_requested:
+                print(f"Shutdown signal received at step {step} -- saving and exiting cleanly.")
+                _save_checkpoint_now(step, force_hf_upload=True)
+                if wandb_enabled:
+                    import wandb  # noqa: PLC0415
+
+                    wandb.finish()
+                return
+
+            # Last micro-step's real per-term gradient norms (see CodecLoss._hook_clone) -- same
+            # "last micro-step only" convention already used for the preview video below.
+            grad_norms = {f"grad_norm_{k}": v.item() for k, v in loss_fn.backward_metrics.items()}
+            grad_norms["grad_norm_params_total"] = grad_norm_params_total
+            grad_norms.update(per_term_grad_norms)  # empty dict unless --log-per-term-grad-norm
+
+            timer.end_step()
+            profiler_step()
+
+            current_lr = optimizer.param_groups[0]["lr"]
+            term_str = ", ".join(
+                f"{k}={v:.4f}" for k, v in accumulated_floats.items() if k != "loss_total" and not k.endswith("_auto_w")
+            )
+            if (step + 1) % args.console_log_every == 0 or step == start_step:
+                print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated_floats['loss_total']:.4f} ({term_str})")
+                print(
+                    f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
+                    f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
                 )
-                losses = loss_fn(outputs)
-            if args.log_per_term_grad_norm and micro_step == args.grad_accum_steps - 1:
-                # Each term's OWN real parameter-gradient norm, computed independently via
-                # autograd.grad (doesn't touch .grad, doesn't affect the real training step below).
-                # Must run BEFORE the real .backward() call: that call frees the graph by default,
-                # and every one of these needs it still intact -- retain_graph=True on each so the
-                # next one (and the real backward() after) can still use it. allow_unused=True
-                # since a term with a zero weight (loss_mae/lpips/dino_latent_consistency can each
-                # be individually disabled via config) has no graph to differentiate through at
-                # all. Unlike grad_norm_params_total, these need no unscale_() step: they operate
-                # directly on the raw, not-yet-GradScaler-multiplied loss values (scaling only
-                # happens at the .backward() call below), so they're precision-comparable by
-                # construction -- see notes/grad_norm_investigation.md for why that matters here.
-                for term_name in ("loss_mae", "loss_lpips_perceptual", "loss_dino_latent_consistency"):
-                    if term_name not in losses:
-                        continue
-                    term_grads = torch.autograd.grad(losses[term_name], params, retain_graph=True, allow_unused=True)
-                    term_grads = [g for g in term_grads if g is not None]
-                    norm = torch.norm(torch.stack([g.norm() for g in term_grads])).item() if term_grads else 0.0
-                    per_term_grad_norms[f"grad_norm_params_{term_name}"] = norm
-            grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
-            for k, v in losses.items():
-                term = v.detach() / args.grad_accum_steps
-                accumulated[k] = term if k not in accumulated else accumulated[k] + term
-        # Single sync point per loss term for the whole step, not one per term per micro-step --
-        # see the comment on `accumulated`'s declaration above for why that matters.
-        accumulated_floats: dict[str, float] = {k: v.item() for k, v in accumulated.items()}
-        # Real total gradient norm across every trainable parameter (bottleneck + decoder) --
-        # unlike grad_norm_loss_* below, this is an actual parameter gradient, the quantity
-        # "is AdamW's update small" genuinely depends on (notes/grad_norm_investigation.md).
-        # unscale_ first: under --precision fp16-hybrid, .grad is still GradScaler-scaled at this
-        # point (unscaling normally only happens inside grad_scaler.step()) -- without this the
-        # logged norm would repeat the exact scale-factor confusion already found and corrected for
-        # the activation-gradient probes. A documented no-op under bf16 (scaler disabled). clip
-        # with max_norm=inf so this only ever measures the norm, never actually clips gradients --
-        # clipping isn't something this project has decided to do.
-        grad_scaler.unscale_(optimizer)
-        grad_norm_params_total = torch.nn.utils.clip_grad_norm_(params, float("inf")).item()
-        grad_scaler.step(optimizer)
-        grad_scaler.update()
-        lr_scheduler.step()
+                print(timer.report(args.batch_size * args.grad_accum_steps, args.frames))
+                # :.6e, not :.4f -- a genuinely small-but-nonzero grad norm (plausible this deep into
+                # training, on an already-converged checkpoint) rounds to a misleading "0.0000" at 4
+                # decimal places, same illusion this project already hit once with the PSD loss print.
+                print(", ".join(f"{k}={v:.6e}" for k, v in grad_norms.items()))
+            log_step(wandb_enabled, step, {**accumulated_floats, **grad_norms}, current_lr)
 
-        # Checked here, right after a step fully lands and before any of this step's own
-        # (potentially slow) logging/eval work -- prioritizes actually getting the save done
-        # inside `timeout`'s kill-after grace period over finishing this step's own work first.
-        if _shutdown_requested:
-            print(f"Shutdown signal received at step {step} -- saving and exiting cleanly.")
-            _save_checkpoint_now(step, force_hf_upload=True)
-            if wandb_enabled:
-                import wandb  # noqa: PLC0415
-
-                wandb.finish()
-            return
-
-        # Last micro-step's real per-term gradient norms (see CodecLoss._hook_clone) -- same
-        # "last micro-step only" convention already used for the preview video below.
-        grad_norms = {f"grad_norm_{k}": v.item() for k, v in loss_fn.backward_metrics.items()}
-        grad_norms["grad_norm_params_total"] = grad_norm_params_total
-        grad_norms.update(per_term_grad_norms)  # empty dict unless --log-per-term-grad-norm
-
-        current_lr = optimizer.param_groups[0]["lr"]
-        term_str = ", ".join(
-            f"{k}={v:.4f}" for k, v in accumulated_floats.items() if k != "loss_total" and not k.endswith("_auto_w")
-        )
-        if (step + 1) % args.console_log_every == 0 or step == start_step:
-            print(f"step {step}: lr={current_lr:.2e} loss_total={accumulated_floats['loss_total']:.4f} ({term_str})")
-            print(
-                f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
-                f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
-            )
-            # :.6e, not :.4f -- a genuinely small-but-nonzero grad norm (plausible this deep into
-            # training, on an already-converged checkpoint) rounds to a misleading "0.0000" at 4
-            # decimal places, same illusion this project already hit once with the PSD loss print.
-            print(", ".join(f"{k}={v:.6e}" for k, v in grad_norms.items()))
-        log_step(wandb_enabled, step, {**accumulated_floats, **grad_norms}, current_lr)
-
-        is_last = step == args.steps - 1
-        if (step + 1) % args.checkpoint_every == 0 or is_last:
-            _save_checkpoint_now(step)
-        # Always persist the first completed step so a new run proves its output path before
-        # committing hours of compute. Subsequent samples follow the configured interval.
-        if step == start_step or (step + 1) % args.preview_every == 0 or is_last:
-            log_preview(
-                wandb_enabled, step, video, reconstructed, fps=args.target_fps,
-                output_dir=checkpoint_dir / "previews",
-            )
+            is_last = step == args.steps - 1
+            if (step + 1) % args.checkpoint_every == 0 or is_last:
+                _save_checkpoint_now(step)
+            # Always persist the first completed step so a new run proves its output path before
+            # committing hours of compute. Subsequent samples follow the configured interval.
+            if step == start_step or (step + 1) % args.preview_every == 0 or is_last:
+                log_preview(
+                    wandb_enabled, step, video, reconstructed, fps=args.target_fps,
+                    output_dir=checkpoint_dir / "previews",
+                )
 
 
 if __name__ == "__main__":
