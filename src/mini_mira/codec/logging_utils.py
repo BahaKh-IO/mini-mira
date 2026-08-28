@@ -88,15 +88,18 @@ def log_preview(
             preview_dir = Path(output_dir)
             preview_dir.mkdir(parents=True, exist_ok=True)
             video_path = preview_dir / f"step_{step:06d}.mp4"
-            # crf=18 explicitly -- without it this silently fell back to ffmpeg's own default
-            # (~23), visibly compressed (confirmed for real: a raw frame logged separately looked
-            # clean, the same frame through this encoder looked bad -- an encoding artifact, not a
-            # data bug). 18 is the standard "visually excellent" x264 choice; these are short
-            # diagnostic clips, not archival footage, so the larger file size costs nothing that
-            # matters here, and misleading compression artifacts on a quality judgment call do.
+            # crf=0 -- x264's true lossless mode, not just "high quality." Previously crf=18
+            # ("visually excellent" but still lossy): confirmed for real that it visibly mattered
+            # (real block/compression artifacts appeared on this side that weren't in the raw
+            # tensor) and, worse, nothing signaled to a viewer that this side wasn't the exact
+            # training input. crf=0 removes that gap entirely for the part we control -- the only
+            # compression left on the "original" side is whatever the source dataset clip already
+            # had, which is the real, honest picture. Real cost: much bigger files than crf=18
+            # (still small clips though, short diagnostic previews, not archival footage) --
+            # accepted deliberately in exchange for the preview actually being trustworthy.
             iio.imwrite(
                 video_path, video, fps=fps, codec="libx264", pixelformat="yuv420p",
-                output_params=["-crf", "18"],
+                output_params=["-crf", "0"],
             )
             print(f"Saved preview to {video_path}")
         except Exception as exc:  # media encoding must never discard a completed optimizer step
