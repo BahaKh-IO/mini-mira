@@ -21,6 +21,7 @@ DinoModel, not for a model that always needs frame pairs) is padded up to 2 by r
 frame, not rejected -- see dino_forward.
 """
 
+import contextlib
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,7 @@ import torch.hub
 import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -42,6 +44,37 @@ VJEPA_TUBELET_SIZE_EXPECTED = 2  # sanity check only -- source of truth is encod
 # ViT-B's own hierarchical_layers (app/vjepa_2_1/models/vision_transformer.py) -- the only valid
 # out_layers indices for this model. Same indices as DinoModel's own DEFAULT_DINO_LAYERS["dinov3_vitb16"].
 DEFAULT_VJEPA_LAYERS = (2, 5, 8, 11)
+
+
+# cuDNN's fused attention is measurably the right backend for this encoder's shape -- at
+# 448x768x40 (a 26880-token joint space-time sequence, head_dim 64, bf16) it runs the attention
+# in 12.5ms against FlashAttention-2's 20.1ms on an H100, and 1.7x on the single largest kernel
+# in the step is worth taking. Listed first with set_priority so the rest stay as fallbacks
+# rather than being disabled: any shape cuDNN can't serve still lands on flash exactly as before.
+_ATTENTION_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH,
+]
+
+
+@contextlib.contextmanager
+def _preferred_attention_backend():
+    """Prefer cuDNN attention for the duration of an encoder forward.
+
+    Upstream's RoPEAttention wraps its own SDPA call in `torch.backends.cuda.sdp_kernel()` -- the
+    deprecated no-argument form, which re-enables every backend and so silently discards any
+    preference an outer context established. Neutralizing that one call for the duration of the
+    forward is what lets the preference below actually reach the attention; it changes nothing
+    else about upstream's behavior (the call it replaces enables all backends, which is the state
+    the surrounding sdpa_kernel already leaves them in).
+    """
+    original = torch.backends.cuda.sdp_kernel
+    torch.backends.cuda.sdp_kernel = lambda *args, **kwargs: contextlib.nullcontext()
+    try:
+        with sdpa_kernel(_ATTENTION_BACKENDS, set_priority=True):
+            yield
+    finally:
+        torch.backends.cuda.sdp_kernel = original
 
 
 def _vjepa_repo_dir() -> Path:
@@ -131,7 +164,8 @@ class VjepaModel(nn.Module):
         repeating the last frame (so it returns exactly one output frame) instead of raising --
         see module docstring for why this matters.
         """
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda), \
+                _preferred_attention_backend():
             b, t, _, h, w = x.shape
             assert t >= 1, f"t={t} must be at least 1"
             if t < self.tubelet_size:
@@ -141,7 +175,12 @@ class VjepaModel(nn.Module):
             x = self.image_normalization(x)
             new_h = self.patch_size * (h // self.patch_size)
             new_w = self.patch_size * (w // self.patch_size)
-            x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
+            # Skipped when the input is already patch-aligned, which is the case for every real
+            # training resolution here (448x768 is 28x48 whole patches). Resizing something to the
+            # size it already is costs a full antialiased-bilinear pass over the whole clip for a
+            # result identical to its input.
+            if (new_h, new_w) != (h, w):
+                x = torch.nn.functional.interpolate(x, (new_h, new_w), mode="bilinear", antialias=True)
             x = rearrange(x, "(b t) c h w -> b c t h w", b=b, t=t)
 
             tokens = self.encoder(x)  # Tensor if self.layers is None, else list[Tensor] -- one

@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 @dataclass
@@ -93,6 +94,30 @@ class QKLayerNorm(nn.Module):
         return x.to(input_dtype)
 
 
+# SpaceTimeBlock runs attention at two shapes that are about as different as two attention
+# shapes get -- many short sequences over time, few long sequences over space -- and the fastest
+# SDPA backend is not the same one for both. PyTorch's default priority order picks
+# FlashAttention for both and loses on each. Measured on an H100, bf16, forward+backward, at the
+# decoder's real 448x768x40 shapes:
+#
+#   temporal, 2688 sequences of length 20:   flash 7.5ms   mem-efficient 2.8ms   cuDNN 3.8ms
+#   spatial,     40 sequences of length 1344: flash 6.9ms   cuDNN         4.1ms   mem-efficient 13.2ms
+#
+# Flash's per-sequence tiling has nowhere near enough work to amortize its own setup across
+# 20-token sequences; on the long spatial sequences cuDNN's fused kernel is simply faster. Both
+# lists keep every other backend as a fallback (set_priority orders them, it does not disable
+# them), so an unsupported shape still lands somewhere valid rather than raising.
+_SHORT_SEQUENCE_LEN = 128
+_SHORT_SEQUENCE_BACKENDS = [
+    SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION, SDPBackend.MATH,
+]
+_LONG_SEQUENCE_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH,
+]
+
+
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, qk_norm: str = "layernorm"):
         super().__init__()
@@ -117,7 +142,9 @@ class SelfAttention(nn.Module):
             q = apply_rotary_emb(q, freqs)
             k = apply_rotary_emb(k, freqs)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        backends = _SHORT_SEQUENCE_BACKENDS if n <= _SHORT_SEQUENCE_LEN else _LONG_SEQUENCE_BACKENDS
+        with sdpa_kernel(backends, set_priority=True):
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
         out = out.transpose(1, 2).reshape(b, n, c)
         return self.wo(out)
 
