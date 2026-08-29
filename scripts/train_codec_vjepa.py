@@ -108,6 +108,19 @@ def parse_args() -> argparse.Namespace:
         "--frames", type=int, default=None, help="Clip length in frames (both data modes). Default 4"
     )
     parser.add_argument("--require-pretrained-vjepa", action="store_true")
+    parser.add_argument(
+        "--use-refinement-head", action=argparse.BooleanOptionalAction, default=None,
+        help="Add a small conv refinement head after the decoder's per-patch pixel readout, "
+        "before tanh (mini_mira.codec.decoder.PixelRefinementHead) -- targets the blocky/tiled "
+        "reconstruction pattern in notes/blockiness_investigation.md by giving the decoder a "
+        "local, weight-shared way to blend across patch boundaries, on top of whatever the "
+        "transformer's global attention learns on its own. Zero-initialized: output is "
+        "bit-identical to not having it, the moment it's added -- purely additive from there. "
+        "On a --resume against a checkpoint saved without it, needs --reset-optimizer-state too "
+        "(the new params change the optimizer's param count, which a plain resume can't handle). "
+        "Default: whatever --config's own decoder.use_refinement_head says (False unless a "
+        "config sets it).",
+    )
     parser.add_argument("--index-path", default=None, help="Real dataset dir from download_shards.py")
     parser.add_argument(
         "--num-workers", type=int, default=6,
@@ -286,6 +299,8 @@ def main() -> None:
     apply_run_config(args, run_config)
 
     config = load_pipeline_config(args.config)
+    if args.use_refinement_head is not None:
+        config.decoder.use_refinement_head = args.use_refinement_head
     # Real, previously-hit-for-real requirement (notes/vjepa_next_session.md): the decoder's own
     # temporal/spatial upsample only exactly reconstructs --height/--width if both are divisible
     # by decoder.patch_size * bottleneck.stride -- otherwise it silently reconstructs a slightly
@@ -422,18 +437,31 @@ def main() -> None:
     start_step = 0
     wandb_run_id = None
     if args.resume and ckpt_path.exists():
-        start_step, wandb_run_id = load_checkpoint(ckpt_path, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler)
+        # decoder_new_submodule_prefix: only set (and only actually needed) when the refinement
+        # head is on -- a checkpoint saved before this run's config turned it on won't have those
+        # keys, which is expected, not a corruption; see _load_decoder_flexible. A checkpoint that
+        # already HAS them (e.g. a later resume of a run that already adopted it) hits zero
+        # missing keys either way, so this is safe to pass unconditionally whenever the head is on.
+        decoder_new_prefix = "refinement_head." if config.decoder.use_refinement_head else None
+        start_step, wandb_run_id = load_checkpoint(
+            ckpt_path, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler,
+            reset_optimizer_state=args.reset_optimizer_state,
+            decoder_new_submodule_prefix=decoder_new_prefix,
+        )
         if args.wandb_new_run:
             wandb_run_id = None
         if args.reset_optimizer_state:
-            # Fresh AdamW state (no momentum/variance carried over) bound to the SAME just-loaded
-            # weights -- load_checkpoint above already loaded the OLD optimizer state into the
-            # existing `optimizer` object; replacing it here discards that state entirely rather
-            # than editing it in place. Only the optimizer's own state resets -- loaded model
-            # weights and start_step are untouched. lr_scheduler was constructed bound to the old
-            # optimizer object (torch.optim.lr_scheduler stores this as self.optimizer), so it
-            # needs to be pointed at the new one or every later lr_scheduler.step()/get_lr() call
-            # would silently keep operating on the discarded optimizer instead.
+            # load_checkpoint above skipped loading the checkpoint's saved optimizer state
+            # entirely (necessary, not just preferred, whenever the param count changed -- e.g.
+            # the refinement head just added new ones -- since optimizer.load_state_dict raises
+            # on a mismatch rather than something to load-then-discard). `optimizer` here is
+            # still the freshly-constructed one from just above, already at zero state; rebuilding
+            # it again is only needed to make that explicit at the call site and to keep this
+            # branch symmetric with lr_scheduler.optimizer's repoint below, which IS load-bearing:
+            # lr_scheduler was constructed bound to the pre-loop `optimizer` object
+            # (torch.optim.lr_scheduler stores this as self.optimizer), so every later
+            # lr_scheduler.step()/get_lr() call needs pointing at the object actually being
+            # stepped, not a stale reference.
             optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
             lr_scheduler.optimizer = optimizer
         # Two real bugs, verified directly, not just reasoned about:
