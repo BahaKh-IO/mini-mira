@@ -26,7 +26,7 @@ from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.logging_utils import init_wandb, log_preview, log_step
-from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
+from mini_mira.codec.loss import CodecLoss, CodecLossSchedule, CodecLossWeights, CodecOutputs, normalize_video
 from mini_mira.codec.vjepa import DEFAULT_VJEPA_LAYERS, VjepaModel
 from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
@@ -45,6 +45,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 20")
     parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps - warmup_steps")
     parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
+    parser.add_argument(
+        "--reconstruction-loss", choices=["l1", "l2"], default="l1",
+        help="Default l1 (mira's own recipe). Pass l2 to match configs/runs/codec_vjepa_l2_warmup.yaml",
+    )
+    parser.add_argument(
+        "--perceptual-warmup-steps", type=int, default=0,
+        help="Default 0 (perceptual terms full-strength from step 0, today's existing behavior). "
+        "Pass 1500 to match configs/runs/codec_vjepa_l2_warmup.yaml's hold-then-ramp schedule.",
+    )
     parser.add_argument("--precision", choices=["fp16-hybrid", "bf16"], default="bf16")
     parser.add_argument("--activation-checkpointing", action="store_true", help="Trade compute for memory -- needed at larger --height/--width")
     parser.add_argument(
@@ -80,9 +89,18 @@ def main() -> None:
     vjepa.eval()
     bottleneck = MyBottleneck(config.bottleneck, use_checkpointing=args.activation_checkpointing).cuda()
     decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
-    loss_fn = CodecLoss(CodecLossWeights(auto_weight=True), use_checkpointing=args.activation_checkpointing).cuda()
+    loss_fn = CodecLoss(
+        CodecLossWeights(auto_weight=True, reconstruction_loss=args.reconstruction_loss),
+        use_checkpointing=args.activation_checkpointing,
+    ).cuda()
     loss_fn.bind_encoder_dino(vjepa)
     loss_fn.bind_last_layer(decoder.last_layer_weight)
+    # Built at full target weights; ramps down from there -- see CodecLossSchedule's docstring.
+    loss_schedule = CodecLossSchedule(
+        perceptual_warmup_steps=args.perceptual_warmup_steps,
+        lpips_target=loss_fn.weights.loss_lpips_perceptual,
+        dino_target=loss_fn.weights.loss_dino_latent_consistency,
+    )
 
     params = list(bottleneck.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
@@ -111,6 +129,7 @@ def main() -> None:
     wandb_enabled = init_wandb(args.wandb_project, vars(args))
 
     for step in range(args.steps):
+        loss_schedule.apply(loss_fn.weights, step)
         optimizer.zero_grad()
         with _autocast(args.precision):
             with torch.no_grad():
