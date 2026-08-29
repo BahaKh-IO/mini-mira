@@ -208,6 +208,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--hf-backup-repo", default=None, help="Optional HF Hub repo to back up checkpoints to")
     parser.add_argument("--wandb-project", default=None)
+    parser.add_argument(
+        "--wandb-entity", default=None,
+        help="Optional wandb team/entity. Without it, wandb falls back to the logged-in account's "
+        "own default -- a real 'permission denied' if that default differs from the entity the "
+        "project actually lives under (hit for real on a fresh box's own personal login).",
+    )
 
     return parser.parse_args()
 
@@ -529,7 +535,7 @@ def main() -> None:
     # wandb_run_id: None on a fresh run (wandb.init mints a new one, captured below) or the id
     # loaded from the checkpoint above -- passing it back in continues that SAME wandb run
     # instead of --resume silently fragmenting the loss/lr history into a new, disconnected one.
-    wandb_enabled = init_wandb(args.wandb_project, vars(args), run_id=wandb_run_id)
+    wandb_enabled = init_wandb(args.wandb_project, vars(args), run_id=wandb_run_id, entity=args.wandb_entity)
     wandb_run_id = get_wandb_run_id(wandb_enabled)
     torch.cuda.reset_peak_memory_stats()
 
