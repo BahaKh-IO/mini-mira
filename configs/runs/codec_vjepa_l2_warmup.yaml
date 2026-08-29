@@ -42,5 +42,10 @@ steps: 4000
 checkpoint_every: 100
 hf_backup_every: 1000
 
+# Explicit, not left to train_codec_vjepa.py's own default (max(1, steps // 20) = 200 here) --
+# standing preference as of 2026-08-29: LR warmup is always 50 steps for this project's runs,
+# not a fraction of --steps. decay_steps is left unset (defaults to steps - lr_warmup_steps).
+lr_warmup_steps: 50
+
 reconstruction_loss: l2
 perceptual_warmup_steps: 1500
