@@ -326,11 +326,19 @@ class CodecLossWeights:
 
 @dataclass
 class CodecLossSchedule:
-    """Ramps the two perceptual terms in linearly over the first `perceptual_warmup_steps`
-    optimizer steps, leaving the pixel term untouched throughout.
+    """Holds the two perceptual terms at 0 through the first `perceptual_warmup_steps` optimizer
+    steps, then ramps them in linearly over an equal-length window after that. Pixel term
+    untouched throughout.
 
-        step 0                        -> both perceptual weights 0: a pure pixel-loss codec
-        step perceptual_warmup_steps  -> both at their targets, and every step after
+        step 0 .. perceptual_warmup_steps        -> both perceptual weights 0: pure pixel-loss
+        step perceptual_warmup_steps .. 2x that   -> ramping linearly
+        step >= 2 * perceptual_warmup_steps       -> both at their targets, every step after
+
+    Correction from the first version of this class (which started ramping immediately at step
+    0, reaching target by perceptual_warmup_steps): the pixel-only phase needs to actually hold
+    for the full warmup window, not just be the starting point of a ramp already in progress.
+    Ramp-after duration is assumed equal to the hold duration (not separately specified) --
+    flag if a different ramp length was actually intended.
 
     Why: a real 5-way, 1000-step loss sweep on one clip (H100, scaled_300m_vjepa, identical seed
     and LR, only the loss config varying) split cleanly along two axes. A pure L2 pixel loss won
@@ -363,7 +371,9 @@ class CodecLossSchedule:
         if self.perceptual_warmup_steps <= 0:
             fraction = 1.0
         else:
-            fraction = min(1.0, max(0.0, step / self.perceptual_warmup_steps))
+            # Flat 0 through the hold window, then ramp over the next window of the same length.
+            steps_past_hold = step - self.perceptual_warmup_steps
+            fraction = min(1.0, max(0.0, steps_past_hold / self.perceptual_warmup_steps))
         weights.loss_lpips_perceptual = self.lpips_target * fraction
         weights.loss_dino_latent_consistency = self.dino_target * fraction
 
