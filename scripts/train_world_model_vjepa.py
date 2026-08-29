@@ -196,6 +196,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--compile", action=argparse.BooleanOptionalAction, default=None,
+        help="torch.compile the trainable world_model+action_encoder (in place, not the frozen "
+        "V-JEPA encoder or codec). Default False. See this script's own compile-site comment for "
+        "why this compiles whole-module rather than per-block like train_codec_vjepa.py's decoder.",
+    )
+    parser.add_argument(
         "--num-workers", type=int, default=None,
         help="Default 0 (matches train_world_model.py's own hardcoded behavior). Unlike the codec "
         "scripts, this is NOT yet confirmed safe with --resume's exact-batch-replay -- see this "
@@ -238,7 +244,7 @@ def run_validation(
     with torch.no_grad():
         for _ in range(n_batches):
             batch, _metadata = next(val_iter)
-            batch = resize_batch(batch, height, width).to("cuda")
+            batch = resize_batch(batch, height, width).to("cuda", non_blocking=True)
             with _autocast(precision):
                 losses = model(batch)
             for k, v in losses.items():
@@ -268,7 +274,7 @@ def run_full_eval(
     with torch.no_grad():
         for _ in range(n_batches):
             batch, _metadata = next(eval_iter)
-            batch = resize_batch(batch, height, width).to("cuda")
+            batch = resize_batch(batch, height, width).to("cuda", non_blocking=True)
             with _autocast(precision):
                 z, z_t = model.rollout(batch, context_latents, diffusion_steps, schedule_type)
                 # One shared decode + encoder pass, reused by all three eval tiers below instead
@@ -410,6 +416,24 @@ def main() -> None:
         latent_std=latent_stats["latent_std"], dino=vjepa,
     ).cuda()
     model.train()
+
+    # Module.compile() in-place, not the model.world_model = torch.compile(...) rebinding form --
+    # same reasoning train_codec_vjepa.py already established: torch.compile()'s OptimizedModule
+    # wrapper prefixes every state_dict key with "_orig_mod.", breaking checkpoint compatibility
+    # between a --compile'd and a plain run; compiling in place keeps the module's identity and key
+    # names, sidestepping that entirely (mini_mira.world_model.checkpoint's _unwrap_compiled is
+    # still there as a defensive no-op, mirroring the codec's own belt-and-suspenders setup).
+    #
+    # Whole-module compile here, NOT per-block like the codec's decoder -- deliberately different
+    # from that precedent: the codec's per-block choice was specifically to keep CodecLoss's
+    # per-layer adaptive-weight gradient reads out of one opaque compiled graph (measured 1.6x
+    # SLOWER otherwise). This script's loss has no equivalent per-layer gradient read, so there's
+    # no known reason to give up whole-module compile's better cross-block fusion. Reasoned, not
+    # yet measured against a per-block alternative -- if --compile turns out to be a net loss here,
+    # that's the first thing to try, same as the codec's own discovery process.
+    if args.compile:
+        model.world_model.compile()
+        model.action_encoder.compile()
 
     params = list(model.world_model.parameters()) + list(model.action_encoder.parameters()) + [model.bos]
     # Matches mira's own world-model optimizer betas (0.9, 0.99) -- note this differs from
@@ -581,7 +605,10 @@ def main() -> None:
         for _ in range(args.grad_accum_steps):
             batch, _metadata = next(train_iter)
             batches_consumed += 1
-            batch = resize_batch(batch, args.height, args.width).to("cuda")
+            # non_blocking=True is safe/beneficial here since create_loader's pin_memory defaults
+            # to True on CUDA -- lets the H2D copy overlap instead of blocking. Same on the
+            # validation/full-eval .to("cuda") calls below.
+            batch = resize_batch(batch, args.height, args.width).to("cuda", non_blocking=True)
             with _autocast(args.precision):
                 losses = model(batch)
             grad_scaler.scale(losses["loss_total"] / args.grad_accum_steps).backward()
