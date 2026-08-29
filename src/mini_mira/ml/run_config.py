@@ -44,6 +44,7 @@ class WorldModelRunConfig:
     checkpoint_every: int | None = None
     console_log_every: int | None = None
     num_workers: int = 0  # V-JEPA-track only so far (train_world_model_vjepa.py)
+    compile: bool = False  # V-JEPA-track only so far (train_world_model_vjepa.py)
 
 
 @dataclass
