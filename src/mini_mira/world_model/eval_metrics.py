@@ -20,14 +20,21 @@ from torch import Tensor
 
 
 class RunningMean:
-    """Plain single-process running mean over however many values update() has seen so far."""
+    """Plain single-process running mean over however many values update() has seen so far.
+
+    _sum stays on whatever device `values` arrives on (no .cpu() in update()) -- forcing a sync on
+    every single update() call was a real, if small, instance of the same sync-stall class already
+    fixed for train_codec_vjepa.py/train_world_model.py's own per-micro-step .item() calls (this
+    one only fires per eval batch, not per micro-step, so far smaller magnitude, but the same fix
+    applies: accumulate as a tensor, sync once in compute() instead of once per update()."""
 
     def __init__(self) -> None:
-        self._sum = torch.zeros((), dtype=torch.float64)
+        self._sum: Tensor | None = None
         self._n = 0
 
     def update(self, values: Tensor) -> None:
-        self._sum += values.detach().double().sum().cpu()
+        term = values.detach().double().sum()
+        self._sum = term if self._sum is None else self._sum + term
         self._n += values.numel()
 
     def compute(self) -> float:
