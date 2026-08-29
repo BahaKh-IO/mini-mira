@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         "see mini_mira.codec.decoder.PixelRefinementHead. Overrides only for this run; the "
         "loaded YAML file itself is untouched.",
     )
+    parser.add_argument(
+        "--use-shallow-texture-branch", action="store_true",
+        help="Enable StridedConvBottleneckConfig.use_shallow_texture_branch regardless of what "
+        "--config says -- see mini_mira.codec.bottleneck.MyBottleneck. Overrides only for this "
+        "run; the loaded YAML file itself is untouched.",
+    )
     parser.add_argument("--preview-every", type=int, default=25)
     parser.add_argument("--preview-dir", default="overfit_previews_vjepa", help="Local dir for preview videos -- saved here regardless of wandb status")
     parser.add_argument("--console-log-every", type=int, default=10)
@@ -79,6 +85,8 @@ def main() -> None:
     config = load_pipeline_config(args.config)
     if args.use_refinement_head:
         config.decoder.use_refinement_head = True
+    if args.use_shallow_texture_branch:
+        config.bottleneck.use_shallow_texture_branch = True
 
     torch.manual_seed(0)
     # require_pretrained=True unconditionally -- there's no sensible reason to run this specific
