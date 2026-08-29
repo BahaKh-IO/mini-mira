@@ -1,0 +1,46 @@
+# V-JEPA codec, L2 pixel loss with the perceptual terms ramped in over the first 1,500 steps.
+#
+# The recipe two real experiments on this architecture pointed at (H100, scaled_300m_vjepa.yaml,
+# one real clip, 1000 steps each, identical seed/LR, only the loss config varying):
+#
+#   config                             PSNR    SSIM   LPIPS
+#   L2 only, no perceptual            25.24   0.664   0.461   <- best PSNR
+#   L2 + LPIPS + DINO  (auto_weight)  24.51   0.615   0.360
+#   L1 only, no perceptual            23.75   0.652   0.472
+#   L1 + LPIPS + DINO  (the default)  23.19   0.610   0.368   <- control
+#   L2, perceptual down-weighted 0.1  23.04   0.529   0.329   <- best LPIPS
+#
+# Two separate findings, and this file takes both. First, swapping the pixel term L1 -> L2 won in
+# every matched pair (25.24 vs 23.75 without perceptual terms; 24.51/0.360 vs 23.19/0.368 with
+# them) -- so reconstruction_loss: l2. Second, PSNR and LPIPS rank the perceptual terms in
+# opposite directions, because a pure pixel loss converges to the smooth per-patch average that
+# PSNR rewards and LPIPS punishes. Rather than pick a side, perceptual_warmup_steps: 1500 trains
+# on the pixel term alone through the phase where the model is learning coarse structure anyway
+# (and where the perceptual terms are both expensive and fighting it), then ramps them in to
+# 1.0 to put the high-frequency detail back.
+#
+# Caveat worth keeping in view: those numbers come from overfitting a SINGLE clip, which measures
+# fitting capacity, not generalization, and the MIRA paper's own Table 6 found that dropping both
+# perceptual terms collapses the downstream world model even where reconstruction still looks
+# fine. That is exactly why the ramp ends at the full-strength perceptual recipe rather than
+# stopping at the pure-L2 config that topped PSNR.
+#
+#   python scripts/train_codec_vjepa.py --config configs/scaled_300m_vjepa.yaml \
+#     --run-config configs/runs/codec_vjepa_l2_warmup.yaml \
+#     --index-path <train data dir> --require-pretrained-vjepa \
+#     --checkpoint-dir checkpoints_vjepa --wandb-project mini-mira-vjepa-codec
+
+height: 448
+width: 768
+frames: 40
+batch_size: 2
+grad_accum_steps: 16
+precision: bf16
+compile: true
+
+steps: 4000
+checkpoint_every: 100
+hf_backup_every: 1000
+
+reconstruction_loss: l2
+perceptual_warmup_steps: 1500

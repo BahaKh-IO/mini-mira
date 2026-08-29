@@ -298,6 +298,13 @@ class CodecLossWeights:
     """A term is active iff its weight is > 0 (matches mira's own convention)."""
 
     loss_mae: float = 1.0
+    # "l1" (mira's real recipe, and this project's default) or "l2" -- which pixel-space distance
+    # the loss_mae term actually computes. Kept under the loss_mae key either way: auto_weight's
+    # anchor lookup, the per-term gradient-norm logging and every existing wandb panel all key off
+    # that exact string, so this is a pure swap of the math rather than a new term. The name is
+    # then a slight misnomer under "l2" (it computes MSE, not a mean ABSOLUTE error) -- accepted
+    # deliberately over a wide, purely cosmetic rename of a load-bearing key.
+    reconstruction_loss: str = "l1"
     loss_lpips_perceptual: float = 1.0
     lpips_perceptual_frame_frac: float = 0.25
     loss_dino_latent_consistency: float = 1.0
@@ -315,6 +322,50 @@ class CodecLossWeights:
     # The default path does not probe at all (see _apply_adaptive_weights_reusing_gradients) and
     # ignores this: there, exact factors are already essentially free.
     auto_weight_every: int = 1
+
+
+@dataclass
+class CodecLossSchedule:
+    """Ramps the two perceptual terms in linearly over the first `perceptual_warmup_steps`
+    optimizer steps, leaving the pixel term untouched throughout.
+
+        step 0                        -> both perceptual weights 0: a pure pixel-loss codec
+        step perceptual_warmup_steps  -> both at their targets, and every step after
+
+    Why: a real 5-way, 1000-step loss sweep on one clip (H100, scaled_300m_vjepa, identical seed
+    and LR, only the loss config varying) split cleanly along two axes. A pure L2 pixel loss won
+    PSNR outright (25.24dB, against 23.19 for the shipped L1+LPIPS+DINO recipe), while the
+    perceptual terms won LPIPS by just as clear a margin (0.329-0.368, against 0.461 for pure L2)
+    -- the usual blur-versus-texture split, where PSNR rewards exactly the smooth per-patch
+    average that early training falls into anyway. This schedule takes the first and then the
+    second: the pixel term alone gets the reconstruction to a good coarse optimum quickly and
+    cheaply, and the perceptual terms then ramp in to put the high-frequency detail back.
+
+    Both `auto_weight` and `reconstruction_loss` are deliberately NOT scheduled. auto_weight
+    rescales the perceptual terms against the pixel anchor and has nothing to act on while their
+    weights are still 0, so it can simply stay on; the pixel loss is meant to be one consistent
+    objective for the whole run, not something that changes shape underneath the optimizer.
+
+    Constructing CodecLoss with a target of 0 and then scheduling upward does NOT work: the LPIPS
+    module is built once, in __init__, only when its weight is already > 0. Build CodecLoss with
+    the TARGET weights (what the training scripts do) and let this ramp them down at step 0.
+
+    perceptual_warmup_steps=0 disables the whole mechanism -- weights stay at their targets from
+    step 0, which is exactly the behavior of every run predating this class.
+    """
+
+    perceptual_warmup_steps: int = 0
+    lpips_target: float = 1.0
+    dino_target: float = 1.0
+
+    def apply(self, weights: CodecLossWeights, step: int) -> None:
+        """Set `weights`' two perceptual weights for `step`, in place."""
+        if self.perceptual_warmup_steps <= 0:
+            fraction = 1.0
+        else:
+            fraction = min(1.0, max(0.0, step / self.perceptual_warmup_steps))
+        weights.loss_lpips_perceptual = self.lpips_target * fraction
+        weights.loss_dino_latent_consistency = self.dino_target * fraction
 
 
 class CodecLoss(nn.Module):
@@ -578,11 +629,18 @@ class CodecLoss(nn.Module):
         loss: dict[str, Tensor] = {}
 
         if self.weights.loss_mae > 0:
-            loss["loss_mae"] = F.l1_loss(self._hook_clone(predicted, "loss_mae"), target)
+            pixel_loss_fn = F.mse_loss if self.weights.reconstruction_loss == "l2" else F.l1_loss
+            loss["loss_mae"] = pixel_loss_fn(self._hook_clone(predicted, "loss_mae"), target)
 
         t_total = predicted.shape[1]
 
-        if self.lpips_perceptual_loss is not None:
+        # The weight check is what makes CodecLossSchedule's warmup phase actually cheap: at
+        # weight 0 the term would contribute exactly nothing to the total anyway, so skipping it
+        # here saves two full VGG passes per micro-step rather than computing and multiplying by
+        # zero. The DINO term below has always guarded itself this way; this one never did,
+        # because before the schedule existed its weight was either permanently 0 (module never
+        # built, `is not None` already false) or permanently positive.
+        if self.lpips_perceptual_loss is not None and self.weights.loss_lpips_perceptual > 0:
             # Only a random frame subset scored per step (mira's cost-control trick): cheaper
             # than every frame, and different random subsets across steps still cover everything.
             k = max(1, round(t_total * self.weights.lpips_perceptual_frame_frac))

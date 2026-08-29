@@ -70,6 +70,10 @@ class CodecRunConfig:
     lr_min: float | None = None
 
     loss_mae_weight: float = 1.0
+    # V-JEPA-track only so far (train_codec_vjepa.py), same as `compile` above --
+    # see mini_mira.codec.loss.CodecLossSchedule.
+    reconstruction_loss: str = "l1"
+    perceptual_warmup_steps: int = 0
     log_activation_grad_norms: bool = False
     log_per_term_grad_norm: bool = False
 
