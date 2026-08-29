@@ -58,6 +58,7 @@ EXPECTED_CODEC_DEFAULTS = {
     "perceptual_chunk_size": 0, "auto_weight_every": 1,
     "perceptual_dino_model": None, "perceptual_dino_multilayer": False,
     "lr_warmup_steps": None, "lr_decay_steps": None, "lr_min": None, "loss_mae_weight": 1.0,
+    "reconstruction_loss": "l1", "perceptual_warmup_steps": 0,
     "log_activation_grad_norms": False, "log_per_term_grad_norm": False, "checkpoint_every": 100,
     "hf_backup_every": None, "preview_every": 100, "console_log_every": 10,
     "precision": "fp16-hybrid",
