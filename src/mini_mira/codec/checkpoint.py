@@ -59,6 +59,32 @@ def save_checkpoint(
     tmp.replace(path)
 
 
+def _load_decoder_flexible(
+    decoder: torch.nn.Module, state_dict: dict[str, Any], new_submodule_prefix: str | None
+) -> None:
+    """decoder.load_state_dict, tolerant of missing keys IF every one of them belongs to
+    new_submodule_prefix -- a submodule (e.g. "refinement_head.") added to the architecture after
+    this checkpoint was saved, with no counterpart in the saved file. Any OTHER missing key, or
+    any unexpected key at all, still raises: this is meant to let one specific, known kind of
+    architecture growth resume cleanly, not to blanket-swallow every mismatch.
+
+    new_submodule_prefix=None (the default) skips all of this and loads strictly, unchanged from
+    before this function existed -- the common case, and every existing caller's behavior."""
+    if new_submodule_prefix is None:
+        decoder.load_state_dict(state_dict)
+        return
+    result = decoder.load_state_dict(state_dict, strict=False)
+    unexpected_missing = [k for k in result.missing_keys if not k.startswith(new_submodule_prefix)]
+    if unexpected_missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"Decoder checkpoint mismatch beyond the expected new {new_submodule_prefix!r} "
+            f"submodule -- missing: {unexpected_missing}, unexpected: {result.unexpected_keys}"
+        )
+    if result.missing_keys:
+        print(f"load_checkpoint: decoder missing {new_submodule_prefix!r} keys (new submodule, "
+              f"expected, starts fresh): {result.missing_keys}")
+
+
 def load_checkpoint(
     path: str | Path,
     bottleneck: torch.nn.Module,
@@ -66,17 +92,34 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
     grad_scaler: torch.amp.GradScaler | None = None,
+    reset_optimizer_state: bool = False,
+    decoder_new_submodule_prefix: str | None = None,
 ) -> tuple[int, str | None]:
     """Loads every component in place. Returns (step to resume from (saved_step + 1), the saved
     wandb run id or None).
 
     Checkpoints saved before grad_scaler/wandb_run_id support existed simply have no matching
     key -- .get(...) treats that the same as grad_scaler=None / wandb_run_id=None was passed at
-    save time, so older checkpoints keep loading fine, just without restoring that state."""
+    save time, so older checkpoints keep loading fine, just without restoring that state.
+
+    reset_optimizer_state: skip loading the checkpoint's saved optimizer state entirely, so the
+    caller's own (already-constructed) optimizer keeps whatever state it started with. Needed,
+    not just preferred, whenever the caller's optimizer covers a different set of parameters than
+    the checkpoint was saved with (e.g. decoder_new_submodule_prefix added new ones) --
+    optimizer.load_state_dict raises on a param-count mismatch, so loading first and discarding
+    after (the old pattern) doesn't work once the counts actually differ. The lr_scheduler is
+    NOT affected by this flag: its own state (warmup/decay shape, current step) is independent of
+    AdamW's momentum/variance and still loads either way, matching how --reset-optimizer-state and
+    --reset-lr-schedule are already independent, separately-opted-into things at the CLI level.
+
+    decoder_new_submodule_prefix: see _load_decoder_flexible. None (default) loads the decoder
+    strictly, unchanged from before this parameter existed.
+    """
     ckpt: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
     _unwrap_compiled(bottleneck).load_state_dict(ckpt["bottleneck"])
-    _unwrap_compiled(decoder).load_state_dict(ckpt["decoder"])
-    optimizer.load_state_dict(ckpt["optimizer"])
+    _load_decoder_flexible(_unwrap_compiled(decoder), ckpt["decoder"], decoder_new_submodule_prefix)
+    if not reset_optimizer_state:
+        optimizer.load_state_dict(ckpt["optimizer"])
     lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
     if grad_scaler is not None and ckpt.get("grad_scaler") is not None:
         grad_scaler.load_state_dict(ckpt["grad_scaler"])
