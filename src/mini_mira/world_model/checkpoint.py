@@ -12,6 +12,14 @@ from typing import Any
 import torch
 
 
+def _unwrap_compiled(module: torch.nn.Module) -> torch.nn.Module:
+    """Ported from mini_mira.codec.checkpoint (same real bug, same fix) -- torch.compile()'s
+    OptimizedModule wrapper carries a real "_orig_mod." prefix in its state_dict() keys (confirmed
+    empirically there, torch==2.8.0), breaking cross-load between a --compile'd and a plain run.
+    A no-op wherever compile was never used."""
+    return getattr(module, "_orig_mod", module)
+
+
 def save_checkpoint(
     path: str | Path,
     step: int,
@@ -74,8 +82,8 @@ def save_checkpoint(
     torch.save(
         {
             "step": step,
-            "world_model": world_model.state_dict(),
-            "action_encoder": action_encoder.state_dict(),
+            "world_model": _unwrap_compiled(world_model).state_dict(),
+            "action_encoder": _unwrap_compiled(action_encoder).state_dict(),
             "bos": bos.detach().cpu(),
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
@@ -115,8 +123,8 @@ def load_checkpoint(
     no matching key -- .get(...) treats that the same as those args weren't passed at save time,
     so older checkpoints keep loading fine, just without restoring/checking that state."""
     ckpt: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
-    world_model.load_state_dict(ckpt["world_model"])
-    action_encoder.load_state_dict(ckpt["action_encoder"])
+    _unwrap_compiled(world_model).load_state_dict(ckpt["world_model"])
+    _unwrap_compiled(action_encoder).load_state_dict(ckpt["action_encoder"])
     with torch.no_grad():
         bos.copy_(ckpt["bos"].to(bos.device))
     optimizer.load_state_dict(ckpt["optimizer"])
