@@ -27,6 +27,7 @@ def save_checkpoint(
     latent_std: float | None = None,
     dataloader_batches_consumed: int = 0,
     temporal_downsampling: int | None = None,
+    num_workers: int | None = None,
 ) -> None:
     """Atomic write: save to a temp file, then rename -- a crash mid-save never leaves `path`
     pointing at a half-written file.
@@ -60,6 +61,11 @@ def save_checkpoint(
     loader past already-seen data instead of silently restarting from the beginning. Only correct
     if the loader is rebuilt with the same seed/num_workers every launch -- see train_world_model.py.
 
+    num_workers: same mismatch-check purpose as codec_checkpoint/temporal_downsampling -- a
+    --resume launched with a different --num-workers than the original run would still fast-forward
+    the same batch COUNT, but (unconfirmed, not yet empirically tested) may not land on the same
+    actual batches if per-worker shard assignment shifts with worker count. Warn, don't block.
+
     Also snapshots torch's CPU + CUDA RNG state, so a future --resume continues the same random
     stream (noise/tau draws) instead of restarting it -- see train_world_model.py's unconditional
     torch.manual_seed(0), which this is restored after."""
@@ -80,6 +86,7 @@ def save_checkpoint(
             "latent_std": latent_std,
             "dataloader_batches_consumed": dataloader_batches_consumed,
             "temporal_downsampling": temporal_downsampling,
+            "num_workers": num_workers,
             "rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         },
@@ -126,5 +133,6 @@ def load_checkpoint(
         "latent_std": ckpt.get("latent_std"),
         "dataloader_batches_consumed": ckpt.get("dataloader_batches_consumed", 0),
         "temporal_downsampling": ckpt.get("temporal_downsampling"),
+        "num_workers": ckpt.get("num_workers"),
     }
     return ckpt["step"] + 1, ckpt.get("wandb_run_id"), provenance
