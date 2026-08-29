@@ -270,6 +270,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-wait", type=int, default=5, help="Warmup steps before --profile-steps starts")
     parser.add_argument("--hf-backup-repo", default=None, help="Optional HF Hub repo to back up checkpoints to")
     parser.add_argument("--wandb-project", default=None)
+    parser.add_argument(
+        "--wandb-entity", default=None,
+        help="wandb team/entity. Without it, wandb falls back to the logged-in account's own "
+        "default entity -- a real 'permission denied' if that differs from where the project "
+        "actually lives (see logging_utils.init_wandb's docstring).",
+    )
     return parser.parse_args()
 
 
@@ -561,7 +567,7 @@ def main() -> None:
     # loaded from the checkpoint above (continues that SAME wandb run instead of --resume
     # silently fragmenting the loss/lr history into a new, disconnected one), or forced back to
     # None by --wandb-new-run above when a fresh chart is wanted despite resuming training state.
-    wandb_enabled = init_wandb(args.wandb_project, vars(args), run_id=wandb_run_id)
+    wandb_enabled = init_wandb(args.wandb_project, vars(args), run_id=wandb_run_id, entity=args.wandb_entity)
     wandb_run_id = get_wandb_run_id(wandb_enabled)
     torch.cuda.reset_peak_memory_stats()
 
