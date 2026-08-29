@@ -42,6 +42,17 @@ defaults baked in here -- these are supervisor calls, still open as of this fork
 notes/vjepa_world_model_next_session.md). Every flag below resolves exactly like
 train_world_model.py's own (explicit CLI > --run-config YAML > the dataclass's hardcoded default);
 nothing about being the V-JEPA track changes that resolution order or picks a value for you.
+
+--num-workers (default 0, V-JEPA-track only -- train_world_model.py itself still hardcodes 0):
+added on the reasoning that mira's own _VideoActionIterable assigns each worker a disjoint,
+deterministically-seeded shard subset and PyTorch enforces strict round-robin yield order across
+workers for an IterableDataset (buffers out-of-order arrivals), so a --resume launched with the
+SAME --num-workers as the original run should reproduce the identical batch sequence -- unlike
+train_codec.py's dataloader, which never needed this property in the first place. Reasoned from
+reading mira/data/training_loader.py directly, not yet empirically confirmed with a real
+fresh-then-resume test on real hardware -- do that before trusting this for a real run. A
+checkpoint records the num_workers it was trained with; a --resume with a different value only
+warns, matching the codec_checkpoint/temporal_downsampling mismatch checks below.
 """
 
 import argparse
@@ -184,6 +195,13 @@ def parse_args() -> argparse.Namespace:
         "logged as separate wandb.Video entries, not a gridded batch. Default 2",
     )
 
+    parser.add_argument(
+        "--num-workers", type=int, default=None,
+        help="Default 0 (matches train_world_model.py's own hardcoded behavior). Unlike the codec "
+        "scripts, this is NOT yet confirmed safe with --resume's exact-batch-replay -- see this "
+        "script's module docstring and mini_mira.world_model.checkpoint's num_workers docstring. "
+        "A --resume with a different --num-workers than the original run only warns, doesn't block.",
+    )
     parser.add_argument("--checkpoint-dir", default="checkpoints_wm_vjepa")
     parser.add_argument("--checkpoint-every", type=int, default=None, help="Default: steps // 10")
     parser.add_argument("--console-log-every", type=int, default=None, help="Default: steps // 100")
@@ -408,23 +426,18 @@ def main() -> None:
         optimizer, warmup_steps=warmup_steps, constant_steps=0, decay_steps=decay_steps, min_lr=min_lr,
     )
 
-    # No --num-workers flag here, deliberately, same as train_world_model.py -- locked in as a
-    # real decision this session, not left open: --resume below fast-forwards past already-
-    # consumed batches via plain next() calls on a freshly-built loader, which is only correct
-    # because the stream is single-process/unseeded (deterministic across relaunches). This risk
-    # applies identically to the V-JEPA track (same resume mechanism, unchanged) -- raising
-    # num_workers here would silently break it exactly the way it would for DINO's own script.
-    # train_codec_vjepa.py got --num-workers safely because ITS --resume never tries to replay
-    # specific batches; this script's does, so it doesn't get the same treatment. See
-    # notes/vjepa_world_model_next_session.md for the full writeup of this decision.
+    # --num-workers, V-JEPA-track only (see module docstring for the reasoning + the caveat this
+    # is not yet empirically confirmed safe with --resume's exact-batch fast-forward below).
+    # train_world_model.py itself is untouched, still hardcodes num_workers=0.
     train_loader = create_loader(
         index_path=args.index_path, clip_len=args.frames, target_fps=args.target_fps,
-        n_players=1, batch_size=args.batch_size, frame_size=None,
+        n_players=1, batch_size=args.batch_size, frame_size=None, num_workers=args.num_workers,
     )
     train_iter = iter(train_loader)
     test_loader = create_loader(
         index_path=args.test_index_path, clip_len=args.frames, target_fps=args.target_fps,
         n_players=1, batch_size=eval_batch_size, frame_size=None, seed=37,
+        num_workers=args.num_workers,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -477,6 +490,14 @@ def main() -> None:
                 f"{prev_temporal_downsampling}, but this run computes {model.temporal_downsampling} "
                 f"-- if these differ, action/latent alignment will silently corrupt."
             )
+        prev_num_workers = provenance["num_workers"]
+        if prev_num_workers is not None and prev_num_workers != args.num_workers:
+            print(
+                f"WARNING: this checkpoint was trained with --num-workers={prev_num_workers}, "
+                f"but this run uses --num-workers={args.num_workers} -- unconfirmed whether this "
+                f"changes per-worker shard assignment enough to desync the dataloader-position "
+                f"fast-forward below from the batches this checkpoint actually saw."
+            )
         batches_consumed = provenance["dataloader_batches_consumed"]
         if batches_consumed > 0:
             print(f"Fast-forwarding dataloader past {batches_consumed} already-consumed batches...")
@@ -525,6 +546,7 @@ def main() -> None:
             latent_mean=latent_stats["latent_mean"], latent_std=latent_stats["latent_std"],
             dataloader_batches_consumed=batches_consumed,
             temporal_downsampling=model.temporal_downsampling,
+            num_workers=args.num_workers,
         )
         if args.hf_backup_repo:
             from huggingface_hub import HfApi  # noqa: PLC0415 -- optional dep, only used here
