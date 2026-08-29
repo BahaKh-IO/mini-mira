@@ -46,7 +46,7 @@ EXPECTED_WM_DEFAULTS = {
     "val_n_samples": 64, "drift_eval_every": None, "drift_eval_n_samples": 8,
     "drift_eval_context_latents": 6, "drift_eval_diffusion_steps": 4,
     "drift_eval_schedule": "linear", "fdd_slice_frames": 7, "viz_n_samples": 2,
-    "checkpoint_every": None, "console_log_every": None,
+    "checkpoint_every": None, "console_log_every": None, "num_workers": 0,
 }
 wm_defaults = {f.name: getattr(WorldModelRunConfig(), f.name) for f in fields(WorldModelRunConfig)}
 assert wm_defaults == EXPECTED_WM_DEFAULTS, f"WorldModelRunConfig defaults drifted: {wm_defaults}"
@@ -54,8 +54,9 @@ print(f"[PASS] WorldModelRunConfig: all {len(wm_defaults)} defaults match train_
 
 EXPECTED_CODEC_DEFAULTS = {
     "steps": 30, "lr": 1e-4, "height": 64, "width": 64, "frames": 4, "target_fps": 20,
-    "batch_size": 4, "grad_accum_steps": 1, "activation_checkpointing": False,
-    "perceptual_chunk_size": 0, "perceptual_dino_model": None, "perceptual_dino_multilayer": False,
+    "batch_size": 4, "grad_accum_steps": 1, "activation_checkpointing": False, "compile": False,
+    "perceptual_chunk_size": 0, "auto_weight_every": 1,
+    "perceptual_dino_model": None, "perceptual_dino_multilayer": False,
     "lr_warmup_steps": None, "lr_decay_steps": None, "lr_min": None, "loss_mae_weight": 1.0,
     "log_activation_grad_norms": False, "log_per_term_grad_norm": False, "checkpoint_every": 100,
     "hf_backup_every": None, "preview_every": 100, "console_log_every": 10,
