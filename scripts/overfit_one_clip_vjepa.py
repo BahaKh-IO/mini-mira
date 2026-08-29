@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--precision", choices=["fp16-hybrid", "bf16"], default="bf16")
     parser.add_argument("--activation-checkpointing", action="store_true", help="Trade compute for memory -- needed at larger --height/--width")
+    parser.add_argument(
+        "--use-refinement-head", action="store_true",
+        help="Enable ViTDecoderConfig.use_refinement_head regardless of what --config says -- "
+        "see mini_mira.codec.decoder.PixelRefinementHead. Overrides only for this run; the "
+        "loaded YAML file itself is untouched.",
+    )
     parser.add_argument("--preview-every", type=int, default=25)
     parser.add_argument("--preview-dir", default="overfit_previews_vjepa", help="Local dir for preview videos -- saved here regardless of wandb status")
     parser.add_argument("--console-log-every", type=int, default=10)
@@ -58,6 +64,8 @@ def _autocast(precision: str) -> torch.autocast:
 def main() -> None:
     args = parse_args()
     config = load_pipeline_config(args.config)
+    if args.use_refinement_head:
+        config.decoder.use_refinement_head = True
 
     torch.manual_seed(0)
     # require_pretrained=True unconditionally -- there's no sensible reason to run this specific
