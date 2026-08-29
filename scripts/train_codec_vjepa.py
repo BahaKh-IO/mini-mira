@@ -41,7 +41,9 @@ from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.checkpoint import load_checkpoint, save_checkpoint
 from mini_mira.codec.decoder import ViTVideoDecoder
 from mini_mira.codec.logging_utils import get_wandb_run_id, init_wandb, log_preview, log_step
-from mini_mira.codec.loss import CodecLoss, CodecLossWeights, CodecOutputs, normalize_video
+from mini_mira.codec.loss import (
+    CodecLoss, CodecLossSchedule, CodecLossWeights, CodecOutputs, normalize_video,
+)
 from mini_mira.codec.data_pipeline import PrefetchingVideoStream
 from mini_mira.codec.profiling import StepTimer, profile_window
 from mini_mira.codec.vjepa import DEFAULT_VJEPA_LAYERS, VjepaModel
@@ -157,6 +159,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
     parser.add_argument(
         "--loss-mae-weight", type=float, default=None, help="CodecLossWeights.loss_mae. Default 1.0"
+    )
+    parser.add_argument(
+        "--reconstruction-loss", choices=["l1", "l2"], default=None,
+        help="Pixel-space distance for the loss_mae term. Default l1 (mira's own recipe). l2 won "
+        "PSNR by ~2dB over l1 in a real 1000-step single-clip sweep on this architecture, at some "
+        "cost in LPIPS -- see CodecLossSchedule's docstring for the full numbers.",
+    )
+    parser.add_argument(
+        "--perceptual-warmup-steps", type=int, default=None,
+        help="Ramp the LPIPS and DINO-consistency weights linearly from 0 to their full value "
+        "over this many steps, training on the pixel term alone before that (see "
+        "mini_mira.codec.loss.CodecLossSchedule). Default 0 -- disabled, weights full from step "
+        "0, exactly today's behavior. Steps during the ramp are also cheaper: a zero-weight term "
+        "is skipped, not computed and multiplied by zero.",
     )
     parser.add_argument(
         "--log-activation-grad-norms", action=argparse.BooleanOptionalAction, default=None,
@@ -302,13 +318,22 @@ def main() -> None:
     bottleneck = MyBottleneck(config.bottleneck, use_checkpointing=args.activation_checkpointing).cuda()
     decoder = ViTVideoDecoder(config.decoder, use_checkpointing=args.activation_checkpointing).cuda()
 
+    # Built with the perceptual terms at their FULL target weights, always -- CodecLoss only
+    # constructs its LPIPS module when that weight is already > 0, so the schedule below has to
+    # ramp down from the target rather than up from zero (see CodecLossSchedule's docstring).
     loss_fn = CodecLoss(
         CodecLossWeights(auto_weight=True, loss_mae=args.loss_mae_weight,
-                         auto_weight_every=args.auto_weight_every),
+                         auto_weight_every=args.auto_weight_every,
+                         reconstruction_loss=args.reconstruction_loss),
         use_checkpointing=args.activation_checkpointing,
         perceptual_chunk_size=args.perceptual_chunk_size,
         log_activation_grad_norms=args.log_activation_grad_norms,
     ).cuda()
+    loss_schedule = CodecLossSchedule(
+        perceptual_warmup_steps=args.perceptual_warmup_steps,
+        lpips_target=loss_fn.weights.loss_lpips_perceptual,
+        dino_target=loss_fn.weights.loss_dino_latent_consistency,
+    )
     loss_fn.bind_encoder_dino(vjepa)
     loss_fn.bind_last_layer(decoder.last_layer_weight)
     loss_fn.use_channels_last_perceptual()
@@ -535,6 +560,10 @@ def main() -> None:
     profile_dir = checkpoint_dir / "profile"
     with profile_window(profile_dir, args.profile_steps, args.profile_wait) as profiler_step:
         for step in range(start_step, args.steps):
+            # Before the micro-step loop, so every micro-step in one optimizer step is scored
+            # under the same weights. Keyed off the absolute step, so --resume lands exactly
+            # where the ramp left off rather than restarting it.
+            loss_schedule.apply(loss_fn.weights, step)
             optimizer.zero_grad()
             # Held as GPU tensors through the micro-step loop, not Python floats -- v.item() forces a
             # full CUDA sync (blocks the CPU until every queued kernel finishes), and doing that once
@@ -617,6 +646,11 @@ def main() -> None:
             grad_norms = {f"grad_norm_{k}": v.item() for k, v in loss_fn.backward_metrics.items()}
             grad_norms["grad_norm_params_total"] = grad_norm_params_total
             grad_norms.update(per_term_grad_norms)  # empty dict unless --log-per-term-grad-norm
+            # The schedule's current weights, so the ramp is visible as a curve rather than only
+            # inferable from the loss terms it silently switches on. Constant when
+            # --perceptual-warmup-steps is 0 (the default).
+            grad_norms["weight_lpips_perceptual"] = loss_fn.weights.loss_lpips_perceptual
+            grad_norms["weight_dino_latent_consistency"] = loss_fn.weights.loss_dino_latent_consistency
 
             timer.end_step()
             profiler_step()
