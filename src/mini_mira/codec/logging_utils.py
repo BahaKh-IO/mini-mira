@@ -13,18 +13,25 @@ import torch
 from torch import Tensor
 
 
-def init_wandb(project: str | None, config: dict[str, Any], run_id: str | None = None) -> bool:
+def init_wandb(
+    project: str | None, config: dict[str, Any], run_id: str | None = None, entity: str | None = None,
+) -> bool:
     """Starts a wandb run if `project` is set. Returns whether logging is enabled.
 
     run_id: pass a previously-saved run id (see get_wandb_run_id) to CONTINUE that run instead of
     starting a fresh one. Without this, every --resume silently opened a brand-new wandb run,
     fragmenting one training run's loss/lr history across several disconnected entries instead of
-    one continuous line."""
+    one continuous line.
+
+    entity: optional wandb team/entity. Without it, wandb.init falls back to whatever the logged-in
+    account's own default entity is -- silently wrong (a real "permission denied" hit, not
+    hypothetical) if that account's default differs from the one the project actually lives under,
+    e.g. a personal login on a fresh box vs. the shared team account other runs were logged to."""
     if not project:
         return False
     import wandb  # noqa: PLC0415 -- optional dep, only imported when actually used
 
-    wandb.init(project=project, config=config, id=run_id, resume="allow" if run_id else None)
+    wandb.init(project=project, entity=entity, config=config, id=run_id, resume="allow" if run_id else None)
     return True
 
 
