@@ -114,12 +114,26 @@ def parse_args() -> argparse.Namespace:
         "before tanh (mini_mira.codec.decoder.PixelRefinementHead) -- targets the blocky/tiled "
         "reconstruction pattern in notes/blockiness_investigation.md by giving the decoder a "
         "local, weight-shared way to blend across patch boundaries, on top of whatever the "
-        "transformer's global attention learns on its own. Zero-initialized: output is "
-        "bit-identical to not having it, the moment it's added -- purely additive from there. "
-        "On a --resume against a checkpoint saved without it, needs --reset-optimizer-state too "
-        "(the new params change the optimizer's param count, which a plain resume can't handle). "
-        "Default: whatever --config's own decoder.use_refinement_head says (False unless a "
-        "config sets it).",
+        "transformer's global attention learns on its own. LayerScale-initialized (small, not "
+        "zero) -- fixes a real NaN crash an earlier exact-zero version hit. Tested: no longer "
+        "crashes, but the LPIPS term stays visibly unstable even so -- NOT currently recommended "
+        "for a real run (see notes/vjepa_codec_quality_research.md). On a --resume against a "
+        "checkpoint saved without it, needs --reset-optimizer-state too (the new params change "
+        "the optimizer's param count, which a plain resume can't handle). Default: whatever "
+        "--config's own decoder.use_refinement_head says (False unless a config sets it).",
+    )
+    parser.add_argument(
+        "--use-shallow-texture-branch", action=argparse.BooleanOptionalAction, default=None,
+        help="Keep the encoder's SHALLOWEST aggregated layer as its own channel group in the "
+        "bottleneck instead of blending it into the mean of all layers (mini_mira.codec."
+        "bottleneck.MyBottleneck) -- targets the same texture loss DINO-Tok (arXiv:2511.20565) "
+        "diagnosed in an almost identical setup. Validated on the one-clip diagnostic: better "
+        "loss AND better perceptual quality at every checkpoint, no instability -- the current "
+        "top recommendation (see notes/vjepa_codec_quality_research.md). Changes the bottleneck's "
+        "own input width, so it CANNOT resume from a checkpoint saved without it -- the bottleneck "
+        "restarts fresh whenever this flag changes true<->false; the decoder is unaffected (only "
+        "consumes the bottleneck's output latent, unchanged shape) and can still be reused. "
+        "Default: whatever --config's own bottleneck.use_shallow_texture_branch says.",
     )
     parser.add_argument("--index-path", default=None, help="Real dataset dir from download_shards.py")
     parser.add_argument(
@@ -301,6 +315,8 @@ def main() -> None:
     config = load_pipeline_config(args.config)
     if args.use_refinement_head is not None:
         config.decoder.use_refinement_head = args.use_refinement_head
+    if args.use_shallow_texture_branch is not None:
+        config.bottleneck.use_shallow_texture_branch = args.use_shallow_texture_branch
     # Real, previously-hit-for-real requirement (notes/vjepa_next_session.md): the decoder's own
     # temporal/spatial upsample only exactly reconstructs --height/--width if both are divisible
     # by decoder.patch_size * bottleneck.stride -- otherwise it silently reconstructs a slightly
