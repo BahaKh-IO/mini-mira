@@ -46,7 +46,7 @@ EXPECTED_WM_DEFAULTS = {
     "val_n_samples": 64, "drift_eval_every": None, "drift_eval_n_samples": 8,
     "drift_eval_context_latents": 6, "drift_eval_diffusion_steps": 4,
     "drift_eval_schedule": "linear", "fdd_slice_frames": 7, "viz_n_samples": 2,
-    "checkpoint_every": None, "console_log_every": None, "num_workers": 0,
+    "checkpoint_every": None, "console_log_every": None, "num_workers": 0, "compile": False,
 }
 wm_defaults = {f.name: getattr(WorldModelRunConfig(), f.name) for f in fields(WorldModelRunConfig)}
 assert wm_defaults == EXPECTED_WM_DEFAULTS, f"WorldModelRunConfig defaults drifted: {wm_defaults}"
