@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "mira" / 
 
 import torch
 from mira.data.training_loader import create_loader
+from mira.training.lr_schedule import WarmupConstantCosineDecayLR
 
 from mini_mira.codec.bottleneck import MyBottleneck
 from mini_mira.codec.decoder import ViTVideoDecoder
@@ -41,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-fps", type=int, default=20)
     parser.add_argument("--steps", type=int, default=300, help="One real example to memorize -- should show real progress well before this")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-warmup-steps", type=int, default=None, help="Default: steps // 20")
+    parser.add_argument("--lr-decay-steps", type=int, default=None, help="Default: steps - warmup_steps")
+    parser.add_argument("--lr-min", type=float, default=None, help="Default: --lr * 0.01")
     parser.add_argument("--precision", choices=["fp16-hybrid", "bf16"], default="bf16")
     parser.add_argument("--activation-checkpointing", action="store_true", help="Trade compute for memory -- needed at larger --height/--width")
     parser.add_argument(
@@ -85,6 +89,15 @@ def main() -> None:
     grad_scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16-hybrid"))
     loss_fn.bind_grad_scaler(grad_scaler)
 
+    # Same schedule shape as train_codec_vjepa.py -- was previously just a flat --lr the whole
+    # run here; needed to actually test different pacing on this cheap, disposable diagnostic.
+    warmup_steps = args.lr_warmup_steps if args.lr_warmup_steps is not None else max(1, args.steps // 20)
+    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else max(1, args.steps - warmup_steps)
+    min_lr = args.lr_min if args.lr_min is not None else args.lr * 0.01
+    lr_scheduler = WarmupConstantCosineDecayLR(
+        optimizer, warmup_steps=warmup_steps, constant_steps=0, decay_steps=decay_steps, min_lr=min_lr,
+    )
+
     # One real batch, pulled once, reused every step -- the actual overfit target. batch_size=1:
     # exactly one clip, matching "feed the decoder one single clip" literally.
     loader = create_loader(
@@ -111,13 +124,15 @@ def main() -> None:
         grad_scaler.scale(losses["loss_total"]).backward()
         grad_scaler.step(optimizer)
         grad_scaler.update()
+        lr_scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
 
         if (step + 1) % args.console_log_every == 0 or step == 0:
             term_str = ", ".join(
                 f"{k}={v:.4f}" for k, v in losses.items() if k != "loss_total" and not k.endswith("_auto_w")
             )
-            print(f"step {step}: loss_total={losses['loss_total'].item():.4f} ({term_str})")
-        log_step(wandb_enabled, step, {k: v.item() for k, v in losses.items()}, args.lr)
+            print(f"step {step}: lr={current_lr:.2e} loss_total={losses['loss_total'].item():.4f} ({term_str})")
+        log_step(wandb_enabled, step, {k: v.item() for k, v in losses.items()}, current_lr)
 
         if step == 0 or (step + 1) % args.preview_every == 0 or step == args.steps - 1:
             log_preview(
