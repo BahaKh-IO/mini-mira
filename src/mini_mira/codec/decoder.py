@@ -6,7 +6,7 @@ from einops import rearrange
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-from mini_mira.ml.blocks import BlockConfig, SpaceTimeBlock
+from mini_mira.ml.blocks import BlockConfig, LayerScale, SpaceTimeBlock
 from mini_mira.ml.init import init_weights
 from mini_mira.ml.rope import spatial_rope, temporal_rope
 
@@ -68,23 +68,23 @@ class PixelRefinementHead(nn.Module):
     notes/blockiness_investigation.md and notes/vjepa_codec_quality_research.md for the diagnosed
     failure mode this targets.
 
-    A residual correction, not a replacement: forward returns `pixels + conv_stack(pixels)`. The
-    stack's own last conv is zero-initialized by ViTVideoDecoder AFTER its own `self.apply
-    (init_weights)` call (init_weights would otherwise overwrite a zero-init done here, since it
-    explicitly re-initializes every nn.Conv2d it finds) -- so the moment this is turned on, output
-    is bit-identical to not having it at all, and it can only ever add detail from there.
+    A residual correction, not a replacement: forward returns `pixels + layerscale(conv_stack
+    (pixels))`. Uses the same LayerScale this codebase's own transformer blocks already use
+    (mini_mira.ml.blocks.LayerScale, initialized to `layerscale_init`, e.g. 1e-4) to keep the
+    correction small and safe at the start -- NOT the exact-zero-init this class used previously.
 
-    Expected training dynamic, not a bug if seen on the box: with the last conv's WEIGHT at zero,
-    backprop through it multiplies the incoming gradient by that same zero matrix, so gradient to
-    every EARLIER layer in the stack is exactly zero on step one -- only the last conv's own
-    weight (whose gradient is an outer product of the incoming gradient and ITS input, no
-    zero-weight multiply involved) can move off zero at first. Once it does, gradient starts
-    reaching the earlier layers too. Same mechanism as zero-init residual designs elsewhere (e.g.
-    LayerScale, adaLN-zero) -- a brief "only the last layer moves" warmup, not a dead branch. See
-    scripts/verify_refinement_head.py, checks 1/2/4 for this proven directly, not just asserted.
+    That's a deliberate, evidenced fix, not a style choice: an earlier exact-zero version of this
+    head (real weight, real bias, both hard-zeroed) trained fine at first but caused a real `NaN`
+    crash partway through a real overfit run -- an unbounded correction with nothing capping its
+    growth. LayerScale's own paper (Touvron et al., ICCV 2021) is explicit that the right init is
+    "a small epsilon different from zero", not exactly zero, for precisely this reason: every
+    conv layer here gets real, nonzero gradient from step one (nothing is exactly zero anymore),
+    while the overall correction still starts small and grows gradually rather than being capped
+    off entirely until one single weight happens to move first. See
+    scripts/verify_refinement_head.py for this proven directly.
     """
 
-    def __init__(self, out_channels: int, channels: int, num_layers: int, eps: float):
+    def __init__(self, out_channels: int, channels: int, num_layers: int, eps: float, layerscale_init: float):
         super().__init__()
         layers: list[nn.Module] = []
         in_channels = out_channels
@@ -97,6 +97,7 @@ class PixelRefinementHead(nn.Module):
                 layers.append(nn.GELU())
             in_channels = layer_out
         self.layers = nn.ModuleList(layers)
+        self.layerscale = LayerScale(out_channels, init=layerscale_init)
 
     @property
     def last_conv(self) -> nn.Conv2d:
@@ -109,7 +110,10 @@ class PixelRefinementHead(nn.Module):
         for layer in self.layers:
             y = layer(y)
         y = rearrange(y, "(b t) c h w -> b t c h w", b=b, t=t)
-        return x + y
+        # LayerScale.gamma has shape (out_channels,) and normally multiplies a channels-LAST
+        # tensor (its usual (..., c) use in SpaceTimeBlock) -- here channels is dim 2, not last,
+        # so gamma is reshaped to broadcast correctly instead of calling layerscale(y) directly.
+        return x + y * self.layerscale.gamma.view(1, 1, -1, 1, 1)
 
 
 class ViTVideoDecoder(nn.Module):
@@ -145,26 +149,24 @@ class ViTVideoDecoder(nn.Module):
                 channels=config.refinement_channels,
                 num_layers=config.refinement_num_layers,
                 eps=config.eps,
+                layerscale_init=config.layerscale_init,
             )
 
         self.apply(init_weights)
-        if self.refinement_head is not None:
-            # Must happen AFTER self.apply(init_weights) above -- init_weights re-initializes
-            # every nn.Conv2d it finds (N(0, 0.02), zero bias), which would silently overwrite a
-            # zero-init done inside PixelRefinementHead.__init__ instead of leaving it in place.
-            # Zeroing here, last, is what actually makes the head a no-op at construction time.
-            nn.init.zeros_(self.refinement_head.last_conv.weight)
-            nn.init.zeros_(self.refinement_head.last_conv.bias)
+        # No manual zero-init needed here anymore -- PixelRefinementHead's own LayerScale
+        # (initialized to config.layerscale_init) is what keeps its contribution small and safe
+        # at construction. init_weights doesn't match LayerScale's type, so it leaves gamma
+        # untouched -- no post-apply fixup step required, unlike the earlier zero-init version.
 
     @property
     def last_layer_weight(self):
         """The decoder's final projection weight -- used by CodecLoss's auto_weight to measure
         how hard each loss term pushes on the actual output, matching mira's vit_decoder.py
         exactly (same PatchUnembed.proj role in both) when there's no refinement head. With one,
-        the refinement head's own last conv IS the true final layer instead -- pointing there
-        keeps auto_weight measuring the real last step, not an now-outdated stand-in."""
+        the refinement head's own LayerScale gamma IS the true final operation instead -- pointing
+        there keeps auto_weight measuring the real last step, not an now-outdated stand-in."""
         if self.refinement_head is not None:
-            return self.refinement_head.last_conv.weight
+            return self.refinement_head.layerscale.gamma
         return self.patch_unembed.proj.weight
 
     def forward(self, z):
