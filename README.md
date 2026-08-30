@@ -5,10 +5,12 @@ latent world model for Rocket League, built on a representation-autoencoder (RAE
 flow-matching diffusion transformer. Reimplements [`mira-wm/mira`](https://github.com/mira-wm/mira)
 (Apache 2.0) end to end at a smaller scale, verified against the real source rather than assumed.
 
-**Current status**: the codec is frozen at step 3,999; the world model has completed two real
-training runs, through step 5,500, on top of it. A second, parallel track has also started —
-swapping the frozen DINOv3 backbone for V-JEPA 2.1, as a controlled benchmark against the DINO
-track rather than a replacement for it. See [Status](#status) below.
+**Current status**: the DINO-track codec is frozen at step 3,999; its world model has completed two
+real training runs, through step 5,500, on top of it. A second, parallel track — swapping the
+frozen DINOv3 backbone for V-JEPA 2.1, as a controlled benchmark rather than a replacement — is
+mid-flight on a real reconstruction-quality fix: a bottleneck change that stops discarding
+fine texture during compression, validated against a real published result and now training for
+real on a fresh 8,000-step run. See [Status](#status) below.
 
 ## What this is
 
@@ -408,6 +410,29 @@ hyperparameter parity beyond what's settled above, and formally which DINO check
 control (the settled recipe above already implies DINO's second/5,500-step run, but that's an
 implication, not yet an explicit statement for a real write-up).
 
+**Reconstruction-quality investigation, resolved with a real fix now training for real.** The
+DINO-track codec's PSNR (19.56dB) reads as "poor" by standard benchmarks — reconstructions look
+blocky. Researched real, published techniques rather than guessing further, and found the actual
+cause by reading this project's own code: `MyBottleneck` blends 4 encoder-feature layers (shallow
+to deep) into one average before compression, diluting the shallow, texture-rich layer into the
+more abstract deep ones. A very recent paper on an almost identical setup (DINO-Tok,
+arXiv:2511.20565) hit this project's *exact* PSNR number scaling decoder capacity alone, and fixed
+it the same way this project independently arrived at: keep the shallow layer as its own channel
+group instead of averaging it away (`StridedConvBottleneckConfig.use_shallow_texture_branch`, off
+by default — the decoder needs no changes, since it only ever consumes the bottleneck's unchanged
+output shape). Validated on a one-clip diagnostic: wins on loss, pixel accuracy, and perceptual
+detail quality at every checkpoint measured, no instability. **Adopted** — a real 8,000-step
+V-JEPA codec run with this enabled is training now.
+
+Two other quality levers were investigated and explicitly **not** adopted, kept in the codebase as
+tried-and-documented rather than removed: a small decoder-side "refinement head"
+(`ViTDecoderConfig.use_refinement_head`) crashed with a real `NaN` on its first design, and still
+showed persistent instability in perceptual scoring after a standard fix (LayerScale) removed the
+crash itself; and three tested learning-rate pacing variants all underperformed the pacing already
+in use. Full research trail, real numbers, and the real production-launch findings (A40-specific
+memory/speed tuning, a real `wandb` permission bug and its fix) are in
+`notes/vjepa_codec_quality_research.md` (git-ignored, local only).
+
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
 
@@ -415,7 +440,7 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 
 | File | Contents |
 |---|---|
-| `src/mini_mira/codec/bottleneck.py` | Encoder-side strided-conv projection into the latent |
+| `src/mini_mira/codec/bottleneck.py` | Encoder-side strided-conv projection into the latent, with an opt-in shallow-texture-branch variant |
 | `src/mini_mira/codec/decoder.py` | Space-time ViT decoder |
 | `src/mini_mira/world_model/diffusion_transformer.py` | AdaLN-conditioned diffusion transformer |
 | `src/mini_mira/ml/blocks.py` | Shared attention/MLP/AdaLN blocks (decoder + world model) |
@@ -470,9 +495,10 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 contract; RoPE (temporal + axial spatial); QK-norm and mira-matching weight init; AdaLN
 conditioning on `tau`, clean-past, and actions; flow-matching sampling; the real, frozen DINOv3
 backbone with real pretrained weights; **real codec training** on real data with the real loss,
-adaptive loss balancing, and checkpoint save/resume; **real world-model training mechanism** with
-real flow-matching + PSD loss, real action-conditioned data, a full eval suite, and opt-in
-scheduled sampling for rollout-depth robustness.
+adaptive loss balancing, checkpoint save/resume, and an opt-in bottleneck variant
+(`use_shallow_texture_branch`) that preserves shallow-layer texture instead of averaging it away;
+**real world-model training mechanism** with real flow-matching + PSD loss, real action-conditioned
+data, a full eval suite, and opt-in scheduled sampling for rollout-depth robustness.
 
 **Deliberately simplified / not yet implemented** (disclosed decisions, not gaps found later):
 - Actions are keyboard keys only, no mouse — matches the real released data, which has no real
