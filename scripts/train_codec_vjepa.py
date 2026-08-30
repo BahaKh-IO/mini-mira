@@ -23,6 +23,7 @@ micro-batch would need.
 """
 
 import argparse
+import math
 import signal
 import sys
 import types
@@ -697,7 +698,20 @@ def main() -> None:
             with timer.phase("optimizer"):
                 grad_scaler.unscale_(optimizer)
                 grad_norm_params_total = torch.nn.utils.clip_grad_norm_(params, float("inf")).item()
-                grad_scaler.step(optimizer)
+                # Under --precision fp16-hybrid, GradScaler.step() already detects a non-finite
+                # gradient internally, skips the update, and backs off its own scale for next
+                # time -- real, existing protection, left untouched here. Under bf16 (this
+                # project's actual default), GradScaler is a documented no-op, so that protection
+                # doesn't exist at all -- a real, reproducible NaN crash (same step, twice, from
+                # the same resumed checkpoint) hit exactly this gap: nothing stopped one bad
+                # step's update from permanently corrupting every weight for good. Skip the
+                # update instead, only stepping in where GradScaler isn't already handling it.
+                if not grad_scaler.is_enabled() and not math.isfinite(grad_norm_params_total):
+                    print(f"step {step}: non-finite grad_norm_params_total ({grad_norm_params_total}) "
+                          f"-- skipping this optimizer step, weights unchanged.")
+                    optimizer.zero_grad(set_to_none=True)
+                else:
+                    grad_scaler.step(optimizer)
                 grad_scaler.update()
                 lr_scheduler.step()
 
