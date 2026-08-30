@@ -223,6 +223,16 @@ def parse_args() -> argparse.Namespace:
         "upload itself is slow -- frequent cheap local safety saves without paying the upload cost "
         "every time.",
     )
+    parser.add_argument(
+        "--hf-backup-keep-every", type=int, default=None,
+        help="Every this many steps, ALSO upload a permanently-kept, step-numbered copy "
+        "(checkpoint_vjepa_step<N>.pth) to --hf-backup-repo, independent of --hf-backup-every's "
+        "cadence -- that one always overwrites the same checkpoint_vjepa.pth, so a bad save (e.g. "
+        "a NaN state saved right before a crash is noticed) can clobber the only backup with no "
+        "way back. A real, already-hit near-miss: recovering from a run that went NaN relied on a "
+        "manual upload that happened to exist; this makes that kind of recovery point automatic. "
+        "Default: off (unset) -- opt-in, no extra storage cost unless requested.",
+    )
     parser.add_argument("--preview-every", type=int, default=None, help="W&B image/video preview interval. Default 100")
     parser.add_argument("--console-log-every", type=int, default=None, help="Loss/GPU-memory print interval. Default 10")
     parser.add_argument("--resume", action="store_true")
@@ -603,6 +613,18 @@ def main() -> None:
 
             HfApi().upload_file(
                 path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint_vjepa.pth",
+                repo_id=args.hf_backup_repo, repo_type="model",
+            )
+        # A SEPARATE, non-overwriting snapshot -- checkpoint_vjepa.pth above always gets
+        # replaced, so a bad save (a corrupted/NaN state uploaded right before a crash is
+        # noticed) can destroy the only backup with nothing to fall back on. This uploads under
+        # its own step-numbered name, so every kept snapshot survives independently of what
+        # happens to later ones or to the "latest" pointer above.
+        if args.hf_backup_repo and args.hf_backup_keep_every and (step + 1) % args.hf_backup_keep_every == 0:
+            from huggingface_hub import HfApi  # optional dep, only used here
+
+            HfApi().upload_file(
+                path_or_fileobj=str(ckpt_path), path_in_repo=f"checkpoint_vjepa_step{step + 1}.pth",
                 repo_id=args.hf_backup_repo, repo_type="model",
             )
 
