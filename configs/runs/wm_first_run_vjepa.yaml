@@ -1,0 +1,22 @@
+# V-JEPA world model, first real launch. Compressed budget (internship ending in 3-5 days):
+# 2000 steps, not DINO's own ~5500-step precedent (DINO's 2nd, scheduled-sampling run).
+# batch_size/grad_accum_steps below are a starting guess (matches DINO's own real 448x768 config)
+# -- confirm via a --steps 10 probe before the real launch, edit here if it OOMs.
+# drift_eval_context_latents/fdd_slice_frames reuse DINO's own "Option B" pairing deliberately --
+# they divide evenly; the script's own hardcoded default (fdd_slice_frames=7) does not, and
+# silently drops ~14% of frames from the Frechet-DINO-Distance metric at this frame count.
+
+precision: bf16
+height: 448
+width: 768
+frames: 40
+batch_size: 4
+grad_accum_steps: 4
+steps: 2000
+compile: true
+num_workers: 6
+scheduled_sampling_prob: 0.3
+drift_eval_context_latents: 2
+fdd_slice_frames: 6
+drift_eval_n_samples: 12
+viz_n_samples: 10
