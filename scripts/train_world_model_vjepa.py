@@ -485,6 +485,14 @@ def main() -> None:
         start_step, wandb_run_id, provenance = load_checkpoint(
             ckpt_path, model.world_model, model.action_encoder, model.bos, optimizer, lr_scheduler, grad_scaler
         )
+        # Without this, a --steps at/below the checkpoint's own step makes range(start_step, steps)
+        # silently empty -- the run exits 0, no warning, no re-save, indistinguishable from success.
+        # Checked before the dataloader fast-forward below so a doomed resume fails immediately.
+        if start_step >= args.steps:
+            raise SystemExit(
+                f"--resume checkpoint already at step {start_step - 1} (>= --steps {args.steps}) -- "
+                f"nothing to train; raise --steps or drop --resume."
+            )
         # Real risk this checks for: nothing else stops a --resume from silently pairing against a
         # different codec checkpoint or latent-stats file than the run was actually trained
         # against (the codec is loaded fresh from --codec-checkpoint every launch, never saved
