@@ -72,6 +72,9 @@ class CodecRunConfig:
     lr_min: float | None = None
 
     loss_mae_weight: float = 1.0
+    # V-JEPA-track only so far (train_codec_vjepa.py) -- caps auto_weight's rescale factor, see
+    # mini_mira.codec.loss.CodecLossWeights.max_auto_weight.
+    max_auto_weight: float = 1e4
     # V-JEPA-track only so far (train_codec_vjepa.py), same as `compile` above --
     # see mini_mira.codec.loss.CodecLossSchedule.
     reconstruction_loss: str = "l1"

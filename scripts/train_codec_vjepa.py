@@ -189,6 +189,16 @@ def parse_args() -> argparse.Namespace:
         "--loss-mae-weight", type=float, default=None, help="CodecLossWeights.loss_mae. Default 1.0"
     )
     parser.add_argument(
+        "--max-auto-weight", type=float, default=None,
+        help="Caps how far auto_weight can rescale a perceptual term's gradient to match "
+        "loss_mae's (CodecLossWeights.max_auto_weight). Default 1e4 (mira's own default) -- a "
+        "real, observed pattern: as the perceptual terms ramp up, an increasing fraction of "
+        "steps hit a non-finite gradient (caught and skipped, not corrupting weights, but real "
+        "steps still lost) -- a term's gradient being rescaled by up to 10,000x whenever it's "
+        "briefly near-zero is a plausible mechanism. Lowering this (e.g. 100) caps how extreme "
+        "any single rescale can get, without changing anything else about the recipe.",
+    )
+    parser.add_argument(
         "--reconstruction-loss", choices=["l1", "l2"], default=None,
         help="Pixel-space distance for the loss_mae term. Default l1 (mira's own recipe). l2 won "
         "PSNR by ~2dB over l1 in a real 1000-step single-clip sweep on this architecture, at some "
@@ -381,7 +391,8 @@ def main() -> None:
     loss_fn = CodecLoss(
         CodecLossWeights(auto_weight=True, loss_mae=args.loss_mae_weight,
                          auto_weight_every=args.auto_weight_every,
-                         reconstruction_loss=args.reconstruction_loss),
+                         reconstruction_loss=args.reconstruction_loss,
+                         max_auto_weight=args.max_auto_weight),
         use_checkpointing=args.activation_checkpointing,
         perceptual_chunk_size=args.perceptual_chunk_size,
         log_activation_grad_norms=args.log_activation_grad_norms,
