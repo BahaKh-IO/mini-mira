@@ -234,6 +234,15 @@ def parse_args() -> argparse.Namespace:
         "manual upload that happened to exist; this makes that kind of recovery point automatic. "
         "Default: off (unset) -- opt-in, no extra storage cost unless requested.",
     )
+    parser.add_argument(
+        "--local-checkpoint-history", type=int, default=None,
+        help="Keep this many rotating, independently-saved LOCAL checkpoints "
+        "(checkpoint_vjepa_history_<slot>.pth in --checkpoint-dir), on top of the single "
+        "'latest' checkpoint_vjepa.pth. A sliding window: once all slots are full, each new "
+        "save overwrites the OLDEST slot only, never the other N-1 -- e.g. with 3 slots, "
+        "steps 1600/1700/1800 fill them, then 1900 overwrites 1600's slot, keeping "
+        "1700/1800/1900. Same cadence as --checkpoint-every. Default: off (unset).",
+    )
     parser.add_argument("--preview-every", type=int, default=None, help="W&B image/video preview interval. Default 100")
     parser.add_argument("--console-log-every", type=int, default=None, help="Loss/GPU-memory print interval. Default 10")
     parser.add_argument("--resume", action="store_true")
@@ -588,8 +597,27 @@ def main() -> None:
     # activation gradients (CodecLoss._hook_clone), not parameter gradients, and can't answer "are
     # the weights actually moving" on their own -- this does, directly.
     initial_params = torch.cat([p.detach().flatten() for p in params]).cpu()
+    # Rotating index for --local-checkpoint-history's sliding window -- incremented once per
+    # real save (not per call: a NaN-skipped "save" below doesn't consume a slot).
+    history_save_count = 0
+
+    def _weights_contain_nan() -> bool:
+        return any(not torch.isfinite(p).all() for p in params)
 
     def _save_checkpoint_now(step: int, *, force_hf_upload: bool = False) -> None:
+        nonlocal history_save_count
+        # Real, already-hit problem: a periodic save landing right after a NaN step overwrote
+        # the last known-good local checkpoint AND the HF backup with a permanently corrupted
+        # state, twice, in the same night. Check current weights before writing or uploading
+        # anything -- skip the ENTIRE save (local "latest", history slot, and HF) rather than
+        # let a bad state clobber a good one. The optimizer already skips applying a non-finite
+        # gradient (see the training loop), so weights recover on their own within a few steps;
+        # this just makes sure nothing gets saved during the brief window before they do.
+        if _weights_contain_nan():
+            print(f"step {step}: current weights contain NaN/Inf -- skipping this checkpoint "
+                  f"save entirely (local, history, and HF) to avoid overwriting a known-good "
+                  f"state with a corrupted one.")
+            return
         # L2 distance from this run's own starting weights (initial_params above) -- an
         # unambiguous "did the model change at all" signal, independent of any
         # gradient-interpretation question. Only at checkpoint cadence, not every step: needs
@@ -603,6 +631,15 @@ def main() -> None:
         )
         del current_params
         save_checkpoint(ckpt_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler, wandb_run_id)
+        if args.local_checkpoint_history:
+            # Sliding window, not append-forever: slot = which save this is, mod window size,
+            # so the OLDEST slot is always the one overwritten once the window is full -- e.g.
+            # 3 slots: saves 1/2/3 fill slots 0/1/2, save 4 overwrites slot 0 (not 1 or 2).
+            slot = history_save_count % args.local_checkpoint_history
+            history_path = checkpoint_dir / f"checkpoint_vjepa_history_{slot}.pth"
+            save_checkpoint(history_path, step, bottleneck, decoder, optimizer, lr_scheduler, grad_scaler, wandb_run_id)
+            print(f"step {step}: saved rotating local history slot {slot} -> {history_path}")
+        history_save_count += 1
         # Decoupled from the local save above: local saves are cheap and want to be frequent
         # for crash safety, but the HF upload itself can be slow (network-bound), so it runs on
         # its own, sparser cadence -- always still fires on the last step or force_hf_upload
