@@ -599,6 +599,10 @@ overrides the file, and omitting `--run-config` entirely reproduces the exact de
   default, matching this project's real GPU box's 8 real CPU cores — recheck against `nproc` on
   different hardware); doing the same for `train_world_model.py` would need that resume mechanism
   addressed first, not done unprompted.
+- Both world-model scripts (`train_world_model.py`/`train_world_model_vjepa.py`) now refuse a
+  `--resume` whose checkpoint step is already `>= --steps` — previously this silently trained
+  nothing (`range(start_step, steps)` is just empty) and exited 0 with no warning, indistinguishable
+  from a real completed run.
 
 ## Configs
 
