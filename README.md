@@ -429,9 +429,19 @@ tried-and-documented rather than removed: a small decoder-side "refinement head"
 (`ViTDecoderConfig.use_refinement_head`) crashed with a real `NaN` on its first design, and still
 showed persistent instability in perceptual scoring after a standard fix (LayerScale) removed the
 crash itself; and three tested learning-rate pacing variants all underperformed the pacing already
-in use. Full research trail, real numbers, and the real production-launch findings (A40-specific
-memory/speed tuning, a real `wandb` permission bug and its fix) are in
-`notes/vjepa_codec_quality_research.md` (git-ignored, local only).
+in use.
+
+The real 8,000-step run hit its own `NaN` crash, deterministically, at the same step twice — traced
+to a real gap where `bf16` training (this project's default) had none of the automatic non-finite-
+gradient protection `fp16-hybrid`'s `GradScaler` provides for free. Fixed with two additions to
+`train_codec_vjepa.py`: the optimizer step is skipped (not applied) on a non-finite gradient, and
+every checkpoint save — local, HF, and a new `--local-checkpoint-history` sliding window of
+independent local snapshots — checks weights for `NaN`/`Inf` first and skips the save entirely
+rather than overwriting a known-good state with a corrupted one. A further, not-yet-conclusively-
+validated mitigation (`--max-auto-weight`, capping how far the adaptive loss-balancing mechanism
+can rescale a term) is in progress. Full research trail, real numbers, and the real production-
+launch findings (A40-specific memory/speed tuning, a real `wandb` permission bug and its fix) are
+in `notes/vjepa_codec_quality_research.md` (git-ignored, local only).
 
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
