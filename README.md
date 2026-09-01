@@ -7,10 +7,10 @@ flow-matching diffusion transformer. Reimplements [`mira-wm/mira`](https://githu
 
 **Current status**: the DINO-track codec is frozen at step 3,999; its world model has completed two
 real training runs, through step 5,500, on top of it. A second, parallel track — swapping the
-frozen DINOv3 backbone for V-JEPA 2.1, as a controlled benchmark rather than a replacement — is
-mid-flight on a real reconstruction-quality fix: a bottleneck change that stops discarding
-fine texture during compression, validated against a real published result and now training for
-real on a fresh 8,000-step run. See [Status](#status) below.
+frozen DINOv3 backbone for V-JEPA 2.1, as a controlled benchmark rather than a replacement — has
+its own codec (bottleneck fix included) deliberately stopped at step 1,999, and its own world
+model has now completed a real 2,000-step run on top of it — both step counts cut well short of
+their original targets given a compressed timeline, not crashes. See [Status](#status) below.
 
 ## What this is
 
@@ -378,26 +378,29 @@ audit above:
   crash in a CPU regression test first, confirmed the fix resolves it, confirmed the un-fixed
   formula still crashes the same way, then confirmed on the real GPU run itself.
 
-**V-JEPA world-model real training recipe — settled**, matching DINO's own second real run's
-effective recipe where it makes sense to:
-- `--steps 5500`
-- `--scheduled-sampling-prob 0.3` **from step 0** — a deliberate divergence from DINO's own
-  procedure (DINO trained ~2,900 steps *without* it first, then `--resume`d with it added for the
-  remaining ~2,600 steps); starting with it from the beginning is intentional since the benefit is
-  already proven, not something V-JEPA needs to rediscover independently.
-- `--height 448 --width 768 --frames 40` — **not** matching DINO's own world-model resolution
-  (DINO used `288×512`, its script's own defaults). This is determined by whichever resolution the
-  real V-JEPA *codec* ends up trained at (already settled at `448×768`), since the frozen
-  bottleneck/decoder only make sense at the resolution they were actually trained on — DINO's
-  `288×512` simply reflects DINO's own codec's resolution, a separate number.
-- `--batch-size 4 --grad-accum-steps 4` (effective batch 16, matching DINO's) — **not yet verified
-  to fit V-JEPA's real memory footprint at 448×768.** The mechanism-only validation above only
-  confirmed `--batch-size 2 --grad-accum-steps 16` fits comfortably (~19GiB of 46GiB); doubling the
-  micro-batch size roughly doubles per-batch activation memory, unconfirmed whether it still fits.
-  Worth a real OOM probe before committing the full 5,500-step budget to it, same discipline
-  already used for the codec's own resolution/batch tuning.
-- `bf16`, no PSD (`--psd-weight`/`--psd-loss-prob` left at 0.0) — matching DINO, which never used
-  PSD in either real run.
+**V-JEPA world-model real training recipe — run for real, completed** (`configs/runs/
+wm_first_run_vjepa.yaml`). `--steps 2000`, **not** DINO's own ~5,500-step second-run precedent —
+a deliberate, explicit cut given a compressed timeline (internship ending in days), not a fallback
+default. `--scheduled-sampling-prob 0.3` **from step 0** (DINO discovered this helps only on its
+second run; starting with it here skips re-discovering an already-proven finding).
+`--height 448 --width 768 --frames 40` (matches the real V-JEPA codec's own trained resolution, not
+DINO's `288×512`). `--batch-size 4 --grad-accum-steps 4 --compile --num-workers 6` — real, measured
+`cuda_peak_reserved=20.46GiB` of ~46GB, flat for the whole run, no memory creep; notably *lower*
+than DINO's own compiled number (19.79GiB) at the same resolution/batch, despite V-JEPA's codec
+needing ~2x DINO's VRAM — the frozen V-JEPA+bottleneck encode step runs once per training step
+under plain `torch.no_grad()`, so that multiplier (measured with V-JEPA backpropped through the
+codec's own decoder+perceptual losses) doesn't carry over to the world-model's memory profile.
+`bf16`, no PSD — matching DINO. `--num-workers 6` under `--resume` and the non-finite-gradient
+guard (ported from the codec's own real fix, see below) were both validated/added before this
+launch, not left as risk.
+
+**Real final numbers, step 1999**: `loss_total=0.3263`, `psnr=15.82`, `ssim=0.678`, `lpips=0.427`,
+`frechet_dino_distance=32.71`, `frechet_inception_distance=101.90`. Rollout-depth degradation
+(`fdd_at_6=28.56` → `fdd_at_36=41.01`, ~1.4x) is comparatively mild against DINO's own first
+(no-scheduled-sampling) run's ~10x degradation (`fdd_at_7=2.55` → `fdd_at_28=26.56`) — consistent
+with scheduled sampling doing its job from step 0, though not a clean apples-to-apples number
+(different slice points, different codec maturity, the benchmark-fairness questions below still
+open). No `NaN`/non-finite-gradient skips occurred during this run.
 
 **Two of the four original benchmark-fairness questions are eval/comparison-time decisions, not
 training-launch blockers** — corrected framing from an earlier pass: whether both tracks get
