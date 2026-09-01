@@ -10,7 +10,11 @@ real training runs, through step 5,500, on top of it. A second, parallel track �
 frozen DINOv3 backbone for V-JEPA 2.1, as a controlled benchmark rather than a replacement — has
 its own codec (bottleneck fix included) deliberately stopped at step 1,999, and its own world
 model has now completed a real 2,000-step run on top of it — both step counts cut well short of
-their original targets given a compressed timeline, not crashes. See [Status](#status) below.
+their original targets given a compressed timeline, not crashes. Training is done; real sampling
+and evaluation against DINO's own numbers is still outstanding before either track's results count
+as announced. **Next planned step**: fine-tune the V-JEPA world model using techniques from
+[arXiv:2604.28190v1](https://arxiv.org/abs/2604.28190v1) — investigation into the paper starting
+now, not yet integrated. See [Status](#status) below.
 
 ## What this is
 
