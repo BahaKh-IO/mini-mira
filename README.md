@@ -612,7 +612,7 @@ one YAML file mirrors `PipelineConfig`'s whole nested shape, no Hydra/config-gro
 | File | Purpose |
 |---|---|
 | `configs/scaled_300m.yaml` | The intended architecture scale (~300M params) |
-| `configs/scaled_300m_vjepa.yaml` | Same, `temporal_stride` 2→1 for the V-JEPA track |
+| `configs/scaled_300m_vjepa.yaml` | Same, `temporal_stride` 2→1 for the V-JEPA track, `use_shallow_texture_branch: true` (matches the real trained codec checkpoint — `compute_latent_stats_vjepa.py`/`train_world_model_vjepa.py` have no CLI override for this field, only `--config` sets it) |
 | `configs/small.yaml` | Mirrors class defaults — what fast verification scripts use |
 
 ```python

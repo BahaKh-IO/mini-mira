@@ -8,6 +8,11 @@ bottleneck:
   latent_dim: 32
   stride: 2
   temporal_stride: 1
+  # The real checkpoint (step 1999, checkpoints_vjepa_l2warmup) was trained with
+  # --use-shallow-texture-branch -- this must match or bottleneck.load_state_dict shape-mismatches
+  # (896 vs 768 projection input channels) in compute_latent_stats_vjepa.py/train_world_model_vjepa.py,
+  # neither of which has a CLI override for this field (only train_codec_vjepa.py does).
+  use_shallow_texture_branch: true
 
 world_model:
   latent_dim: 32
