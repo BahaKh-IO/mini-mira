@@ -57,6 +57,7 @@ warns, matching the codec_checkpoint/temporal_downsampling mismatch checks below
 
 import argparse
 import json
+import math
 import signal
 import sys
 from pathlib import Path
@@ -625,7 +626,19 @@ def main() -> None:
                 accumulated[k] = term if k not in accumulated else accumulated[k] + term
         # Single sync point per loss term for the whole step, not one per term per micro-step.
         accumulated_floats: dict[str, float] = {k: v.item() for k, v in accumulated.items()}
-        grad_scaler.step(optimizer)
+        grad_scaler.unscale_(optimizer)
+        grad_norm_params_total = torch.nn.utils.clip_grad_norm_(params, float("inf")).item()
+        accumulated_floats["grad_norm_params_total"] = grad_norm_params_total
+        # Same real gap already hit (and fixed) on the codec side tonight: under --precision bf16,
+        # GradScaler is a documented no-op -- zero protection against a bad gradient permanently
+        # corrupting every weight. fp16-hybrid already gets this from GradScaler.step() itself, so
+        # only step in where that protection doesn't already exist.
+        if not grad_scaler.is_enabled() and not math.isfinite(grad_norm_params_total):
+            print(f"step {step}: non-finite grad_norm_params_total ({grad_norm_params_total}) -- "
+                  f"skipping this optimizer step, weights unchanged.")
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            grad_scaler.step(optimizer)
         grad_scaler.update()
         lr_scheduler.step()
 
