@@ -443,6 +443,10 @@ can rescale a term) is in progress. Full research trail, real numbers, and the r
 launch findings (A40-specific memory/speed tuning, a real `wandb` permission bug and its fix) are
 in `notes/vjepa_codec_quality_research.md` (git-ignored, local only).
 
+The same non-finite-gradient-skip fix was ported to `train_world_model_vjepa.py` ahead of its own
+first real sustained launch — that script also defaults to `--precision bf16` and had none of this
+protection at all, not yet having hit a real crash, only found by inspection before one happened.
+
 Full bug-by-bug history and the evidence trail behind every claim above: `notes/deviations.md` and
 `notes/session_handoff.md` (both git-ignored, local only).
 
