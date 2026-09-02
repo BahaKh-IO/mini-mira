@@ -459,7 +459,8 @@ def main() -> None:
         for _ in range(5):
             warm_start_batch, _metadata = next(warm_start_iter)
             warm_start_batch = resize_batch(warm_start_batch, args.height, args.width).to("cuda", non_blocking=True)
-            model.warm_start_fd_loss(warm_start_batch)
+            with _autocast(args.precision):
+                model.warm_start_fd_loss(warm_start_batch)
         del warm_start_loader, warm_start_iter
 
     # Module.compile() in-place, not the model.world_model = torch.compile(...) rebinding form --
