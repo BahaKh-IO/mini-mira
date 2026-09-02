@@ -22,13 +22,16 @@ precision: bf16
 height: 448
 width: 768
 frames: 40
+# lr must be written 1.0e-5, not 1e-5 -- PyYAML's default float regex requires a decimal point for
+# scientific notation, otherwise this silently parses as the STRING "1e-5", not a float (real,
+# hit-for-real: crashed deep inside torch.optim.AdamW's own `lr >= 0` check, not here).
 # batch_size/grad_accum_steps: real, confirmed on the actual GPU -- 4/4 (matching the base run's
 # own config) OOMs even with per-block decoder checkpointing on FD-loss's decode+dino_forward
 # pass; 2/8 (same effective batch 16) fits, cuda_peak_reserved=29.64GiB of 44.42GiB.
 batch_size: 2
 grad_accum_steps: 8
 steps: 2500
-lr: 1e-5
+lr: 1.0e-5
 compile: true
 num_workers: 6
 scheduled_sampling_prob: 0.3
