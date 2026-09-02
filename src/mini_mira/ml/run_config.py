@@ -29,6 +29,8 @@ class WorldModelRunConfig:
     psd_weight: float = 0.0
     psd_loss_prob: float = 0.0
     scheduled_sampling_prob: float = 0.0
+    fd_loss_weight: float = 0.0  # V-JEPA-track only so far (train_world_model_vjepa.py)
+    fd_loss_ema_decay: float = 0.97  # V-JEPA-track only so far (train_world_model_vjepa.py)
 
     eval_batch_size: int | None = None
     val_every: int | None = None

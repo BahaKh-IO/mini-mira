@@ -172,6 +172,23 @@ def parse_args() -> argparse.Namespace:
         "benchmark-fairness questions -- see module docstring, not decided here. See "
         "LatentWorldModel._fake_shifted_z.",
     )
+    parser.add_argument(
+        "--fd-loss-weight", type=float, default=None,
+        help="Additive FD-loss (arXiv:2604.28190v1) weight -- loss_total = loss_diffusion + "
+        "fd_loss_weight * loss_fd. Default 0.0 (off). Requires --real-frechet-stats. See "
+        "mini_mira.world_model.fd_loss.",
+    )
+    parser.add_argument(
+        "--fd-loss-ema-decay", type=float, default=None,
+        help="EMA decay for FD-loss's generated-side running stats. Default 0.97 -- deliberately "
+        "much lower than the paper's own 0.999 (tuned for thousands of post-training steps; at a "
+        "few hundred it would barely move from its seed).",
+    )
+    parser.add_argument(
+        "--real-frechet-stats", default=None,
+        help="Path to a .pt file from scripts/compute_real_frechet_stats_vjepa.py (real "
+        "mean/cov). Required if --fd-loss-weight > 0.",
+    )
 
     parser.add_argument("--eval-batch-size", type=int, default=None, help="Default: --batch-size")
     parser.add_argument("--val-every", type=int, default=None, help="Default: steps // 50")
@@ -364,6 +381,11 @@ def main() -> None:
     config.world_model.psd_weight = args.psd_weight
     config.world_model.psd_loss_prob = args.psd_loss_prob
     config.world_model.scheduled_sampling_prob = args.scheduled_sampling_prob
+    config.world_model.fd_loss_weight = args.fd_loss_weight
+    config.world_model.fd_loss_ema_decay = args.fd_loss_ema_decay
+    if args.fd_loss_weight > 0 and args.real_frechet_stats is None:
+        raise SystemExit("--fd-loss-weight > 0 needs --real-frechet-stats (see "
+                          "scripts/compute_real_frechet_stats_vjepa.py)")
 
     # NOT just config.bottleneck.temporal_stride -- that alone was the actual raw-frames-per-
     # latent-frame ratio for train_world_model.py's own DINO track (DinoModel never touches time),
@@ -411,12 +433,34 @@ def main() -> None:
         require_pretrained=args.require_pretrained_vjepa,
         last_layer_only=False, layer_indices=DEFAULT_VJEPA_LAYERS,
     ).cuda()
+    real_frechet_mean, real_frechet_cov = None, None
+    if args.real_frechet_stats is not None:
+        real_frechet_stats_dict = torch.load(args.real_frechet_stats, map_location="cpu", weights_only=False)
+        real_frechet_mean = real_frechet_stats_dict["mean"]
+        real_frechet_cov = real_frechet_stats_dict["cov"]
     model = LatentWorldModel(
         config.world_model, config.bottleneck, config.decoder, num_keys=config.num_keys,
         codec_checkpoint=args.codec_checkpoint, latent_mean=latent_stats["latent_mean"],
-        latent_std=latent_stats["latent_std"], dino=vjepa,
+        latent_std=latent_stats["latent_std"], real_frechet_mean=real_frechet_mean,
+        real_frechet_cov=real_frechet_cov, dino=vjepa,
     ).cuda()
     model.train()
+    if model.fd_loss_enabled:
+        # A handful of no-grad EMA updates before real training starts -- small-scale analog of
+        # the paper's own 50k-sample warm-start, so the first real gradient steps aren't
+        # optimizing against an undefined EMA. Real batches, not the training loader's own
+        # train_iter (not built yet at this point) -- a short-lived loader just for this.
+        warm_start_loader = create_loader(
+            index_path=args.index_path, clip_len=args.frames, target_fps=args.target_fps,
+            n_players=1, batch_size=args.batch_size, frame_size=None,
+            num_workers=args.num_workers, seed=0,
+        )
+        warm_start_iter = iter(warm_start_loader)
+        for _ in range(5):
+            warm_start_batch, _metadata = next(warm_start_iter)
+            warm_start_batch = resize_batch(warm_start_batch, args.height, args.width).cuda()
+            model.warm_start_fd_loss(warm_start_batch)
+        del warm_start_loader, warm_start_iter
 
     # Module.compile() in-place, not the model.world_model = torch.compile(...) rebinding form --
     # same reasoning train_codec_vjepa.py already established: torch.compile()'s OptimizedModule
