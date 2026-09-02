@@ -1,0 +1,31 @@
+# V-JEPA world model, FD-loss fine-tune (arXiv:2604.28190v1) on top of the real step-1999
+# checkpoint from wm_first_run_vjepa.yaml. Same architecture-relevant settings as that recipe
+# (height/width/frames/compile/num_workers unchanged -- must match, since --resume loads into
+# the same model shape); only the training-dynamics fields differ.
+#
+# steps: 2500 -- checkpoint step 1999 -> start_step 2000 -> +500 more steps lands on 2499
+# inclusive, i.e. --steps 2500 (not 2499).
+# lr: 1e-5, an order of magnitude below the base run's 1e-4 -- matches the paper's own
+# post-training LR range (1e-6-1e-5), scaled for a much shorter fine-tune.
+# fd_loss_weight: 1.0 is a starting point, not a tuned value -- this is the one real empirical
+# unknown in this whole recipe, adjust based on the real smoke-test/early-step numbers.
+# fd_loss_ema_decay: 0.97, deliberately far below the paper's own 0.999 (tuned for thousands of
+# post-training steps -- at 500 it would barely move from its seed).
+
+precision: bf16
+height: 448
+width: 768
+frames: 40
+batch_size: 4
+grad_accum_steps: 4
+steps: 2500
+lr: 1e-5
+compile: true
+num_workers: 6
+scheduled_sampling_prob: 0.3
+fd_loss_weight: 1.0
+fd_loss_ema_decay: 0.97
+drift_eval_context_latents: 2
+fdd_slice_frames: 6
+drift_eval_n_samples: 12
+viz_n_samples: 10
