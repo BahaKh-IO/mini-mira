@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
 
 from mini_mira.codec.bottleneck import MyBottleneck, StridedConvBottleneckConfig
 from mini_mira.codec.decoder import ViTDecoderConfig, ViTVideoDecoder
@@ -195,9 +196,18 @@ class LatentWorldModel(nn.Module):
         differentiable: no no_grad here, self.decoder/self.dino are frozen-but-differentiable
         (requires_grad_(False) blocks gradient into their own weights only, not through them to
         the input -- same proven pattern as CodecLoss's DINO-consistency term, src/mini_mira/
-        codec/loss.py)."""
-        video = self.decode_to_video(z1_estimate)
-        dino_features = self.dino.dino_forward(video)
+        codec/loss.py).
+
+        Both calls are gradient-checkpointed -- real, hit-for-real necessity, not precautionary:
+        this is the only place LatentWorldModel ever backprops through the full decoder+encoder at
+        training resolution (eval/rollout always run under no_grad; neither needed a backward-
+        compatible activation footprint before FD-loss existed), and a real 448x768/batch=4 run
+        OOM'd at 44.18/44.42GiB without this. ViTVideoDecoder's OWN use_checkpointing is gated on
+        self.training, which is permanently False here (train() above always .eval()s it) -- that
+        path never fires, hence the external checkpoint() instead, same use_reentrant=False
+        pattern already proven in CodecLoss (loss.py)."""
+        video = checkpoint(self.decode_to_video, z1_estimate, use_reentrant=False)
+        dino_features = checkpoint(self.dino.dino_forward, video, use_reentrant=False)
         if isinstance(dino_features, list):
             dino_features = dino_features[-1]
         return dino_features.mean(dim=(-1, -2)).flatten(0, 1)
