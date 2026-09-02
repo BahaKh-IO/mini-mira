@@ -231,6 +231,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--console-log-every", type=int, default=None, help="Default: steps // 100")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--wandb-new-run", action="store_true",
+        help="With --resume, load model/optimizer/dataloader-position state as normal but start "
+        "a fresh wandb run instead of resuming the checkpoint's own wandb_run_id -- e.g. resuming "
+        "a base-training checkpoint into a smoketest project, where that id doesn't apply.",
+    )
+    parser.add_argument(
         "--skip-dataloader-fastforward", action="store_true",
         help="Skip replaying dataloader_batches_consumed's next() calls on --resume, and reset "
         "this run's own count to 0. For exact same-phase crash recovery, replaying is correct and "
@@ -627,6 +633,13 @@ def main() -> None:
             group["lr"] = lr
         print(f"Resumed from {ckpt_path} at step {start_step}")
 
+    if args.wandb_new_run:
+        # --resume still loads model/optimizer/dataloader-position state above unchanged -- this
+        # only discards the checkpoint's OWN wandb_run_id, so init_wandb below mints a fresh run
+        # instead of trying to resume one that may not even exist under a different --wandb-project
+        # (e.g. resuming a base-training checkpoint into a smoketest project). Real, recurring need:
+        # a --wandb-new-run flag has been reached for by name before this existed.
+        wandb_run_id = None
     # wandb_run_id: None on a fresh run (wandb.init mints a new one, captured below) or the id
     # loaded from the checkpoint above -- passing it back in continues that SAME wandb run
     # instead of --resume silently fragmenting the loss/lr history into a new, disconnected one.
