@@ -7,8 +7,13 @@
 # inclusive, i.e. --steps 2500 (not 2499).
 # lr: 1e-5, an order of magnitude below the base run's 1e-4 -- matches the paper's own
 # post-training LR range (1e-6-1e-5), scaled for a much shorter fine-tune.
-# fd_loss_weight: 1.0 is a starting point, not a tuned value -- this is the one real empirical
-# unknown in this whole recipe, adjust based on the real smoke-test/early-step numbers.
+# fd_loss_weight: 0.002, corrected from an initial 1.0 guess after a real smoke test showed why --
+# loss_fd (~100-225, one-step-estimate proxy vs precomputed real stats) totally dominated
+# loss_diffusion (~0.3) at weight=1.0: loss_total was ~99.8% FD-loss, loss_diffusion trended UP
+# over 10 steps, and frechet_dino_distance/frechet_inception_distance got WORSE (32.71->42.19,
+# 101.90->145.51) despite psnr/ssim ticking up. 0.002 brings fd_loss_weight*loss_fd down to
+# roughly loss_diffusion's own scale -- still a starting point, re-check the same real numbers
+# after the next smoke test before trusting it for the full 500 steps.
 # fd_loss_ema_decay: 0.97, deliberately far below the paper's own 0.999 (tuned for thousands of
 # post-training steps -- at 500 it would barely move from its seed).
 
@@ -23,7 +28,7 @@ lr: 1e-5
 compile: true
 num_workers: 6
 scheduled_sampling_prob: 0.3
-fd_loss_weight: 1.0
+fd_loss_weight: 0.002
 fd_loss_ema_decay: 0.97
 drift_eval_context_latents: 2
 fdd_slice_frames: 6
