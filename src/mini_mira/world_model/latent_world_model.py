@@ -122,7 +122,12 @@ class LatentWorldModel(nn.Module):
         # construction -- ActionEncoder below is built from this value and keeps its own copy.
         self.temporal_downsampling = bottleneck_config.temporal_stride * getattr(self.dino, "tubelet_size", 1)
         self.bottleneck = MyBottleneck(bottleneck_config)
-        self.decoder = ViTVideoDecoder(decoder_config)
+        # use_checkpointing only when FD-loss is active -- see _fd_pooled_features, the only place
+        # this ever needs a backward-compatible activation footprint through the decoder. Gated
+        # here (not just at the call site) because it's the module's OWN self.training that decides
+        # whether checkpointing fires each forward, so building it False keeps every non-FD-loss
+        # path byte-identical to before this existed.
+        self.decoder = ViTVideoDecoder(decoder_config, use_checkpointing=world_model_config.fd_loss_weight > 0)
         if codec_checkpoint is not None:
             _load_codec_weights(codec_checkpoint, self.bottleneck, self.decoder)
         # codec_checkpoint=None keeps bottleneck/decoder at random init -- verify_world_model_
@@ -198,15 +203,23 @@ class LatentWorldModel(nn.Module):
         the input -- same proven pattern as CodecLoss's DINO-consistency term, src/mini_mira/
         codec/loss.py).
 
-        Both calls are gradient-checkpointed -- real, hit-for-real necessity, not precautionary:
-        this is the only place LatentWorldModel ever backprops through the full decoder+encoder at
-        training resolution (eval/rollout always run under no_grad; neither needed a backward-
-        compatible activation footprint before FD-loss existed), and a real 448x768/batch=4 run
-        OOM'd at 44.18/44.42GiB without this. ViTVideoDecoder's OWN use_checkpointing is gated on
-        self.training, which is permanently False here (train() above always .eval()s it) -- that
-        path never fires, hence the external checkpoint() instead, same use_reentrant=False
-        pattern already proven in CodecLoss (loss.py)."""
-        video = checkpoint(self.decode_to_video, z1_estimate, use_reentrant=False)
+        Both the decode and the V-JEPA forward are gradient-checkpointed -- real, hit-for-real
+        necessity, not precautionary: this is the only place LatentWorldModel ever backprops
+        through the full decoder+encoder at training resolution (eval/rollout always run under
+        no_grad; neither needed a backward-compatible activation footprint before FD-loss
+        existed), and a real 448x768/batch=4 run OOM'd even with a first attempt at this (a single
+        whole-function checkpoint around decode_to_video) -- that only recomputes the ENTIRE
+        decoder in one shot during backward, no cheaper peak than no checkpointing at all.
+        ViTVideoDecoder has its own real per-block checkpointing already (same lever that got the
+        codec itself from OOM to comfortably fitting at this exact resolution) -- gated on
+        self.training, permanently False here since train() above always .eval()s the decoder.
+        Toggled on just for this call; safe (no BatchNorm/Dropout in decoder.py, confirmed by
+        direct read -- LayerNorm is train/eval-identical). V-JEPA has no equivalent internal
+        option (third-party code), so it keeps the coarser external checkpoint(), same
+        use_reentrant=False pattern already proven in CodecLoss (loss.py)."""
+        self.decoder.train()
+        video = self.decode_to_video(z1_estimate)
+        self.decoder.eval()
         dino_features = checkpoint(self.dino.dino_forward, video, use_reentrant=False)
         if isinstance(dino_features, list):
             dino_features = dino_features[-1]
