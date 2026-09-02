@@ -458,7 +458,7 @@ def main() -> None:
         warm_start_iter = iter(warm_start_loader)
         for _ in range(5):
             warm_start_batch, _metadata = next(warm_start_iter)
-            warm_start_batch = resize_batch(warm_start_batch, args.height, args.width).cuda()
+            warm_start_batch = resize_batch(warm_start_batch, args.height, args.width).to("cuda", non_blocking=True)
             model.warm_start_fd_loss(warm_start_batch)
         del warm_start_loader, warm_start_iter
 
