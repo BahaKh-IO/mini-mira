@@ -12,9 +12,10 @@ its own codec (bottleneck fix included) deliberately stopped at step 1,999, and 
 model has now completed a real 2,000-step run on top of it — both step counts cut well short of
 their original targets given a compressed timeline, not crashes. Training is done; real sampling
 and evaluation against DINO's own numbers is still outstanding before either track's results count
-as announced. **Next planned step**: fine-tune the V-JEPA world model using techniques from
-[arXiv:2604.28190v1](https://arxiv.org/abs/2604.28190v1) — investigation into the paper starting
-now, not yet integrated. See [Status](#status) below.
+as announced. **In progress**: fine-tuning the V-JEPA world model with FD-loss
+([arXiv:2604.28190v1](https://arxiv.org/abs/2604.28190v1)) for 500 more steps on top of the
+step-1999 checkpoint — implemented, CPU-verified, not yet run on the real GPU. See
+[Status](#status) below.
 
 ## What this is
 
@@ -405,6 +406,41 @@ launch, not left as risk.
 with scheduled sampling doing its job from step 0, though not a clean apples-to-apples number
 (different slice points, different codec maturity, the benchmark-fairness questions below still
 open). No `NaN`/non-finite-gradient skips occurred during this run.
+
+**FD-loss fine-tune (arXiv:2604.28190v1, "Representation Fréchet Loss for Visual Generation") —
+implemented, CPU-verified, not yet run on the real GPU.** Supervisor-directed: 500 more steps on
+top of the step-1999 checkpoint, targeting quality (not the paper's other headline use case,
+distilling multi-step generators into one-step ones). The paper makes Fréchet Distance directly
+optimizable as a training loss by decoupling the population size used for the distance estimate
+(an EMA over many steps) from the batch size used for gradients. Two real findings shaped the
+design, not assumptions:
+- This project's existing Fréchet-distance code (`full_eval_metrics.py`) round-trips through
+  `scipy.linalg.sqrtm`/numpy — non-differentiable by construction, not reusable as a loss. New
+  pure-PyTorch implementation (`src/mini_mira/world_model/fd_loss.py`): the standard
+  `Tr((cov_r@cov_g)^0.5)` cross term is computed via `M = cov_sqrt_r @ cov_g @ cov_sqrt_r`,
+  `Tr(M^0.5) = sum(sqrt(eigvalsh(M)))` — `cov_sqrt_r` (the real, fixed side) computed once;
+  `eigvalsh` on `M` is autograd-differentiable, unlike `scipy.sqrtm`.
+- `LatentWorldModel.rollout()` (full multi-step autoregressive sampling) is far too expensive to
+  differentiate through in a 500-step budget, and is `no_grad()`-wrapped by design. Instead, the
+  "generated" side reuses the one-step estimate already implemented for scheduled sampling
+  (`z1 ≈ z_t + (1-tau)*pred_v`), computed from the exact `z_t`/`pred_v`/`tau` the normal training
+  step already produces — no extra forward pass for generation, only the subsequent decode +
+  V-JEPA feature extraction is new per-step cost.
+
+Additive, not paper-literal: `loss_total = loss_diffusion + fd_loss_weight * loss_fd`, matching
+this codebase's existing PSD-loss pattern rather than the paper's own FD-loss-only post-training,
+to keep the base flow-matching signal alive over a short window. EMA decay defaults to `0.97`
+(deliberately far below the paper's own `0.999`, tuned for thousands of post-training steps — at
+500 steps it would barely move from its seed). New offline script,
+`scripts/compute_real_frechet_stats_vjepa.py`, precomputes real mean/covariance in V-JEPA's own
+768-dim feature space from held-out clips (`OnlineGaussian`, reused as-is — no differentiability
+needed for a fixed, precomputed statistic). New recipe: `configs/runs/wm_finetune_fd_loss_vjepa.yaml`
+(`--steps 2500`, `--lr 1e-5`, `--fd-loss-weight 1.0` as a starting point — genuinely untuned, the
+one real empirical unknown here). `scripts/verify_fd_loss.py` (new, 4 checks, all passing):
+differentiability + sane values, the EMA update rule matches the paper's formula exactly,
+`fd_loss_weight=0` is a provable no-op (no state built at all), and a full synthetic
+forward/backward reaches every trainable parameter. **Not yet done**: a real-GPU smoke test for
+actual added cost/memory, and the real 500-step run itself.
 
 **Two of the four original benchmark-fairness questions are eval/comparison-time decisions, not
 training-launch blockers** — corrected framing from an earlier pass: whether both tracks get
