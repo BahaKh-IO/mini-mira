@@ -439,8 +439,25 @@ needed for a fixed, precomputed statistic). New recipe: `configs/runs/wm_finetun
 one real empirical unknown here). `scripts/verify_fd_loss.py` (new, 4 checks, all passing):
 differentiability + sane values, the EMA update rule matches the paper's formula exactly,
 `fd_loss_weight=0` is a provable no-op (no state built at all), and a full synthetic
-forward/backward reaches every trainable parameter. **Not yet done**: a real-GPU smoke test for
-actual added cost/memory, and the real 500-step run itself.
+forward/backward reaches every trainable parameter.
+
+**Real-GPU debugging done, config validated, real 500-step run not yet started.** FD-loss is the
+first time this script backprops through the full decoder+V-JEPA encoder (eval/rollout always run
+`no_grad`) — real OOM at `--batch-size 4/--grad-accum-steps 4` even with a first (too-coarse,
+whole-function) checkpointing attempt; fixed by reusing `ViTVideoDecoder`'s own real per-block
+`use_checkpointing` (the same lever that got the codec itself fitting at this resolution — gated
+on `self.training`, toggled just for this call since `LatentWorldModel` normally keeps the decoder
+permanently `.eval()`). `--batch-size 2 --grad-accum-steps 8` (same effective batch) is the real,
+confirmed-fitting config, `cuda_peak_reserved=29.64GiB`. `--fd-loss-weight 1.0` was also real-world
+validated as drastically oversized (`loss_fd` completely dominated `loss_diffusion`,
+`frechet_dino_distance`/`frechet_inception_distance` measurably got *worse*); rescaled to `0.002`.
+Re-validated with a real 10-step smoke test at the corrected config: `frechet_dino_distance`
+**improved 32.71→23.42** (−28%), `psnr`/`ssim`/`lpips` all improved too, `loss_diffusion` stayed
+in a tight band instead of trending up. Two new CLI flags added along the way:
+`--skip-dataloader-fastforward` (a `--resume` replaying 8,000 real batches via `next()` before
+training even starts is real, not hypothetical — this is a new training *phase*, not same-phase
+crash recovery, so exact dataloader-position continuity was never actually needed) and
+`--wandb-new-run` (resume model/optimizer state normally, start a fresh wandb run).
 
 **Two of the four original benchmark-fairness questions are eval/comparison-time decisions, not
 training-launch blockers** — corrected framing from an earlier pass: whether both tracks get
