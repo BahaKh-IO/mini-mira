@@ -230,6 +230,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=None, help="Default: steps // 10")
     parser.add_argument("--console-log-every", type=int, default=None, help="Default: steps // 100")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--skip-dataloader-fastforward", action="store_true",
+        help="Skip replaying dataloader_batches_consumed's next() calls on --resume, and reset "
+        "this run's own count to 0. For exact same-phase crash recovery, replaying is correct and "
+        "should stay on -- but a new training PHASE on top of old weights (e.g. this project's own "
+        "FD-loss fine-tune) doesn't need bit-exact data-position continuity with the run that "
+        "produced the checkpoint, and replaying thousands of real batches via next() alone (no "
+        "compute) can take far longer than the fine-tune itself. Real, hit-for-real motivation: "
+        "resuming a 2000-step checkpoint (dataloader_batches_consumed=8000 at batch_size=4/"
+        "grad_accum_steps=4) stalled for 10+ minutes doing nothing but this replay.",
+    )
     parser.add_argument("--hf-backup-repo", default=None, help="Optional HF Hub repo to back up checkpoints to")
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument(
@@ -583,7 +594,13 @@ def main() -> None:
                 f"fast-forward below from the batches this checkpoint actually saw."
             )
         batches_consumed = provenance["dataloader_batches_consumed"]
-        if batches_consumed > 0:
+        if args.skip_dataloader_fastforward:
+            print(
+                f"Skipping dataloader fast-forward (checkpoint recorded {batches_consumed} "
+                f"already-consumed batches) -- this run's own batches_consumed count restarts at 0."
+            )
+            batches_consumed = 0
+        elif batches_consumed > 0:
             print(f"Fast-forwarding dataloader past {batches_consumed} already-consumed batches...")
             for _ in range(batches_consumed):
                 next(train_iter)
