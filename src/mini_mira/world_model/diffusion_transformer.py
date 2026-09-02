@@ -33,6 +33,12 @@ class LatentWorldModelConfig:
     # time. Not a mira field -- mira's own shipped config doesn't have this either. Off by
     # default; see LatentWorldModel._fake_shifted_z for the mechanism.
     scheduled_sampling_prob: float = 0.0
+    # FD-loss (arXiv:2604.28190v1) -- additive, matches the psd_weight pattern above: off by
+    # default, real value has no principled default (empirical), ema_decay tuned down from the
+    # paper's own 0.999 (thousands of post-training steps) to suit a much shorter fine-tune. See
+    # mini_mira.world_model.fd_loss and LatentWorldModel.diffusion_loss for the mechanism.
+    fd_loss_weight: float = 0.0
+    fd_loss_ema_decay: float = 0.97
 
     @property
     def psd_enabled(self) -> bool:

@@ -24,6 +24,7 @@ from mini_mira.codec.dino import DEFAULT_ENCODER_AGGREGATION_LAYERS, DinoModel
 from mini_mira.codec.loss import denormalize_for_dino
 from mini_mira.world_model.action_encoder import ActionEncoder
 from mini_mira.world_model.diffusion_transformer import DiffusionTransformer, LatentWorldModelConfig
+from mini_mira.world_model.fd_loss import FDLossEMAState, RealFrechetStats, differentiable_frechet_distance
 
 _CONVOLUTION_TYPES = (
     torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d,
@@ -80,6 +81,8 @@ class LatentWorldModel(nn.Module):
         codec_checkpoint: str | Path | None,
         latent_mean: float = 0.0,
         latent_std: float = 1.0,
+        real_frechet_mean: torch.Tensor | None = None,
+        real_frechet_cov: torch.Tensor | None = None,
         require_pretrained_dino: bool = True,
         encoder_dino_model: str = "dinov3_vitb16",
         dino: nn.Module | None = None,
@@ -145,6 +148,25 @@ class LatentWorldModel(nn.Module):
         # mira's grid-shaped version -- already-documented deviation, notes/deviations.md 1.7).
         self.bos = nn.Parameter(0.02 * torch.randn(bottleneck_config.latent_dim))
 
+        # FD-loss (arXiv:2604.28190v1) -- opt-in via world_model_config.fd_loss_weight, matches
+        # the psd_weight convention. real_frechet_mean/cov are the real-data stats, precomputed
+        # offline (scripts/compute_real_frechet_stats_vjepa.py); registered as buffers (not kept
+        # as a plain dataclass) so they move with the model's own .to(device)/.cuda() calls, same
+        # reasoning as latent_mean/latent_std above. cov_sqrt is computed once here (eigh is the
+        # expensive part), not every training step -- see fd_loss.RealFrechetStats.
+        self.fd_loss_enabled = world_model_config.fd_loss_weight > 0
+        self.fd_ema: FDLossEMAState | None = None
+        if self.fd_loss_enabled:
+            assert real_frechet_mean is not None and real_frechet_cov is not None, (
+                "fd_loss_weight > 0 needs real_frechet_mean/real_frechet_cov "
+                "(scripts/compute_real_frechet_stats_vjepa.py)"
+            )
+            real_stats = RealFrechetStats.from_mean_cov(real_frechet_mean, real_frechet_cov)
+            self.register_buffer("fd_real_mean", real_stats.mean, persistent=False)
+            self.register_buffer("fd_real_cov_sqrt", real_stats.cov_sqrt, persistent=False)
+            self.register_buffer("fd_real_trace_cov", real_stats.trace_cov, persistent=False)
+            self.fd_ema = FDLossEMAState(dim=self.dino.dino_dim, beta=world_model_config.fd_loss_ema_decay)
+
     def train(self, mode: bool = True) -> "LatentWorldModel":
         """Ports real mira's override verbatim: keeps the frozen codec in .eval() even when the
         wrapper itself is set to train()."""
@@ -165,6 +187,34 @@ class LatentWorldModel(nn.Module):
         z = self.unnormalize_tokens(z)
         video = self.decoder(z)  # [-1, 1] tanh output
         return denormalize_for_dino(video)  # -> [0, 1]
+
+    def _fd_pooled_features(self, z1_estimate: torch.Tensor) -> torch.Tensor:
+        """z1_estimate: (b,t,c,h,w) normalized latents. Decodes and extracts per-frame V-JEPA
+        features, spatially pooled -- same convention full_eval_metrics.py's Frechet accumulation
+        already uses (real_dino_gen[:, s].mean(dim=(-1,-2)).flatten(0,1)), just made
+        differentiable: no no_grad here, self.decoder/self.dino are frozen-but-differentiable
+        (requires_grad_(False) blocks gradient into their own weights only, not through them to
+        the input -- same proven pattern as CodecLoss's DINO-consistency term, src/mini_mira/
+        codec/loss.py)."""
+        video = self.decode_to_video(z1_estimate)
+        dino_features = self.dino.dino_forward(video)
+        if isinstance(dino_features, list):
+            dino_features = dino_features[-1]
+        return dino_features.mean(dim=(-1, -2)).flatten(0, 1)
+
+    def warm_start_fd_loss(self, batch) -> None:
+        """One no-grad EMA update from a real batch -- call this a few times before real
+        fine-tuning starts, so the first real gradient steps aren't optimizing against an
+        undefined EMA. Small-scale analog of the paper's own 50k-sample warm-start."""
+        assert self.fd_loss_enabled and self.fd_ema is not None, "fd_loss_weight must be > 0"
+        with torch.no_grad():
+            z, a = self._encode(batch)
+            shifted_z = self._shifted_z(z)
+            z_t, _v, tau = self.prepare_training_inputs(z)
+            pred_v = self.world_model(z_t, a=a, tau=tau, clean_past=shifted_z)
+            z1_estimate = z_t + (1 - tau) * pred_v
+            features = self._fd_pooled_features(z1_estimate)
+            self.fd_ema.update(features)
 
     def _encode(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
         """batch.video (uint8, [0,255]) -> normalized latents; batch.actions.key_presses ->
@@ -240,6 +290,19 @@ class LatentWorldModel(nn.Module):
                 outputs["loss_total"] = loss_diffusion + loss_psd
                 loss_psd_logged = loss_psd.detach() / self.world_model_config.psd_loss_prob
             outputs["loss_psd"] = loss_psd_logged
+
+        if self.fd_loss_enabled:
+            assert self.fd_ema is not None
+            # Reuses this step's own z_t/pred_v/tau -- no extra forward pass for the generation
+            # side itself, the same one-step estimate _fake_shifted_z already uses for scheduled
+            # sampling: z1 ~= z_t + (1-tau)*pred_v.
+            z1_estimate = z_t + (1 - tau) * pred_v
+            features = self._fd_pooled_features(z1_estimate)
+            mean_g, cov_g = self.fd_ema.update(features)
+            real_stats = RealFrechetStats(self.fd_real_mean, self.fd_real_cov_sqrt, self.fd_real_trace_cov)
+            loss_fd = differentiable_frechet_distance(real_stats, mean_g, cov_g)
+            outputs["loss_total"] = outputs["loss_total"] + self.world_model_config.fd_loss_weight * loss_fd.float()
+            outputs["loss_fd"] = loss_fd.detach()
 
         return outputs
 
