@@ -142,9 +142,19 @@ def main() -> None:
     )
     eval_iter = iter(loader)
 
+    # Real per-slice window width for the DINO-Frechet tensor specifically -- V-JEPA's tubelet
+    # halves time, so its feature tensor is proportionally SHORTER than the video tensor; using
+    # the same fdd_slice_frames-wide window for both runs later slices past the end of the
+    # shorter one, leaving them with zero samples (OnlineGaussian.compute()'s own real crash: real
+    # hit, "Need at least 2 samples to compute statistics"). max(1, ...) guards against flooring
+    # to a zero-width slice; a no-op (== fdd_slice_frames) for DinoModel, where dino_temporal_scale
+    # == model.temporal_downsampling always -- see train_world_model_vjepa.py's own identical fix.
+    dino_temporal_scale = model.temporal_downsampling // getattr(model.dino, "tubelet_size", 1)
+    dino_fdd_slice_frames = max(1, args.fdd_slice_frames * dino_temporal_scale // model.temporal_downsampling)
     full_eval_metrics = FullEvalMetrics(
         dino_dim=vjepa.dino_dim, fdd_slice_frames=args.fdd_slice_frames,
         num_slices=n_generated_video_frames // args.fdd_slice_frames, device="cuda",
+        dino_fdd_slice_frames=dino_fdd_slice_frames,
     )
     drift_trackers = {"dino_cos_drift": RunningMean(), "dino_l2_drift": RunningMean(), "latent_drift": RunningMean()}
     viz_samples: list[torch.Tensor] = []
@@ -158,7 +168,6 @@ def main() -> None:
             with _autocast(args.precision):
                 z, z_t = model.rollout(batch, args.context_latents, args.diffusion_steps, args.schedule_type)
                 real_video, pred_video, real_dino, pred_dino = decode_and_dino(model, z, z_t)
-                dino_temporal_scale = model.temporal_downsampling // getattr(model.dino, "tubelet_size", 1)
                 drift = compute_drift_metrics(
                     z, z_t, args.context_latents, real_dino, pred_dino, model.temporal_downsampling,
                     dino_temporal_scale=dino_temporal_scale,
