@@ -23,6 +23,7 @@ import torch
 from mira.data.batch import VideoActionBatch
 from mira.data.training_loader import create_loader
 
+from mini_mira.codec.logging_utils import init_wandb
 from mini_mira.codec.video_prep import resize_to_canonical
 from mini_mira.ml.config_loading import load_pipeline_config
 from mini_mira.world_model.eval_metrics import RunningMean, compute_drift_metrics, decode_and_dino
@@ -61,6 +62,8 @@ def parse_args() -> argparse.Namespace:
         "tracks' invocations to pull the same real clips before each one's own resize.",
     )
     parser.add_argument("--output-dir", default="sample_rollout_out")
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-entity", default=None)
     return parser.parse_args()
 
 
@@ -103,6 +106,8 @@ def main() -> None:
         model.bos.copy_(ckpt["bos"].to(model.bos.device))
     print(f"Loaded world-model checkpoint from step {ckpt['step']}")
     model.eval()
+
+    wandb_enabled = init_wandb(args.wandb_project, vars(args), entity=args.wandb_entity)
 
     n_latent_frames = args.frames // model.temporal_downsampling
     assert 0 < args.context_latents < n_latent_frames, (
@@ -169,6 +174,10 @@ def main() -> None:
     print("\nSampling results:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}")
+    if wandb_enabled:
+        import wandb  # noqa: PLC0415
+
+        wandb.log(metrics)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -181,7 +190,7 @@ def main() -> None:
         render_rollout_sample(pred_video, key_presses, n_context_frames)
         for pred_video, key_presses in zip(viz_samples, viz_key_presses)
     ]
-    log_rollout_videos(rendered, args.target_fps, ckpt["step"], wandb_enabled=False, output_dir=output_dir)
+    log_rollout_videos(rendered, args.target_fps, ckpt["step"], wandb_enabled=wandb_enabled, output_dir=output_dir)
     print(f"\nSaved {len(rendered)} rollout videos + results.json to {output_dir}/")
 
 
