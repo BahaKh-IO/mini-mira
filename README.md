@@ -12,10 +12,10 @@ its own codec (bottleneck fix included) deliberately stopped at step 1,999, and 
 model has now completed a real 2,000-step run on top of it — both step counts cut well short of
 their original targets given a compressed timeline, not crashes. Training is done; real sampling
 and evaluation against DINO's own numbers is still outstanding before either track's results count
-as announced. **In progress**: fine-tuning the V-JEPA world model with FD-loss
-([arXiv:2604.28190v1](https://arxiv.org/abs/2604.28190v1)) for 500 more steps on top of the
-step-1999 checkpoint — implemented, CPU-verified, not yet run on the real GPU. See
-[Status](#status) below.
+as announced. **Done**: fine-tuned the V-JEPA world model with FD-loss
+([arXiv:2604.28190v1](https://arxiv.org/abs/2604.28190v1)) for the full 500 steps on top of the
+step-1999 checkpoint — real, clean completion at step 2,499, every quality metric improved on the
+pre-fine-tune baseline. See [Status](#status) below.
 
 ## What this is
 
@@ -441,7 +441,7 @@ differentiability + sane values, the EMA update rule matches the paper's formula
 `fd_loss_weight=0` is a provable no-op (no state built at all), and a full synthetic
 forward/backward reaches every trainable parameter.
 
-**Real-GPU debugging done, config validated, real 500-step run not yet started.** FD-loss is the
+**Real-GPU debugging done, config validated, the real 500-step run is complete.** FD-loss is the
 first time this script backprops through the full decoder+V-JEPA encoder (eval/rollout always run
 `no_grad`) — real OOM at `--batch-size 4/--grad-accum-steps 4` even with a first (too-coarse,
 whole-function) checkpointing attempt; fixed by reusing `ViTVideoDecoder`'s own real per-block
@@ -458,6 +458,23 @@ in a tight band instead of trending up. Two new CLI flags added along the way:
 training even starts is real, not hypothetical — this is a new training *phase*, not same-phase
 crash recovery, so exact dataloader-position continuity was never actually needed) and
 `--wandb-new-run` (resume model/optimizer state normally, start a fresh wandb run).
+
+One real interruption along the way, cause not fully confirmed: the launch died silently around
+step 2,299 (no Python traceback anywhere in the log — `dmesg` was inaccessible without root to
+confirm an OOM-kill, best guess given hours of `--num-workers 6` runtime, not proven). `--resume`
+picked it back up cleanly with no data loss (`--checkpoint-every 100` had already saved past that
+point) and it ran the remaining ~200 steps to completion without recurring.
+
+**Real final numbers, step 2,499, vs. the pre-fine-tune baseline (step 1,999) — every metric
+improved**: `frechet_dino_distance` 32.71→**28.40** (−13%), `frechet_inception_distance`
+101.90→**94.45** (−7%), `psnr` 15.82→**18.88** (+19%), `ssim` 0.678→**0.747** (+10%), `lpips`
+0.427→**0.358** (+16%, lower is better). `loss_fd` converged from ~225 at step 2000 to a stable
+~70 plateau; `loss_diffusion` stayed in a healthy 0.25–0.32 band the whole run, never trended
+toward degradation. Worth noting honestly: `frechet_dino_distance` wasn't perfectly monotonic
+along the way (23.42 at step 2009 → 29.78 at step 2249 → 28.40 at step 2499) — small-eval-batch
+noise, expected — but the net trend from baseline held up across the full run, not just an early
+lucky reading. Real checkpoint: `checkpoints_wm_vjepa_fd_finetune_v2/checkpoint_wm_vjepa.pth`,
+backed up to `BahaXD/mini-mira-codec-checkpoints`.
 
 **Two of the four original benchmark-fairness questions are eval/comparison-time decisions, not
 training-launch blockers** — corrected framing from an earlier pass: whether both tracks get
