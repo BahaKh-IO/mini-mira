@@ -81,17 +81,16 @@ ratio (1.82), not picked by feel. Fast verification scripts instead use `configs
 | Track | Real step | PSNR (dB) | SSIM | LPIPS |
 |---|---|---|---|---|
 | DINOv3 | 3,999 of 8,000 target | 19.56 | 0.552 | 0.486 |
-| V-JEPA 2.1 | 1,999 of 8,000 target | *not yet run* | *not yet run* | *not yet run* |
+| V-JEPA 2.1 | 1,999 of 8,000 target | **21.79** | **0.655** | **0.427** |
 
-DINO's numbers are real, from `evaluate_codec.py` on 20 genuinely held-out clips. **V-JEPA's own
-codec has never had this same held-out eval run against it** — `evaluate_codec_vjepa.py` is built
-and verified, just never pointed at the real step-1999 checkpoint. This is the one real gap in
-this table; worth running before calling the codec-level comparison complete:
-```
-python scripts/evaluate_codec_vjepa.py --config configs/scaled_300m_vjepa.yaml \
-  --codec-checkpoint checkpoints_vjepa_l2warmup/checkpoint_vjepa.pth \
-  --index-path <held-out test split> --height 448 --width 768 --frames 40 --require-pretrained-vjepa
-```
+Both real, from `evaluate_codec.py`/`evaluate_codec_vjepa.py` on 20 genuinely held-out clips
+each. **V-JEPA's codec beats DINO's on all three metrics — at roughly half the training steps**
+(1,999 vs. 3,999). Worth being honest about why before reading too much into it: not a clean
+architecture comparison — different resolutions (288×512 vs. 448×768, V-JEPA's own native training
+scale), and V-JEPA's checkpoint also carries the shallow-texture-branch bottleneck fix that
+DINO's never got (a real, separate improvement, not inherent to the backbone swap). A genuinely
+controlled comparison would need to isolate that variable; this table reports what each track's
+own real, shipped checkpoint actually measures, not an ablation.
 
 **World model — drift/Frechet eval on generated rollouts:**
 
