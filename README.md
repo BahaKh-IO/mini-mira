@@ -92,22 +92,43 @@ DINO's never got (a real, separate improvement, not inherent to the backbone swa
 controlled comparison would need to isolate that variable; this table reports what each track's
 own real, shipped checkpoint actually measures, not an ablation.
 
-**World model — drift/Frechet eval on generated rollouts:**
+**World model — same long-rollout benchmark, both tracks (`scripts/sample_rollout.py`/
+`sample_rollout_vjepa.py`):** 2 real context frames, 36 generated frames, same real held-out clips
+(matched `--seed`) before each track's own resize, same eval code path for both.
 
-| Track | Real step | PSNR | SSIM | LPIPS | Frechet DINO Dist. | Frechet Inception Dist. |
-|---|---|---|---|---|---|---|
-| DINOv3 (run 1, no scheduled sampling) | ~2,900 | noisy 12–15, never improved | 0.48→0.65 | 0.59→0.40 | dropped >50% | dropped >50% |
-| V-JEPA 2.1 (base) | 1,999 of 2,000 target | 15.82 | 0.678 | 0.4265 | 32.71 | 101.90 |
-| V-JEPA 2.1 (+FD-loss, 500 more steps) | 2,499 | **18.88** | **0.747** | **0.358** | **28.40** | **94.45** |
+| Metric | DINOv3 (step 5,503) | V-JEPA 2.1 (step 2,499) |
+|---|---|---|
+| PSNR | 17.40 | 16.46 |
+| SSIM | 0.724 | 0.697 |
+| LPIPS | 0.397 | **0.383** |
+| Frechet DINO Distance | **3.46** | 22.75 |
+| Frechet Inception Distance | **64.31** | 107.57 |
+| `drift_dino_l2_drift` | **0.052** | 0.517 |
+| Depth degradation (`fdd_at_6`→`fdd_at_36`) | 2.69→5.81 (2.15x) | 18.15→28.62 (1.58x) |
 
-DINO's row is directional (start→end deltas from its *first* real run, 2,900 steps, no scheduled
-sampling) — its own precise final absolute numbers in this exact form were never separately
-captured for the second (5,500-step, scheduled-sampling) run, only a depth-degradation comparison
-(`fdd_at_7=2.55`→`fdd_at_28=26.56`). V-JEPA's two rows are both real, precise, same-format
-numbers — before vs. after the FD-loss fine-tune, at genuinely comparable eval settings. **Not a
-clean DINO-vs-V-JEPA comparison yet** — different codec maturity, different step budgets, the
-benchmark-fairness questions below are still open. The V-JEPA-internal before/after comparison
-(base → FD-loss fine-tuned) is the one apples-to-apples number in this whole table.
+**Real, first genuinely matched-methodology comparison this project has had** — same rollout
+length, same real clips, same code path, not two different training-time snapshots. DINO wins
+clearly on the Frechet/drift metrics (6.6x lower FDD, ~10x lower `drift_dino_l2_drift`); the gap on
+raw pixel metrics (PSNR/SSIM/LPIPS) is small, and V-JEPA is actually slightly ahead on LPIPS. **Not
+evidence the backbone swap itself is behind** — DINO's world model has more than double the
+training (5,503 vs. V-JEPA's 2,499 total steps) on top of a more mature codec (step 3,999/8,000 vs.
+1,999/8,000, literally half). Matches an already-on-record finding from mira's own paper (Table 6):
+codec/perceptual quality disproportionately affects Frechet-distance-style generation metrics
+specifically, more than raw pixel ones — exactly the pattern here. The honest conclusion is
+"V-JEPA hasn't had a fair shot yet," not "V-JEPA is architecturally worse."
+
+Separately, V-JEPA's own before/after FD-loss fine-tune (different eval settings — 2 context
+latents but full-training-cadence eval, not this same long-rollout script): `frechet_dino_distance`
+32.71→28.40, `psnr` 15.82→18.88, `ssim` 0.678→0.747, `lpips` 0.4265→0.358 — a genuine, if smaller
+scale, internal improvement, not directly comparable to the table above (different rollout
+mechanics/eval cadence).
+
+DINO's own PSNR here (17.40) is also a real correction worth recording: earlier text in this file
+described DINO's *training-time* PSNR as "stayed noisy ~12-15dB, never improved" — this is a
+cleaner, held-out, fixed-seed reading using the same matched methodology as V-JEPA's row, and reads
+meaningfully higher. **Not a clean DINO-vs-V-JEPA comparison overall** — different codec maturity,
+different step budgets, the benchmark-fairness questions below are still open — but this table is
+the first one built to actually be comparable in methodology, not just adjacent numbers.
 
 ---
 
