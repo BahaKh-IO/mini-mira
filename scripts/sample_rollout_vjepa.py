@@ -58,9 +58,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viz-n-samples", type=int, default=10, help="How many rollouts to also save as videos")
     parser.add_argument("--precision", choices=["fp16-hybrid", "bf16"], default="bf16")
     parser.add_argument(
-        "--seed", type=int, default=37,
-        help="Matches the training scripts' own test-loader seed. Pass the SAME value on both "
-        "tracks' invocations to pull the same real clips before each one's own resize.",
+        "--seed", type=int, default=123,
+        help="Pass the SAME value on both tracks' invocations to pull the same real clips before "
+        "each one's own resize. NOT 37 -- that's the training scripts' own test-loader default, "
+        "and a real run with it (evaluate_codec_vjepa.py) drew a suspiciously kickoff-heavy "
+        "sample; try a few different values if the preview videos still look intro-heavy.",
+    )
+    parser.add_argument(
+        "--shuffle-buffer-size", type=int, default=500,
+        help="create_loader's own group-level shuffle buffer (default there is 100) -- a wider "
+        "buffer draws from a broader spread of the stream before emitting, real lever against "
+        "getting an unrepresentative (e.g. kickoff-heavy) draw.",
     )
     parser.add_argument("--output-dir", default="sample_rollout_vjepa_out")
     parser.add_argument("--wandb-project", default=None)
@@ -130,6 +138,7 @@ def main() -> None:
     loader = create_loader(
         index_path=args.index_path, clip_len=args.frames, target_fps=args.target_fps,
         n_players=1, batch_size=args.batch_size, frame_size=None, seed=args.seed,
+        shuffle_buffer_size=args.shuffle_buffer_size,
     )
     eval_iter = iter(loader)
 
