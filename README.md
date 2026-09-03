@@ -613,6 +613,8 @@ Full bug-by-bug history and the evidence trail behind every claim above: `notes/
 | `scripts/compute_latent_stats_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` in place of `DinoModel` |
 | `scripts/train_world_model.py` | Real GPU world-model training |
 | `scripts/train_world_model_vjepa.py` | Same, V-JEPA track — full fork, `VjepaModel` injected via `LatentWorldModel`'s `dino:` seam |
+| `scripts/sample_rollout.py` | Standalone: load a trained world-model checkpoint, roll out on real held-out clips, save videos + Frechet/PSNR/LPIPS/SSIM/drift metrics — no training loop |
+| `scripts/sample_rollout_vjepa.py` | Same, V-JEPA track — full fork |
 | `scripts/verify_world_model_training.py` | CPU mechanism proof for `train_world_model.py` |
 | `scripts/verify_world_model_training_vjepa.py` | CPU mechanism proof that `temporal_downsampling` correctly accounts for a time-halving encoder (V-JEPA-specific, not a fork of the above) |
 | `scripts/verify_full_eval_metrics.py` | CPU mechanism proof for the full eval suite |
