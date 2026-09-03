@@ -74,6 +74,44 @@ ratio (1.82), not picked by feel. Fast verification scripts instead use `configs
 
 ## Status
 
+### Results summary
+
+**Codec — held-out reconstruction quality:**
+
+| Track | Real step | PSNR (dB) | SSIM | LPIPS |
+|---|---|---|---|---|
+| DINOv3 | 3,999 of 8,000 target | 19.56 | 0.552 | 0.486 |
+| V-JEPA 2.1 | 1,999 of 8,000 target | *not yet run* | *not yet run* | *not yet run* |
+
+DINO's numbers are real, from `evaluate_codec.py` on 20 genuinely held-out clips. **V-JEPA's own
+codec has never had this same held-out eval run against it** — `evaluate_codec_vjepa.py` is built
+and verified, just never pointed at the real step-1999 checkpoint. This is the one real gap in
+this table; worth running before calling the codec-level comparison complete:
+```
+python scripts/evaluate_codec_vjepa.py --config configs/scaled_300m_vjepa.yaml \
+  --codec-checkpoint checkpoints_vjepa_l2warmup/checkpoint_vjepa.pth \
+  --index-path <held-out test split> --height 448 --width 768 --frames 40 --require-pretrained-vjepa
+```
+
+**World model — drift/Frechet eval on generated rollouts:**
+
+| Track | Real step | PSNR | SSIM | LPIPS | Frechet DINO Dist. | Frechet Inception Dist. |
+|---|---|---|---|---|---|---|
+| DINOv3 (run 1, no scheduled sampling) | ~2,900 | noisy 12–15, never improved | 0.48→0.65 | 0.59→0.40 | dropped >50% | dropped >50% |
+| V-JEPA 2.1 (base) | 1,999 of 2,000 target | 15.82 | 0.678 | 0.4265 | 32.71 | 101.90 |
+| V-JEPA 2.1 (+FD-loss, 500 more steps) | 2,499 | **18.88** | **0.747** | **0.358** | **28.40** | **94.45** |
+
+DINO's row is directional (start→end deltas from its *first* real run, 2,900 steps, no scheduled
+sampling) — its own precise final absolute numbers in this exact form were never separately
+captured for the second (5,500-step, scheduled-sampling) run, only a depth-degradation comparison
+(`fdd_at_7=2.55`→`fdd_at_28=26.56`). V-JEPA's two rows are both real, precise, same-format
+numbers — before vs. after the FD-loss fine-tune, at genuinely comparable eval settings. **Not a
+clean DINO-vs-V-JEPA comparison yet** — different codec maturity, different step budgets, the
+benchmark-fairness questions below are still open. The V-JEPA-internal before/after comparison
+(base → FD-loss fine-tuned) is the one apples-to-apples number in this whole table.
+
+---
+
 **Codec**: step 3,999 of training, full resolution (288×512, 40-frame clips), real Rocket League
 data, real mira's cosine LR schedule and three-term loss (L1 + LPIPS + DINO latent-consistency).
 Real held-out evaluation on 20 clips it never trained on (`scripts/evaluate_codec.py`):
