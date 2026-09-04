@@ -85,3 +85,7 @@ scipy>=1.11
 # assumed -- it only worked on this dev machine because something else already pulled it in
 # transitively. 1.0.28 is the version verified working here.
 timm>=1.0
+
+# Only for scripts/serve_interactive_vjepa.py -- a small local web server for interactive/live
+# rollout control (browser keypresses -> generation). No other script needs a web framework.
+flask>=3.0
