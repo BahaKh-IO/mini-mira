@@ -3,8 +3,11 @@
 # (height/width/frames/compile/num_workers unchanged -- must match, since --resume loads into
 # the same model shape); only the training-dynamics fields differ.
 #
-# steps: 2500 -- checkpoint step 1999 -> start_step 2000 -> +500 more steps lands on 2499
-# inclusive, i.e. --steps 2500 (not 2499).
+# steps: 3000 -- extended from the original 2500 target. The first 500 steps (2000-2499) ran to
+# completion and were real-benchmarked (see README's Results summary) before this extension was
+# decided; checkpoint step 2499 -> start_step 2500 -> +500 more steps lands on 2999 inclusive,
+# i.e. --steps 3000 (not 2999). Same hyperparameters throughout -- this is a continuation of the
+# same fine-tune, not a new phase.
 # lr: 1e-5, an order of magnitude below the base run's 1e-4 -- matches the paper's own
 # post-training LR range (1e-6-1e-5), scaled for a much shorter fine-tune.
 # fd_loss_weight: 0.002, corrected from an initial 1.0 guess after a real smoke test showed why --
@@ -30,7 +33,7 @@ frames: 40
 # pass; 2/8 (same effective batch 16) fits, cuda_peak_reserved=29.64GiB of 44.42GiB.
 batch_size: 2
 grad_accum_steps: 8
-steps: 2500
+steps: 3000
 lr: 1.0e-5
 compile: true
 num_workers: 6
