@@ -657,25 +657,39 @@ def main() -> None:
         # (set only by the SIGTERM/SIGINT shutdown path below, this run's last chance to upload)
         # so the final state is never skipped regardless of where hf_backup_every's modulo lands.
         is_last_step = step == args.steps - 1
-        if args.hf_backup_repo and (force_hf_upload or (step + 1) % hf_backup_every == 0 or is_last_step):
+
+        def _upload(path_in_repo: str) -> None:
+            # A real, already-hit failure: killing the whole process group (e.g. `pkill -f` on
+            # this script's name also matches its dataloader worker processes, since fork()
+            # doesn't change a child's visible command line -- see notes/vjepa_codec_quality_
+            # research.md) can kill a worker mid-upload; PyTorch's own DataLoader watchdog then
+            # raises, uncaught, right in the middle of this call -- crashing the process AFTER
+            # the local save (above) already succeeded, but before the upload finished, leaving
+            # HF stale with no indication anything went wrong beyond a bare traceback. Caught
+            # here so that failure mode degrades to "HF didn't get this one, try again later"
+            # instead of losing the whole shutdown sequence (or a mid-run crash) over it -- the
+            # local file, which is what --resume actually reads, is already safe either way.
             from huggingface_hub import HfApi  # optional dep, only used here
 
-            HfApi().upload_file(
-                path_or_fileobj=str(ckpt_path), path_in_repo="checkpoint_vjepa.pth",
-                repo_id=args.hf_backup_repo, repo_type="model",
-            )
+            try:
+                HfApi().upload_file(
+                    path_or_fileobj=str(ckpt_path), path_in_repo=path_in_repo,
+                    repo_id=args.hf_backup_repo, repo_type="model",
+                )
+            except Exception as exc:  # noqa: BLE001 -- deliberately broad, see comment above
+                print(f"step {step}: HF upload to {path_in_repo!r} failed ({exc!r}) -- local "
+                      f"checkpoint is still safe, this just means HF is stale until the next "
+                      f"successful upload.")
+
+        if args.hf_backup_repo and (force_hf_upload or (step + 1) % hf_backup_every == 0 or is_last_step):
+            _upload("checkpoint_vjepa.pth")
         # A SEPARATE, non-overwriting snapshot -- checkpoint_vjepa.pth above always gets
         # replaced, so a bad save (a corrupted/NaN state uploaded right before a crash is
         # noticed) can destroy the only backup with nothing to fall back on. This uploads under
         # its own step-numbered name, so every kept snapshot survives independently of what
         # happens to later ones or to the "latest" pointer above.
         if args.hf_backup_repo and args.hf_backup_keep_every and (step + 1) % args.hf_backup_keep_every == 0:
-            from huggingface_hub import HfApi  # optional dep, only used here
-
-            HfApi().upload_file(
-                path_or_fileobj=str(ckpt_path), path_in_repo=f"checkpoint_vjepa_step{step + 1}.pth",
-                repo_id=args.hf_backup_repo, repo_type="model",
-            )
+            _upload(f"checkpoint_vjepa_step{step + 1}.pth")
 
     timer = StepTimer()
     profile_dir = checkpoint_dir / "profile"
