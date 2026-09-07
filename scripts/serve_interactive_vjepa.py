@@ -161,10 +161,11 @@ def main() -> None:
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
             batch = seed_batch.to("cuda", non_blocking=True)
             z_context, _a = model._encode(batch)  # noqa: SLF001 -- established pattern in this codebase's own scripts
+            context_video = model.decode_to_video(z_context)  # same autocast context -- real, hit-for-real bf16/fp32 crash otherwise
         session["z"] = z_context
         session["key_presses"] = batch.actions.key_presses.clone()
-        session["all_frames"] = [video_to_uint8(model.decode_to_video(z_context))[0].cpu()]
-        frame = _decode_last_frames(z_context, td)
+        session["all_frames"] = [video_to_uint8(context_video)[0].cpu()]
+        frame = video_to_uint8(context_video)[:, -td:].cpu()
         return jsonify({"frame_png_b64": _frame_to_png_b64(frame[0, -1]), "n_frames": z_context.shape[1]})
 
     @app.route("/step", methods=["POST"])
@@ -177,14 +178,14 @@ def main() -> None:
             if key in keys_held:
                 new_window[:, :, i] = 1
         session["key_presses"] = torch.cat([session["key_presses"], new_window.to(session["key_presses"].device)], dim=1)
-        with torch.autocast(device_type="cuda", dtype=dtype):
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
             session["z"] = generate_next_frame(
                 model, session["z"], session["key_presses"].cuda(),
                 n_diffusion_steps=args.diffusion_steps, schedule_type=args.schedule_type,
             )
-            frame = _decode_last_frames(session["z"], td)
-        session["all_frames"].append(video_to_uint8(frame)[0].cpu())
-        return jsonify({"frame_png_b64": _frame_to_png_b64(frame[0, -1]), "n_frames": int(session["z"].shape[1])})
+            frame = video_to_uint8(_decode_last_frames(session["z"], td))
+        session["all_frames"].append(frame[0].cpu())
+        return jsonify({"frame_png_b64": _frame_to_png_b64(frame[0, -1].cpu()), "n_frames": int(session["z"].shape[1])})
 
     @app.route("/download")
     def download():
